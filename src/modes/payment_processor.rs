@@ -32,6 +32,7 @@ use crate::{
     config::Config,
     modes::{
         minotari_subprocess::{create_sign_and_submit, SeedRole},
+        minotari_wallet_ops::{rewrite_birthday, wipe_and_reimport_via_create},
         Mode, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
@@ -146,8 +147,33 @@ impl Mode for PaymentProcessor {
         anyhow::bail!(read_side_placeholder("get_utxo_count"));
     }
 
-    async fn wipe_and_reimport(&mut self, _birthday: u16) -> anyhow::Result<()> {
-        anyhow::bail!(read_side_placeholder("wipe_and_reimport"));
+    async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {
+        // Mirror of `crate::modes::new_wallet::NewWallet::wipe_and_reimport`,
+        // differing only in seed slot (`mnemonic_payment_processor` vs
+        // `mnemonic_new`). See `analysis/DESIGN_AMENDMENT.md §8.3`.
+        let mnemonic_handle = self
+            .seeds
+            .mnemonic_payment_processor()
+            .context("reading SeedRole::Pp mnemonic for wipe_and_reimport")?;
+        let password_handle = self
+            .seeds
+            .wallet_password()
+            .context("reading wallet password for wipe_and_reimport")?;
+        let rewritten = rewrite_birthday(mnemonic_handle.reveal(), birthday)
+            .context("rewriting CipherSeed birthday for Mode 3 re-import")?;
+        wipe_and_reimport_via_create(
+            &self.cfg,
+            &mut self.data_dir,
+            &rewritten,
+            password_handle.reveal(),
+        )
+        .await
+        .context("Mode 3 wipe_and_reimport via minotari Create --seed-words")?;
+        log::info!(
+            target: LOG_TARGET,
+            "Mode 3 wipe_and_reimport complete (birthday={birthday})",
+        );
+        Ok(())
     }
 }
 
@@ -262,6 +288,28 @@ mod tests {
             .expect_err("get_balance placeholder must bail");
         let msg = format!("{err:#}");
         assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
+        teardown_seeds(&seeds);
+    }
+
+    #[tokio::test]
+    async fn mode3_wipe_and_reimport_attempts_subprocess() {
+        // Mirror of `mode2_wipe_and_reimport_attempts_subprocess` — confirms
+        // Mode 3 routes through the shared helper. Point `minotari_path` at a
+        // non-existent binary so the spawn deterministically surfaces the
+        // Mode 3 wipe context.
+        let (mut m, seeds) = build_mode3("WIPE");
+        m.cfg.minotari_path = Some(std::path::PathBuf::from(
+            "/wallet-benchmarks-test-nonexistent-minotari-binary",
+        ));
+        let err = m
+            .wipe_and_reimport(0)
+            .await
+            .expect_err("missing binary must surface as a spawn error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Mode 3 wipe_and_reimport"),
+            "error context must name Mode 3's wipe step: {msg}",
+        );
         teardown_seeds(&seeds);
     }
 }

@@ -39,6 +39,7 @@ use crate::{
     config::Config,
     modes::{
         minotari_subprocess::{create_sign_and_submit, SeedRole},
+        minotari_wallet_ops::{rewrite_birthday, wipe_and_reimport_via_create},
         Mode, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
@@ -157,8 +158,35 @@ impl Mode for NewWallet {
         anyhow::bail!(read_side_placeholder("get_utxo_count"));
     }
 
-    async fn wipe_and_reimport(&mut self, _birthday: u16) -> anyhow::Result<()> {
-        anyhow::bail!(read_side_placeholder("wipe_and_reimport"));
+    async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {
+        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 4: rewrite the mnemonic's
+        // birthday to `birthday` then re-create the wallet DB from the new
+        // mnemonic via `minotari Create --seed-words`. The shared helper owns
+        // the wipe + create + harness.toml plumbing; Mode 2's job is just to
+        // produce the right mnemonic + password for it.
+        let mnemonic_handle = self
+            .seeds
+            .mnemonic_new()
+            .context("reading SeedRole::New mnemonic for wipe_and_reimport")?;
+        let password_handle = self
+            .seeds
+            .wallet_password()
+            .context("reading wallet password for wipe_and_reimport")?;
+        let rewritten = rewrite_birthday(mnemonic_handle.reveal(), birthday)
+            .context("rewriting CipherSeed birthday for Mode 2 re-import")?;
+        wipe_and_reimport_via_create(
+            &self.cfg,
+            &mut self.data_dir,
+            &rewritten,
+            password_handle.reveal(),
+        )
+        .await
+        .context("Mode 2 wipe_and_reimport via minotari Create --seed-words")?;
+        log::info!(
+            target: LOG_TARGET,
+            "Mode 2 wipe_and_reimport complete (birthday={birthday})",
+        );
+        Ok(())
     }
 }
 
@@ -294,14 +322,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode2_wipe_and_reimport_bails_with_amendment_pointer() {
+    async fn mode2_wipe_and_reimport_attempts_subprocess() {
+        // The real impl from 3i.0 spawns `minotari Create --seed-words ...`.
+        // Point `minotari_path` at a non-existent binary so the spawn fails
+        // deterministically with a "No such file or directory" — the test
+        // does not depend on the host's $PATH state, but does prove the
+        // method routes through the shared helper (the error context
+        // includes "Mode 2 wipe_and_reimport").
         let (mut m, seeds) = build_mode2("WIPE");
+        m.cfg.minotari_path = Some(std::path::PathBuf::from(
+            "/wallet-benchmarks-test-nonexistent-minotari-binary",
+        ));
         let err = m
             .wipe_and_reimport(0)
             .await
-            .expect_err("wipe_and_reimport placeholder must bail");
+            .expect_err("missing binary must surface as a spawn error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
+        assert!(
+            msg.contains("Mode 2 wipe_and_reimport"),
+            "error context must name Mode 2's wipe step: {msg}",
+        );
         teardown_seeds(&seeds);
     }
 }
