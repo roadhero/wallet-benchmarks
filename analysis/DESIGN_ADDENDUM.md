@@ -208,3 +208,49 @@ Walking each new decision through directive 6:
 - **S4** is an ordering directive; no code surface change. **Pass.**
 
 **No re-flag required. swe-impl proceeds without arch-security.**
+
+## §Dependency strategy — resolved (post-M1 spike escalation)
+
+> **Status:** Resolution decision following swe-impl's escalation in `analysis/DESIGN_AMENDMENT.md`. Adopted 2026-05-22.
+> **Precedence:** This section supersedes `DESIGN.md §Dependency strategy` in the same way `DESIGN_ADDENDUM.md` line 4 specifies for the file overall. swe-impl uses the Cargo.toml block below, not DESIGN.md's.
+
+### 1. Resolution
+
+Replace the three git-rev tari deps with crates.io v5.3.1 pins. Exact Cargo.toml block (replaces DESIGN.md `§Dependency strategy` "Tari ecosystem" block):
+
+```toml
+# Tari ecosystem — Mode 1 (gRPC) and Mode 2/3 (offline sign + HTTP submit)
+minotari_app_grpc           = { version = "5.3.1", default-features = false }
+minotari_node_wallet_client = "5.3.1"
+tonic                       = { version = "0.13", features = ["transport"] }
+prost                       = "0.13"
+
+tari_common                 = "5.3.1"
+tari_common_types           = "5.3.1"
+tari_transaction_components = "5.3.1"
+tari_crypto                 = { version = "0.22.1", features = ["borsh"] }
+tari_utilities              = "0.8"
+```
+
+### 2. Rationale
+
+- **Mirrors `minotari-cli`'s own Cargo.toml pinning style** (which uses crates.io 5.3.x for these deps), per CLAUDE.md §Maintainer Mirror Rule. `minotari-cli` is authored by the bounty maintainer (SWvheerden); `minotari_payment_processor` — the source of the original git-rev choice — is not.
+- **Single-resolver consistency with `minotari_node_wallet_client = "5.3.1"` and `minotari_app_grpc = "5.3.1"`.** Eliminates the version-skew issue swe-impl surfaced in `DESIGN_AMENDMENT.md` (two copies of tari types transitively pulled at different versions).
+- **`core2 0.4.0` yank is moot** — crates.io 5.3.1 of the tari crates resolves past it via its own transitive selection.
+
+### 3. AC-27 recording
+
+The `versions` block in the result profile records, for each of the three tari crates:
+
+- `tag: "v5.3.1"`
+- `commit: "5d6ef11bb89caa34fe9ee676d608f273db90038d"`
+
+A single tag covers all three because they ship from a workspace. `RESULT_PROFILE_SCHEMA.md §3` line 85 already permits the tag+commit pair ("If running off a tag, `commit` may still be filled (recommended)"). We take the recommended path.
+
+### 4. Precedence
+
+This section supersedes DESIGN.md `§Dependency strategy` for purposes of swe-impl's Cargo.toml construction. DESIGN.md remains the historical architect output; swe-impl reads both files and uses the override above where they conflict.
+
+### 5. DESIGN_AMENDMENT.md disposition
+
+Left intact as the historical record of why we changed pinning. Do not edit. A reader can follow the chain `DESIGN.md` → `DESIGN_AMENDMENT.md` (diagnosis) → `DESIGN_ADDENDUM.md §Dependency strategy — resolved` (decision).
