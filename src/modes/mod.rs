@@ -248,13 +248,21 @@ pub(crate) mod test_support {
 
     /// Hand-rolled fake for scenario unit tests. Records call order and
     /// returns canned values per method. See module docs for rationale.
+    ///
+    /// `canned_balance` and `canned_utxo_count` are sequences rather than
+    /// single values so a single test can model pre-vs-post state across an
+    /// intervening `send_*` call — S0 reads pre-state, submits a tx, then
+    /// polls post-state. Each call to `get_balance` / `get_utxo_count`
+    /// advances an internal index; once the index reaches the end of the
+    /// sequence the **last** value is repeated indefinitely (saturating).
+    /// An empty sequence still yields the "no canned value set" error.
     pub(crate) struct FakeMode {
         /// Returned by `scan_from_birthday`.
         pub canned_scan: Option<ScanOutcome>,
-        /// Returned by `get_balance`.
-        pub canned_balance: Option<u64>,
-        /// Returned by `get_utxo_count`.
-        pub canned_utxo_count: Option<u64>,
+        /// Successive values returned by `get_balance`; last value sticks.
+        pub canned_balance: Vec<u64>,
+        /// Successive values returned by `get_utxo_count`; last value sticks.
+        pub canned_utxo_count: Vec<u64>,
         /// Returned by `send_single`.
         pub canned_send_single: Option<TxRecord>,
         /// Returned by `send_batch_one_to_many`.
@@ -263,6 +271,10 @@ pub(crate) mod test_support {
         pub fail_with: Option<String>,
         /// Method-name log in call order.
         pub calls: Mutex<Vec<&'static str>>,
+        /// Index into `canned_balance` for the next `get_balance` call.
+        balance_idx: Mutex<usize>,
+        /// Index into `canned_utxo_count` for the next `get_utxo_count` call.
+        utxo_idx: Mutex<usize>,
     }
 
     impl FakeMode {
@@ -270,12 +282,14 @@ pub(crate) mod test_support {
         pub(crate) fn new() -> Self {
             Self {
                 canned_scan: None,
-                canned_balance: None,
-                canned_utxo_count: None,
+                canned_balance: Vec::new(),
+                canned_utxo_count: Vec::new(),
                 canned_send_single: None,
                 canned_batch: None,
                 fail_with: None,
                 calls: Mutex::new(Vec::new()),
+                balance_idx: Mutex::new(0),
+                utxo_idx: Mutex::new(0),
             }
         }
 
@@ -336,15 +350,31 @@ pub(crate) mod test_support {
         async fn get_balance(&mut self) -> anyhow::Result<u64> {
             self.record("get_balance");
             self.check_fail("get_balance")?;
-            self.canned_balance
-                .ok_or_else(|| anyhow::anyhow!("FakeMode::get_balance: no canned value set"))
+            if self.canned_balance.is_empty() {
+                anyhow::bail!("FakeMode::get_balance: no canned value set");
+            }
+            let mut idx = self.balance_idx.lock().unwrap();
+            let here = (*idx).min(self.canned_balance.len() - 1);
+            let value = self.canned_balance[here];
+            if *idx < self.canned_balance.len() - 1 {
+                *idx += 1;
+            }
+            Ok(value)
         }
 
         async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
             self.record("get_utxo_count");
             self.check_fail("get_utxo_count")?;
-            self.canned_utxo_count
-                .ok_or_else(|| anyhow::anyhow!("FakeMode::get_utxo_count: no canned value set"))
+            if self.canned_utxo_count.is_empty() {
+                anyhow::bail!("FakeMode::get_utxo_count: no canned value set");
+            }
+            let mut idx = self.utxo_idx.lock().unwrap();
+            let here = (*idx).min(self.canned_utxo_count.len() - 1);
+            let value = self.canned_utxo_count[here];
+            if *idx < self.canned_utxo_count.len() - 1 {
+                *idx += 1;
+            }
+            Ok(value)
         }
 
         async fn wipe_and_reimport(&mut self, _birthday: u16) -> anyhow::Result<()> {
@@ -373,8 +403,8 @@ pub(crate) mod test_support {
         async fn fake_mode_records_call_order() {
             let mut fake = FakeMode::new();
             fake.canned_scan = Some(sample_scan());
-            fake.canned_balance = Some(7);
-            fake.canned_utxo_count = Some(3);
+            fake.canned_balance = vec![7];
+            fake.canned_utxo_count = vec![3];
 
             fake.scan_from_birthday(0).await.expect("scan ok");
             fake.get_balance().await.expect("balance ok");

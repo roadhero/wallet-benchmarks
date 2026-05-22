@@ -20,10 +20,34 @@
 //! dispatch skeleton. Step 3i.1.a.3 lands B0. Subsequent steps land S0..S7.
 
 mod b0_baseline;
+mod s0_warmup;
 
 pub use b0_baseline::B0Outcome;
+pub use s0_warmup::S0Outcome;
 
+use tari_common_types::tari_address::TariAddress;
+
+use crate::config::Config;
 use crate::modes::Mode;
+
+/// Per-run context passed to scenarios. Carries the harness configuration
+/// (which scenarios read for `c_min`, `a_fund`, `fee_rate`,
+/// `per_tx_confirmation_timeout_ms`, etc.) plus the harness-controlled
+/// recipient address scenarios send to.
+///
+/// Lifted out of `run_scenario`'s arguments so the dispatch signature stays
+/// stable as additional scenarios that need configuration (S1..S7) come
+/// online. B0 ignores all fields; S0 reads them.
+pub struct ScenarioCtx<'a> {
+    /// Harness configuration (mirrors `RESULT_PROFILE_SCHEMA.md §1`).
+    pub config: &'a Config,
+    /// Destination address for scenario-level sends (S0's funding-style tx,
+    /// S1's UTXO-multiplication rounds, S4's concurrent dispatch, S5's
+    /// arm-specific recipient lists). The harness's run loop derives this
+    /// from the configured seed environment per `DESIGN.md §Scenario state
+    /// machine §S0`.
+    pub recipient: &'a TariAddress,
+}
 
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
 /// in the 27-cell matrix. `Display` matches the scenario names used as keys
@@ -103,8 +127,9 @@ impl std::fmt::Display for ScenarioId {
 pub enum ScenarioOutcome {
     /// B0 — from-genesis archival scan against unfunded wallet (AC-10).
     B0(B0Outcome),
+    /// S0 — single funding-style transaction; produces `h_birth` (AC-11).
+    S0(S0Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   3i.1.b → S0
     //   3i.1.c → S1
     //   …      → S2..S7
 }
@@ -113,20 +138,26 @@ pub enum ScenarioOutcome {
 ///
 /// Dispatches to per-scenario impl based on `id`. No registry, no factory —
 /// scenarios are added one at a time as the workspace fills out per
-/// `DESIGN.md §swe-impl execution order`. B0 lands in step 3i.1.a.3;
-/// S0..S7 follow.
-pub async fn run_scenario(id: ScenarioId, mode: &mut dyn Mode) -> anyhow::Result<ScenarioOutcome> {
+/// `DESIGN.md §swe-impl execution order`. B0 lands in step 3i.1.a.3; S0
+/// lands in step 3i.1.b; S1..S7 follow.
+pub async fn run_scenario(
+    id: ScenarioId,
+    ctx: &ScenarioCtx<'_>,
+    mode: &mut dyn Mode,
+) -> anyhow::Result<ScenarioOutcome> {
     match id {
         ScenarioId::B0 => b0_baseline::run(mode).await.map(ScenarioOutcome::B0),
-        ScenarioId::S0
-        | ScenarioId::S1
+        ScenarioId::S0 => s0_warmup::run(ctx.config, mode, ctx.recipient)
+            .await
+            .map(ScenarioOutcome::S0),
+        ScenarioId::S1
         | ScenarioId::S2
         | ScenarioId::S3
         | ScenarioId::S4
         | ScenarioId::S5
         | ScenarioId::S6
         | ScenarioId::S7 => anyhow::bail!(
-            "scenario {id} not yet implemented (step 3i.1.a lands B0 only; \
+            "scenario {id} not yet implemented (step 3i.1.b lands S0; \
              subsequent scenarios follow in DESIGN.md swe-impl execution order)"
         ),
     }
