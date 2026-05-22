@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod env_capture;
 pub mod guards;
+pub mod modes;
 pub mod seed;
 pub mod versions;
 pub mod wallet_lifecycle;
