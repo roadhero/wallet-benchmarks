@@ -12,6 +12,7 @@
 //! `BaseNodeWalletClient` shape in `minotari_node_wallet_client = "5.3.1"` and
 //! keeps trait objects usable from scenario dispatch.
 
+pub mod console_wallet;
 pub mod data_dir;
 pub mod grpc;
 

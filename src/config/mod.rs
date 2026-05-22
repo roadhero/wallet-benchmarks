@@ -9,6 +9,8 @@
 //! The TOML loader lives in [`load`]; every field is `#[serde(default)]` so a minimal
 //! `harness.toml` only needs to override the keys the operator cares about.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -103,6 +105,16 @@ pub struct Config {
     /// values themselves are read at runtime; only the names are persisted.
     #[serde(default)]
     pub seeds: Seeds,
+
+    /// Optional override for the `minotari_console_wallet` binary path used by
+    /// Mode 1's [`crate::wallet_lifecycle::console_wallet::ConsoleWalletLifecycle`].
+    /// When `None`, the harness resolves `"minotari_console_wallet"` via `$PATH`.
+    /// Operators on systems where the binary is in a non-standard location
+    /// (developer builds under `~/code/tari/target/release/`, for example) set
+    /// this to the absolute path. Not in the schema's `config` block — this is
+    /// a host-specific runtime setting, not a measurement parameter.
+    #[serde(default)]
+    pub minotari_console_wallet_path: Option<PathBuf>,
 }
 
 /// Names of the environment variables holding seed mnemonics and the wallet
@@ -186,6 +198,7 @@ impl Default for Config {
             base_node_url: Self::default_base_node_url(),
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
             seeds: Seeds::default(),
+            minotari_console_wallet_path: None,
         }
     }
 }
@@ -243,6 +256,7 @@ mod tests {
         assert_eq!(cfg.seeds.new, "HARNESS_SEED_NEW");
         assert_eq!(cfg.seeds.payment_processor, "HARNESS_SEED_PP");
         assert_eq!(cfg.seeds.wallet_password, "HARNESS_WALLET_PW");
+        assert_eq!(cfg.minotari_console_wallet_path, None);
     }
 
     #[test]
@@ -285,6 +299,9 @@ mod tests {
                 payment_processor: "PP".to_string(),
                 wallet_password: "PW".to_string(),
             },
+            minotari_console_wallet_path: Some(PathBuf::from(
+                "/opt/tari/bin/minotari_console_wallet",
+            )),
         };
         let serialized = toml::to_string(&original).expect("serialize");
         let reloaded: Config = toml::from_str(&serialized).expect("round-trip");
