@@ -19,6 +19,7 @@
 //! live in sibling files added one step at a time per `DESIGN_ADDENDUM.md §S4`.
 
 pub(super) mod minotari_subprocess;
+pub mod new_wallet;
 pub mod old_wallet;
 
 use tari_common_types::tari_address::TariAddress;

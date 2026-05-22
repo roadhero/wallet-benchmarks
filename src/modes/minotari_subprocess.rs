@@ -1,11 +1,3 @@
-// Helper functions land in this commit before the per-mode consumers in
-// `new_wallet.rs` / `payment_processor.rs` land in the following commits.
-// The `#[allow(dead_code)]` at the module level below lifts as soon as those
-// consumers reference `create_sign_and_submit` / `build_create_unsigned_tx_argv`
-// / `write_harness_toml` / `SeedRole::{New, Pp}` / `failed_record`. The unit
-// tests in `mod tests` exercise every helper item so the test target keeps the
-// surface honest even before the per-mode wiring.
-#![allow(dead_code)]
 //! Shared `minotari` subprocess pipeline used by Modes 2 and 3.
 //!
 //! Per `analysis/DESIGN.md §Mode 2 — concrete wiring` and
@@ -97,10 +89,14 @@ pub(super) enum SeedRole {
     /// so the slot mapping is exhaustive at the call site — `create_sign_and_submit`
     /// bails loudly if `Old` ever reaches it, surfacing the contract violation
     /// in a single test rather than as a silent miswire.
+    #[allow(dead_code)]
     Old,
     /// New-wallet mode seed (`SeedHandle::mnemonic_new`) — Mode 2.
     New,
     /// Payment-processor seed (`SeedHandle::mnemonic_payment_processor`) — Mode 3.
+    /// `dead_code` allow lifts in the Mode 3 (`PaymentProcessor`) commit that
+    /// follows this one — that's the only consumer of this variant.
+    #[allow(dead_code)]
     Pp,
 }
 
