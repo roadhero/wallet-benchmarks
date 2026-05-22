@@ -8,6 +8,7 @@ pub mod cli;
 pub mod config;
 pub mod env_capture;
 pub mod guards;
+pub mod versions;
 
 use std::str::FromStr;
 
