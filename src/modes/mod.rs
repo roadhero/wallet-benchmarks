@@ -228,3 +228,184 @@ impl std::fmt::Display for TxRecordPhase {
         })
     }
 }
+
+/// Hand-rolled fake `Mode` for scenario unit tests.
+///
+/// Records call order and returns canned values per method. Scoped to
+/// `#[cfg(test)] pub(crate)` so scenario unit tests under `src/scenarios/*`
+/// can construct it via `use crate::modes::test_support::FakeMode` without
+/// exposing it to downstream crates.
+///
+/// Diverges from `analysis/DESIGN.md §Test Strategy`'s "MockWalletDriver via
+/// mockall" reference — implementation tactic recorded in
+/// `analysis/API_DRIFT.md §3i.1.a` and surfaced in PR_BODY_PLAN.md. Intent
+/// (mock the Mode trait surface for scenario unit tests) is preserved.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// Hand-rolled fake for scenario unit tests. Records call order and
+    /// returns canned values per method. See module docs for rationale.
+    pub(crate) struct FakeMode {
+        /// Returned by `scan_from_birthday`.
+        pub canned_scan: Option<ScanOutcome>,
+        /// Returned by `get_balance`.
+        pub canned_balance: Option<u64>,
+        /// Returned by `get_utxo_count`.
+        pub canned_utxo_count: Option<u64>,
+        /// Returned by `send_single`.
+        pub canned_send_single: Option<TxRecord>,
+        /// Returned by `send_batch_one_to_many`.
+        pub canned_batch: Option<TxRecord>,
+        /// If `Some`, every method bails with this message.
+        pub fail_with: Option<String>,
+        /// Method-name log in call order.
+        pub calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl FakeMode {
+        /// Construct a FakeMode with no canned values and no forced failure.
+        pub(crate) fn new() -> Self {
+            Self {
+                canned_scan: None,
+                canned_balance: None,
+                canned_utxo_count: None,
+                canned_send_single: None,
+                canned_batch: None,
+                fail_with: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, method: &'static str) {
+            // `lock().unwrap()` mirrors the in-tree `Mutex` usage in
+            // `src/modes/minotari_wallet_ops.rs` — poisoning surfaces as
+            // a panic in tests, which is the desired behavior.
+            self.calls.lock().unwrap().push(method);
+        }
+
+        fn check_fail(&self, method: &'static str) -> anyhow::Result<()> {
+            if let Some(msg) = &self.fail_with {
+                anyhow::bail!("FakeMode::{method}: {msg}");
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Mode for FakeMode {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn send_single(
+            &mut self,
+            _recipient: &TariAddress,
+            _amount_microtari: u64,
+            _fee_rate: u64,
+        ) -> anyhow::Result<TxRecord> {
+            self.record("send_single");
+            self.check_fail("send_single")?;
+            self.canned_send_single
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("FakeMode::send_single: no canned value set"))
+        }
+
+        async fn send_batch_one_to_many(
+            &mut self,
+            _recipients: &[(TariAddress, u64)],
+            _fee_rate: u64,
+        ) -> anyhow::Result<TxRecord> {
+            self.record("send_batch_one_to_many");
+            self.check_fail("send_batch_one_to_many")?;
+            self.canned_batch.clone().ok_or_else(|| {
+                anyhow::anyhow!("FakeMode::send_batch_one_to_many: no canned value set")
+            })
+        }
+
+        async fn scan_from_birthday(&mut self, _birthday: u16) -> anyhow::Result<ScanOutcome> {
+            self.record("scan_from_birthday");
+            self.check_fail("scan_from_birthday")?;
+            self.canned_scan
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("FakeMode::scan_from_birthday: no canned value set"))
+        }
+
+        async fn get_balance(&mut self) -> anyhow::Result<u64> {
+            self.record("get_balance");
+            self.check_fail("get_balance")?;
+            self.canned_balance
+                .ok_or_else(|| anyhow::anyhow!("FakeMode::get_balance: no canned value set"))
+        }
+
+        async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
+            self.record("get_utxo_count");
+            self.check_fail("get_utxo_count")?;
+            self.canned_utxo_count
+                .ok_or_else(|| anyhow::anyhow!("FakeMode::get_utxo_count: no canned value set"))
+        }
+
+        async fn wipe_and_reimport(&mut self, _birthday: u16) -> anyhow::Result<()> {
+            self.record("wipe_and_reimport");
+            self.check_fail("wipe_and_reimport")?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample_scan() -> ScanOutcome {
+            ScanOutcome {
+                t_scan_ms: 1,
+                h_tip_start: 0,
+                h_tip_end: 0,
+                outputs_found: 0,
+                utxo_count: 0,
+                balance_microtari: 0,
+            }
+        }
+
+        #[tokio::test]
+        async fn fake_mode_records_call_order() {
+            let mut fake = FakeMode::new();
+            fake.canned_scan = Some(sample_scan());
+            fake.canned_balance = Some(7);
+            fake.canned_utxo_count = Some(3);
+
+            fake.scan_from_birthday(0).await.expect("scan ok");
+            fake.get_balance().await.expect("balance ok");
+            fake.get_utxo_count().await.expect("utxo_count ok");
+
+            let calls = fake.calls.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec!["scan_from_birthday", "get_balance", "get_utxo_count"],
+                "FakeMode.calls must record method names in invocation order",
+            );
+        }
+
+        #[tokio::test]
+        async fn fake_mode_bails_when_fail_with_set() {
+            let mut fake = FakeMode::new();
+            fake.fail_with = Some("forced for test".to_string());
+
+            let err = fake
+                .get_balance()
+                .await
+                .expect_err("fail_with must force an error");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("FakeMode::get_balance"),
+                "error must name the method: {msg}",
+            );
+            assert!(
+                msg.contains("forced for test"),
+                "error must carry fail_with payload: {msg}",
+            );
+        }
+    }
+}
