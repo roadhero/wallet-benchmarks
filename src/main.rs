@@ -42,7 +42,9 @@ fn main() -> anyhow::Result<()> {
         SeedWordsWallet::construct_new(cipher_seed).map_err(anyhow::Error::msg)?;
     let wallet_type = WalletType::SeedWords(seed_words_wallet);
     let _key_manager = KeyManager::new(wallet_type)?;
-    println!("ok 3/5  KeyManager::new(WalletType::SeedWords(..)) constructed from CipherSeed::random()");
+    println!(
+        "ok 3/5  KeyManager::new(WalletType::SeedWords(..)) constructed from CipherSeed::random()"
+    );
 
     // Proof 4: sign_locked_transaction resolves as a symbol. Per §M1 we do NOT call it
     // end-to-end (no real unsigned tx available); coercing it to a typed function pointer
@@ -53,7 +55,8 @@ fn main() -> anyhow::Result<()> {
         ConsensusConstants,
         Network,
         PrepareOneSidedTransactionForSigningResult,
-    ) -> Result<SignedOneSidedTransactionResult, TransactionBuilderError> =
+    )
+        -> Result<SignedOneSidedTransactionResult, TransactionBuilderError> =
         sign_locked_transaction::<KeyManager>;
     println!("ok 4/5  sign_locked_transaction symbol resolves (signature checked, not invoked)");
 
