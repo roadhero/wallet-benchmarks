@@ -1,69 +1,57 @@
-//! Dep-graph spike — wallet-benchmarks#1, M1.
+//! Entry point for the `wallet-benchmarks` harness.
 //!
-//! Proves the five hot Tari ecosystem dependencies resolve and compile against the
-//! crates.io `5.3.1` publication of the Tari workspace (commit
-//! `5d6ef11bb89caa34fe9ee676d608f273db90038d`, tag `v5.3.1`). See
-//! `analysis/DESIGN_ADDENDUM.md §Dependency strategy — resolved` for the pin rationale
-//! and `§M1` for the spike contract. This file is replaced by the real `main.rs` in the
-//! module-implementation phase per `§S4`.
+//! Parses the CLI per `analysis/DESIGN_ADDENDUM.md §S1`, dispatches to the
+//! corresponding library entry point. The `run` subcommand is wired up in a
+//! later step (scenarios); for now it prints a one-line "not yet wired" notice
+//! and exits with status 2 (CLI-OK-but-action-not-ready) so operators see the
+//! intended shape from `--help` without the harness pretending to do work.
 
-use minotari_node_wallet_client::http::Client as BaseNodeClient;
-use tari_common::configuration::Network;
-use tari_common_types::seeds::cipher_seed::CipherSeed;
-use tari_transaction_components::{
-    consensus::{ConsensusConstants, ConsensusConstantsBuilder},
-    key_manager::{
-        wallet_types::{SeedWordsWallet, WalletType},
-        KeyManager,
-    },
-    offline_signing::{
-        models::{PrepareOneSidedTransactionForSigningResult, SignedOneSidedTransactionResult},
-        sign_locked_transaction,
-    },
-    TransactionBuilderError,
+use std::process::ExitCode;
+
+use clap::Parser;
+use wallet_benchmarks::{
+    cli::{Cli, Commands},
+    gen_seed, print_address,
 };
-use url::Url;
 
-fn main() -> anyhow::Result<()> {
-    // Proof 1: Network::Esmeralda constructs.
-    let network = Network::Esmeralda;
-    println!("ok 1/5  tari_common::Network::Esmeralda = {:?}", network);
+const LOG_TARGET: &str = "c::main";
 
-    // Proof 2: ConsensusConstantsBuilder::new(Esmeralda).build() returns ConsensusConstants.
-    let _consensus_constants: ConsensusConstants = ConsensusConstantsBuilder::new(network).build();
-    println!("ok 2/5  ConsensusConstantsBuilder::new(Esmeralda).build() -> ConsensusConstants");
+/// Exit code returned by the `run` subcommand until scenarios are wired in.
+const EXIT_RUN_NOT_READY: u8 = 2;
 
-    // Proof 3: KeyManager constructs from a WalletType::SeedWords reconstituted via the
-    // CipherSeed::random() constructor — Tari's canonical seed generator. The seed is
-    // ephemeral and never persisted; the goal is to prove the constructor chain links and
-    // executes, not to exercise mnemonic parsing (which is module-implementation phase).
-    let cipher_seed = CipherSeed::random();
-    let seed_words_wallet =
-        SeedWordsWallet::construct_new(cipher_seed).map_err(anyhow::Error::msg)?;
-    let wallet_type = WalletType::SeedWords(seed_words_wallet);
-    let _key_manager = KeyManager::new(wallet_type)?;
-    println!(
-        "ok 3/5  KeyManager::new(WalletType::SeedWords(..)) constructed from CipherSeed::random()"
-    );
+fn main() -> ExitCode {
+    env_logger::init();
 
-    // Proof 4: sign_locked_transaction resolves as a symbol. Per §M1 we do NOT call it
-    // end-to-end (no real unsigned tx available); coercing it to a typed function pointer
-    // forces the linker to resolve the symbol and the type checker to verify its signature
-    // against DESIGN.md §Mode 2.
-    let _sign_locked_fn: fn(
-        &KeyManager,
-        ConsensusConstants,
-        Network,
-        PrepareOneSidedTransactionForSigningResult,
-    )
-        -> Result<SignedOneSidedTransactionResult, TransactionBuilderError> =
-        sign_locked_transaction::<KeyManager>;
-    println!("ok 4/5  sign_locked_transaction symbol resolves (signature checked, not invoked)");
-
-    // Proof 5: minotari_node_wallet_client::http::Client::new constructs against Esmeralda RPC.
-    let base_node_url = Url::parse("https://rpc.esmeralda.tari.com")?;
-    let _client = BaseNodeClient::new(base_node_url.clone(), base_node_url);
-    println!("ok 5/5  minotari_node_wallet_client::http::Client::new(esmeralda RPC) constructed");
-
-    Ok(())
+    match Cli::parse().resolved_command() {
+        Commands::Run { config } => {
+            log::info!(target: LOG_TARGET, "run requested with config {}", config.display());
+            // The scenario wiring lands in a later step; the CLI parses
+            // successfully but executing the harness is not yet supported.
+            eprintln!(
+                "wallet-benchmarks run --config {}: scenarios will be wired up in a later step; not yet implemented",
+                config.display()
+            );
+            ExitCode::from(EXIT_RUN_NOT_READY)
+        }
+        Commands::GenSeed => match gen_seed() {
+            Ok(mnemonic) => {
+                println!("{mnemonic}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("gen-seed failed: {err:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::PrintAddress { seed_env } => match print_address(&seed_env) {
+            Ok(address) => {
+                println!("{address}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("print-address failed: {err:#}");
+                ExitCode::FAILURE
+            }
+        },
+    }
 }
