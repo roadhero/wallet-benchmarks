@@ -118,21 +118,23 @@ pub(super) async fn run(
     let amount = config.a_fund / 127;
     let tx_record = mode.send_single(recipient, amount, config.fee_rate).await?;
 
-    // `tokio::select!` confirmation loop. The `tokio::time::sleep` arm here
-    // is a **deadline**, not a throttle or backoff — exempted from AC-32 per
-    // `analysis/DESIGN_ADDENDUM.md §S3`. The `CONFIRMATION_POLL_INTERVAL`
-    // sleep between polls is the same exemption: it is a courtesy gap
-    // between read-endpoint calls, not a retry mechanism.
+    // `tokio::select!` confirmation loop. Every sleep inside the select arms
+    // is a **deadline** or a **poll interval bound** — not a throttle or
+    // backoff. AC-32 (per `analysis/DESIGN_ADDENDUM.md §S3` and the
+    // `tests/c_no_retry_backoff_throttle.rs` carve-out) excises
+    // `tokio::select! { ... }` bodies before grepping; both the
+    // `sleep_until(deadline)` deadline arm and the
+    // `sleep(CONFIRMATION_POLL_INTERVAL)` cadence arm live entirely inside
+    // this select block.
     let confirm_start = Instant::now();
-    let deadline_ms = config.per_tx_confirmation_timeout_ms;
-    let deadline = tokio::time::sleep(Duration::from_millis(deadline_ms));
-    tokio::pin!(deadline);
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(config.per_tx_confirmation_timeout_ms);
 
     let mut current_utxo = pre_utxo_count;
     let (post_utxo_count, t_confirm_ms) = loop {
         tokio::select! {
             biased;
-            _ = &mut deadline => {
+            _ = tokio::time::sleep_until(deadline) => {
                 // Timeout: record the last observed UTXO count and `None`
                 // for the confirm time per AC-33's "raw, do not retry" rule.
                 break (current_utxo, None);
