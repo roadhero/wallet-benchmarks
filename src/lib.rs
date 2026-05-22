@@ -10,6 +10,7 @@ pub mod config;
 pub mod env_capture;
 pub mod guards;
 pub mod modes;
+pub mod scenarios;
 pub mod seed;
 pub mod versions;
 pub mod wallet_lifecycle;
