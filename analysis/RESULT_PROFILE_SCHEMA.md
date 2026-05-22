@@ -251,7 +251,7 @@ Concrete entries (rules, not values):
 
 | ID | Type | Pattern | Reason |
 |---|---|---|---|
-| R1 | regex | `\b(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8}\b` | BIP-39-shaped 12/24-word phrase. |
+| R1 | regex | `\b(?:[a-z]{3,8}\s+){11,23}[a-z]{3,8}\b` | Tari 24-word mnemonic OR BIP-39 12/24-word phrase — regex catches the structural shape of both. |
 | R2 | substring (from env) | value of `$HARNESS_SEED_OLD`, `$HARNESS_SEED_NEW`, `$HARNESS_SEED_PP` (each whole-string and each individual word) | Captured seed phrases. |
 | R3 | regex | `(?i)\bview[-_ ]?key\b\s*[:=]\s*[0-9a-f]{32,}` | Hex-encoded view key. |
 | R4 | regex | `(?i)\bspend[-_ ]?key\b\s*[:=]\s*[0-9a-f]{32,}` | Hex-encoded spend key. |
