@@ -19,10 +19,10 @@
 //! Mode 3 itself doesn't know which scenario arm calls it; scenarios in 3i
 //! orchestrate.
 //!
-//! See [`crate::modes::new_wallet`] (Mode 2) for the read-side placeholder
-//! convention — Mode 3 inherits the same placeholder for
-//! `scan_from_birthday` / `get_balance` / `get_utxo_count` / `wipe_and_reimport`,
-//! pointing at the same `DESIGN_AMENDMENT.md §8` follow-up.
+//! See [`crate::modes::new_wallet`] (Mode 2) for the read-side wiring —
+//! Mode 3 mirrors it through the same shared
+//! [`crate::modes::minotari_wallet_ops`] helper, differing only in seed
+//! slot (`mnemonic_payment_processor` here vs `mnemonic_new` in Mode 2).
 
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
@@ -35,7 +35,8 @@ use crate::{
     modes::{
         minotari_subprocess::{create_sign_and_submit, SeedRole},
         minotari_wallet_ops::{
-            rewrite_birthday, run_scan_subprocess, wipe_and_reimport_via_create,
+            rewrite_birthday, run_balance_subprocess, run_scan_subprocess,
+            wipe_and_reimport_via_create,
         },
         Mode, ScanOutcome, TxRecord,
     },
@@ -184,7 +185,9 @@ impl Mode for PaymentProcessor {
     }
 
     async fn get_balance(&mut self) -> anyhow::Result<u64> {
-        anyhow::bail!(read_side_placeholder("get_balance"));
+        run_balance_subprocess(&self.cfg, self.data_dir.path())
+            .await
+            .context("Mode 3 get_balance via minotari Balance")
     }
 
     async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
@@ -333,12 +336,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode3_get_balance_bails_with_amendment_pointer() {
+    async fn mode3_get_balance_attempts_subprocess() {
         let (mut m, seeds) = build_mode3("BAL");
+        m.cfg.minotari_path = Some(std::path::PathBuf::from(
+            "/wallet-benchmarks-test-nonexistent-minotari-binary",
+        ));
         let err = m
             .get_balance()
             .await
-            .expect_err("get_balance placeholder must bail");
+            .expect_err("missing binary must surface as a spawn error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Mode 3 get_balance"),
+            "error must name Mode 3's get_balance: {msg}",
+        );
+        teardown_seeds(&seeds);
+    }
+
+    #[tokio::test]
+    async fn mode3_get_utxo_count_bails_with_amendment_pointer() {
+        let (mut m, seeds) = build_mode3("UTXO");
+        let err = m
+            .get_utxo_count()
+            .await
+            .expect_err("get_utxo_count placeholder must bail");
         let msg = format!("{err:#}");
         assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
         teardown_seeds(&seeds);

@@ -28,7 +28,15 @@
 //!   `log` crate, lands on stderr under env_logger. There is no
 //!   machine-readable `--output-format json` flag (DESIGN_AMENDMENT.md §8.1).
 //!
-//! Additional subcommand wiring (Balance) lands in subsequent commits.
+//! * **Balance** (reads the wallet DB; **takes no `--password`**):
+//!   `--database-path <db> --account-name default`. Stdout format is the literal
+//!   `Balance at height {height}({date}): {total}` where `{total}` is
+//!   [`MicroMinotari`]'s `Display` impl — `"{n} µT"` for amounts < 1 T,
+//!   `"{n.nnnnnn} T"` for amounts ≥ 1 T. The parser matches both shapes
+//!   (anchor strategy `(a)`: structural anchor on the unit sentinel, robust
+//!   to label renames).
+//!
+//! [`MicroMinotari`]: tari_transaction_components::tari_amount::MicroMinotari
 
 use std::{
     path::{Path, PathBuf},
@@ -126,6 +134,25 @@ pub(super) fn build_scan_argv(
         ACCOUNT_NAME.to_string(),
         "--max-blocks-to-scan".to_string(),
         max_blocks_to_scan.to_string(),
+    ]
+}
+
+/// Build the argv for `minotari Balance`.
+///
+/// **`Balance` takes NO `--password` flag** at the pinned `cli.rs` (lines
+/// 247-252) — it reads the DB without unlocking the master cipher seed.
+/// Logged in `analysis/API_DRIFT.md` Step 3i.
+pub(super) fn build_balance_argv(harness_toml_path: &Path, database_path: &Path) -> Vec<String> {
+    vec![
+        "--config".to_string(),
+        harness_toml_path.display().to_string(),
+        "--network".to_string(),
+        NETWORK_FLAG_VALUE.to_string(),
+        "balance".to_string(),
+        "--database-path".to_string(),
+        database_path.display().to_string(),
+        "--account-name".to_string(),
+        ACCOUNT_NAME.to_string(),
     ]
 }
 
@@ -350,6 +377,108 @@ fn parse_event_count(stderr: &str) -> Option<u64> {
     cap.get(1).and_then(|m| m.as_str().parse::<u64>().ok())
 }
 
+/// Spawn `minotari Balance` and return the parsed microTari u64 total.
+///
+/// Stdout format is exactly `Balance at height {h}({d}): {total}` per
+/// `main.rs::handle_balance` at the pinned commit (lines 680-694). `{total}`
+/// is [`MicroMinotari`]'s Display: `"{n} µT"` or `"{n.nnnnnn} T"`.
+///
+/// [`MicroMinotari`]: tari_transaction_components::tari_amount::MicroMinotari
+pub(super) async fn run_balance_subprocess(cfg: &Config, data_dir: &Path) -> anyhow::Result<u64> {
+    let harness_toml = write_harness_toml(data_dir)?;
+    let database_path = data_dir.join("wallet.sqlite3");
+    let argv = build_balance_argv(&harness_toml, &database_path);
+    let binary = resolve_binary(cfg);
+    let (harness_home, path_env) = subprocess_env(data_dir);
+
+    log::debug!(
+        target: LOG_TARGET,
+        "spawning {} for Balance (data_dir={})",
+        binary.display(),
+        data_dir.display(),
+    );
+
+    let output = Command::new(&binary)
+        .args(&argv)
+        .env_clear()
+        .env("HOME", &harness_home)
+        .env("PATH", &path_env)
+        .env("TARI_NETWORK", NETWORK_FLAG_VALUE)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "spawning {} balance (is the binary on $PATH or set Config::minotari_path?)",
+                binary.display(),
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        anyhow::bail!(
+            "minotari balance exit {:?}; stderr={}",
+            output.status,
+            stderr,
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_balance_microtari(&stdout).with_context(|| {
+        format!("parsing microTari total from minotari balance stdout (stdout was: {stdout:?})")
+    })
+}
+
+/// Parse the microTari u64 from `Balance`'s stdout.
+///
+/// The stdout format is `Balance at height {h}({d}): {total}` where `{total}`
+/// is one of:
+/// * `"{n} µT"` — `MicroMinotari::Display` when total < 1 T.
+/// * `"{n.nnnnnn} T"` — `Minotari::Display` (delegated by MicroMinotari when
+///   total ≥ 1 T), 6 decimal places.
+///
+/// The parser tries µT first (lossless u64), then falls back to T (parse
+/// decimal, multiply by 1_000_000). Anchor strategy (a) per
+/// `analysis/DESIGN_AMENDMENT.md §8.3` — robust to label renames as long as
+/// the unit sentinel survives.
+fn parse_balance_microtari(stdout: &str) -> anyhow::Result<u64> {
+    static MICROTARI_RE: OnceLock<Regex> = OnceLock::new();
+    static TARI_RE: OnceLock<Regex> = OnceLock::new();
+    let micro_re = MICROTARI_RE.get_or_init(|| {
+        // Match `{n} µT` — the unit sentinel for MicroMinotari < 1 T.
+        Regex::new(r"(\d+)\s*µT").expect("microtari regex compiles")
+    });
+    let tari_re = TARI_RE.get_or_init(|| {
+        // Match `{n.nnnnnn} T` — the unit sentinel for Minotari ≥ 1 T.
+        // The decimal portion is optional so future formatter precision changes
+        // (e.g. zero precision printing `12 T`) still parse.
+        Regex::new(r"(\d+(?:\.\d+)?)\s*T(?:\b|$)").expect("tari regex compiles")
+    });
+    if let Some(cap) = micro_re.captures(stdout) {
+        if let Some(m) = cap.get(1) {
+            return m
+                .as_str()
+                .parse::<u64>()
+                .with_context(|| format!("parsing µT number from {:?}", m.as_str()));
+        }
+    }
+    if let Some(cap) = tari_re.captures(stdout) {
+        if let Some(m) = cap.get(1) {
+            let tari: f64 = m
+                .as_str()
+                .parse::<f64>()
+                .with_context(|| format!("parsing T decimal from {:?}", m.as_str()))?;
+            let microtari = (tari * 1_000_000.0).round() as u64;
+            return Ok(microtari);
+        }
+    }
+    anyhow::bail!(
+        "no balance amount matched (looked for `{{n}} µT` and `{{n.nnnnnn}} T`); \
+         stdout was {stdout:?}",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -455,5 +584,65 @@ mod tests {
     fn parse_event_count_extracts_zero() {
         let stderr = "info: event_count=0 Scan complete";
         assert_eq!(parse_event_count(stderr), Some(0));
+    }
+
+    #[test]
+    fn build_balance_argv_has_no_password_flag() {
+        // cli.rs lines 247-252: Balance takes only DatabaseArgs + AccountArgs.
+        // No SecurityArgs. The argv must NOT contain --password.
+        let argv = build_balance_argv(
+            Path::new("/data/harness.toml"),
+            Path::new("/data/wallet.sqlite3"),
+        );
+        assert!(
+            !argv.iter().any(|s| s == "--password"),
+            "Balance subcommand takes no --password at the pinned cli.rs (lines 247-252): {argv:?}",
+        );
+        assert_eq!(argv[0], "--config");
+        assert_eq!(argv[2], "--network");
+        assert_eq!(argv[4], "balance");
+        assert!(argv.iter().any(|s| s == "--database-path"));
+        assert!(argv.iter().any(|s| s == "--account-name"));
+    }
+
+    #[test]
+    fn parse_balance_microtari_empty_wallet() {
+        // Fixture: empty wallet — total < 1 T, MicroMinotari Display = "{n} µT".
+        let stdout = include_str!("../../fixtures/minotari_balance_empty.txt");
+        assert_eq!(parse_balance_microtari(stdout).expect("parse"), 0);
+    }
+
+    #[test]
+    fn parse_balance_microtari_partial() {
+        // Fixture: partial wallet — total < 1 T, microtari format.
+        let stdout = include_str!("../../fixtures/minotari_balance_partial.txt");
+        // 500_000 µT.
+        assert_eq!(parse_balance_microtari(stdout).expect("parse"), 500_000);
+    }
+
+    #[test]
+    fn parse_balance_microtari_full() {
+        // Fixture: large wallet — total ≥ 1 T, Tari format with 6 decimals.
+        let stdout = include_str!("../../fixtures/minotari_balance_full.txt");
+        // 10.000000 T = 10_000_000 µT.
+        assert_eq!(parse_balance_microtari(stdout).expect("parse"), 10_000_000);
+    }
+
+    #[test]
+    fn parse_balance_microtari_rejects_garbage() {
+        let err = parse_balance_microtari("nothing useful here").expect_err("must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no balance amount matched"),
+            "error must name the parsing failure: {msg}",
+        );
+    }
+
+    #[test]
+    fn parse_balance_microtari_integer_tari() {
+        // Future-proof: if the formatter ever drops the decimal portion ("5 T"
+        // instead of "5.000000 T"), the parser should still work.
+        let stdout = "Balance at height 100(2026-05-01T00:00:00): 5 T\n";
+        assert_eq!(parse_balance_microtari(stdout).expect("parse"), 5_000_000);
     }
 }

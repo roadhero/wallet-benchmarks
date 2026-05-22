@@ -22,14 +22,13 @@
 //! per call — no internal loops, semaphores, or sleeps.
 //!
 //! **Subprocess-backed read/scan flows (`scan_from_birthday`, `get_balance`,
-//! `get_utxo_count`, `wipe_and_reimport`)**: per `analysis/DESIGN_AMENDMENT.md`
-//! §8 (filed in Step 3g), the new `minotari` CLI surface at the pinned commit
-//! has no machine-parseable `get-balance` / `list-utxos` subcommand and uses
-//! `Create --seed-words` (not `import-seed`) for restoration. These flows
-//! are wired in step 3i once the scenarios layer knows the stdout-parsing
-//! contract; today they bail with a structured pointer at the amendment. The
-//! send_* paths above are fully implemented and are the AC-critical surface
-//! for S0/S1/S4/S5.
+//! `wipe_and_reimport`)**: wired in step 3i.0 against the pinned
+//! `minotari-cli` commit per `analysis/DESIGN_AMENDMENT.md §8.3`. The shared
+//! orchestration lives in [`crate::modes::minotari_wallet_ops`] — Mode 2 and
+//! Mode 3 both route through it, differing only in seed slot (`mnemonic_new`
+//! here, `mnemonic_payment_processor` in Mode 3). `get_utxo_count` is still
+//! the §8-amendment placeholder pending its 3i.0.d wiring against the cached
+//! [`ScanOutcome`].
 
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
@@ -42,7 +41,8 @@ use crate::{
     modes::{
         minotari_subprocess::{create_sign_and_submit, SeedRole},
         minotari_wallet_ops::{
-            rewrite_birthday, run_scan_subprocess, wipe_and_reimport_via_create,
+            rewrite_birthday, run_balance_subprocess, run_scan_subprocess,
+            wipe_and_reimport_via_create,
         },
         Mode, ScanOutcome, TxRecord,
     },
@@ -209,7 +209,11 @@ impl Mode for NewWallet {
     }
 
     async fn get_balance(&mut self) -> anyhow::Result<u64> {
-        anyhow::bail!(read_side_placeholder("get_balance"));
+        // Direct subprocess invocation — `minotari Balance` reads the DB at
+        // its current state and returns the parsed microTari total.
+        run_balance_subprocess(&self.cfg, self.data_dir.path())
+            .await
+            .context("Mode 2 get_balance via minotari Balance")
     }
 
     async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
@@ -363,14 +367,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode2_get_balance_bails_with_amendment_pointer() {
+    async fn mode2_get_balance_attempts_subprocess() {
         let (mut m, seeds) = build_mode2("BAL");
+        m.cfg.minotari_path = Some(std::path::PathBuf::from(
+            "/wallet-benchmarks-test-nonexistent-minotari-binary",
+        ));
         let err = m
             .get_balance()
             .await
-            .expect_err("get_balance placeholder must bail");
+            .expect_err("missing binary must surface as a spawn error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
+        assert!(
+            msg.contains("Mode 2 get_balance"),
+            "error must name Mode 2's get_balance: {msg}",
+        );
         teardown_seeds(&seeds);
     }
 
