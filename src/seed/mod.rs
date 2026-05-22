@@ -19,6 +19,8 @@
 //! (`print-address` subcommand, `enforce_funding` pre-flight, Mode 2/3
 //! recipient computation) all read from the same site.
 
+pub mod redact;
+
 use std::str::FromStr;
 
 use anyhow::Context;
