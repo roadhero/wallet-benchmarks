@@ -1,0 +1,15 @@
+/target/
+/baselines/*.json   # except baseline_profile.json which is committed
+!baseline_profile.json
+/target/harness-data/
+.env
+.env.*
+*.seed
+seeds/
+seeds.toml
+wallets/
+*.tari/
+.tari/
+/Users/
+/home/
+/tmp/wallet-benchmarks-*

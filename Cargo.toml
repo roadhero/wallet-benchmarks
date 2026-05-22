@@ -1,0 +1,47 @@
+[package]
+name = "wallet-benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "wallet-benchmarks"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + IO
+tokio       = { version = "1.47", features = ["full"] }
+reqwest     = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+url         = { version = "2.5", features = ["serde"] }
+
+# CLI / config / logging (mirrors maintainer style)
+clap        = { version = "4", features = ["derive", "env"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+log         = "0.4"
+env_logger  = "0.11"
+anyhow      = "1"
+thiserror   = "1"
+tempfile    = "3"
+chrono      = { version = "0.4", features = ["serde"] }
+rand        = "0.8"
+regex       = "1"
+sha2        = "0.10"
+hex         = "0.4"
+
+# Tari ecosystem — Mode 1 (gRPC) and Mode 2/3 (offline sign + HTTP submit)
+minotari_app_grpc           = { version = "5.3.1", default-features = false }
+minotari_node_wallet_client = "5.3.1"
+tonic                       = { version = "0.13", features = ["transport"] }
+prost                       = "0.13"
+
+tari_common                 = "5.3.1"
+tari_common_types           = "5.3.1"
+tari_transaction_components = "5.3.1"
+tari_crypto                 = { version = "0.22.1", features = ["borsh"] }
+tari_utilities              = "0.8"
+
+[dev-dependencies]
+proptest = "1"
+walkdir  = "2"
