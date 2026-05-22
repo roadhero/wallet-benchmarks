@@ -17,9 +17,11 @@
 //!
 //! This module is added one scenario at a time per `DESIGN.md §swe-impl
 //! execution order`. Step 3i.1.a.2 lands the trait + `ScenarioId` enum +
-//! dispatch skeleton (no scenario impls yet — every variant currently bails
-//! with a "not yet implemented" error). Step 3i.1.a.3 lands B0. Subsequent
-//! steps land S0..S7.
+//! dispatch skeleton. Step 3i.1.a.3 lands B0. Subsequent steps land S0..S7.
+
+mod b0_baseline;
+
+pub use b0_baseline::B0Outcome;
 
 use crate::modes::Mode;
 
@@ -99,27 +101,35 @@ impl std::fmt::Display for ScenarioId {
 /// the type and adds variants in lockstep with scenario impls.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScenarioOutcome {
-    // Variants land per `DESIGN.md §swe-impl execution order`:
-    //   3i.1.a.3 → B0
-    //   3i.1.b   → S0
-    //   3i.1.c   → S1
-    //   …        → S2..S7
-    // This module currently carries no variants — `run_scenario` bails for
-    // every id below.
+    /// B0 — from-genesis archival scan against unfunded wallet (AC-10).
+    B0(B0Outcome),
+    // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
+    //   3i.1.b → S0
+    //   3i.1.c → S1
+    //   …      → S2..S7
 }
 
 /// Run the named scenario against the given mode.
 ///
 /// Dispatches to per-scenario impl based on `id`. No registry, no factory —
 /// scenarios are added one at a time as the workspace fills out per
-/// `DESIGN.md §swe-impl execution order`. Until step 3i.1.a.3 lands B0,
-/// every id bails with a "not yet implemented" error.
-pub async fn run_scenario(id: ScenarioId, _mode: &mut dyn Mode) -> anyhow::Result<ScenarioOutcome> {
-    anyhow::bail!(
-        "scenario {id} not yet implemented (step 3i.1.a.2 lands the dispatch \
-         skeleton; per-scenario impls follow in DESIGN.md swe-impl execution \
-         order starting with B0 in step 3i.1.a.3)"
-    )
+/// `DESIGN.md §swe-impl execution order`. B0 lands in step 3i.1.a.3;
+/// S0..S7 follow.
+pub async fn run_scenario(id: ScenarioId, mode: &mut dyn Mode) -> anyhow::Result<ScenarioOutcome> {
+    match id {
+        ScenarioId::B0 => b0_baseline::run(mode).await.map(ScenarioOutcome::B0),
+        ScenarioId::S0
+        | ScenarioId::S1
+        | ScenarioId::S2
+        | ScenarioId::S3
+        | ScenarioId::S4
+        | ScenarioId::S5
+        | ScenarioId::S6
+        | ScenarioId::S7 => anyhow::bail!(
+            "scenario {id} not yet implemented (step 3i.1.a lands B0 only; \
+             subsequent scenarios follow in DESIGN.md swe-impl execution order)"
+        ),
+    }
 }
 
 #[cfg(test)]
