@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod env_capture;
 pub mod guards;
 
 use std::str::FromStr;
