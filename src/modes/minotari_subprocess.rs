@@ -94,9 +94,6 @@ pub(super) enum SeedRole {
     /// New-wallet mode seed (`SeedHandle::mnemonic_new`) — Mode 2.
     New,
     /// Payment-processor seed (`SeedHandle::mnemonic_payment_processor`) — Mode 3.
-    /// `dead_code` allow lifts in the Mode 3 (`PaymentProcessor`) commit that
-    /// follows this one — that's the only consumer of this variant.
-    #[allow(dead_code)]
     Pp,
 }
 

@@ -21,6 +21,7 @@
 pub(super) mod minotari_subprocess;
 pub mod new_wallet;
 pub mod old_wallet;
+pub mod payment_processor;
 
 use tari_common_types::tari_address::TariAddress;
 
