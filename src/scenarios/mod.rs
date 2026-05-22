@@ -21,9 +21,11 @@
 
 mod b0_baseline;
 mod s0_warmup;
+mod s1_volume;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
+pub use s1_volume::{RoundOutcome, S1Outcome};
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -129,8 +131,9 @@ pub enum ScenarioOutcome {
     B0(B0Outcome),
     /// S0 — single funding-style transaction; produces `h_birth` (AC-11).
     S0(S0Outcome),
+    /// S1 — UTXO multiplication across 7 doubling rounds (AC-12/13/14).
+    S1(S1Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   3i.1.c → S1
     //   …      → S2..S7
 }
 
@@ -150,14 +153,16 @@ pub async fn run_scenario(
         ScenarioId::S0 => s0_warmup::run(ctx.config, mode, ctx.recipient)
             .await
             .map(ScenarioOutcome::S0),
-        ScenarioId::S1
-        | ScenarioId::S2
+        ScenarioId::S1 => s1_volume::run(ctx.config, mode, ctx.recipient, None)
+            .await
+            .map(ScenarioOutcome::S1),
+        ScenarioId::S2
         | ScenarioId::S3
         | ScenarioId::S4
         | ScenarioId::S5
         | ScenarioId::S6
         | ScenarioId::S7 => anyhow::bail!(
-            "scenario {id} not yet implemented (step 3i.1.b lands S0; \
+            "scenario {id} not yet implemented (step 3i.1.c lands S1; \
              subsequent scenarios follow in DESIGN.md swe-impl execution order)"
         ),
     }

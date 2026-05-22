@@ -246,6 +246,18 @@ pub(crate) mod test_support {
 
     use super::*;
 
+    /// Per-call outcome injected into FakeMode's `send_single_sequence` —
+    /// success returns the named `TxRecord`, failure bails with the named
+    /// message. Used by scenarios (S1+) that need to model alternating
+    /// success/failure across multiple sends in a single test.
+    #[derive(Clone)]
+    pub(crate) enum SendOutcome {
+        /// Return `Ok(tx_record.clone())` from `send_single`.
+        Ok(TxRecord),
+        /// Bail with `anyhow!("FakeMode::send_single: {msg}")` from `send_single`.
+        Err(String),
+    }
+
     /// Hand-rolled fake for scenario unit tests. Records call order and
     /// returns canned values per method. See module docs for rationale.
     ///
@@ -256,6 +268,10 @@ pub(crate) mod test_support {
     /// advances an internal index; once the index reaches the end of the
     /// sequence the **last** value is repeated indefinitely (saturating).
     /// An empty sequence still yields the "no canned value set" error.
+    ///
+    /// `send_single_sequence` (used by S1+) is the per-call outcome list:
+    /// each `send_single` call pops the front; once exhausted, the fake
+    /// falls through to `canned_send_single` (legacy single-value path).
     pub(crate) struct FakeMode {
         /// Returned by `scan_from_birthday`.
         pub canned_scan: Option<ScanOutcome>,
@@ -263,8 +279,12 @@ pub(crate) mod test_support {
         pub canned_balance: Vec<u64>,
         /// Successive values returned by `get_utxo_count`; last value sticks.
         pub canned_utxo_count: Vec<u64>,
-        /// Returned by `send_single`.
+        /// Default `send_single` return value when `send_single_sequence` is
+        /// empty.
         pub canned_send_single: Option<TxRecord>,
+        /// Per-call outcomes for `send_single`. Each call consumes the
+        /// front; once empty, falls through to `canned_send_single`.
+        pub send_single_sequence: Vec<SendOutcome>,
         /// Returned by `send_batch_one_to_many`.
         pub canned_batch: Option<TxRecord>,
         /// If `Some`, every method bails with this message.
@@ -275,6 +295,8 @@ pub(crate) mod test_support {
         balance_idx: Mutex<usize>,
         /// Index into `canned_utxo_count` for the next `get_utxo_count` call.
         utxo_idx: Mutex<usize>,
+        /// Index into `send_single_sequence` for the next `send_single` call.
+        send_single_idx: Mutex<usize>,
     }
 
     impl FakeMode {
@@ -285,11 +307,13 @@ pub(crate) mod test_support {
                 canned_balance: Vec::new(),
                 canned_utxo_count: Vec::new(),
                 canned_send_single: None,
+                send_single_sequence: Vec::new(),
                 canned_batch: None,
                 fail_with: None,
                 calls: Mutex::new(Vec::new()),
                 balance_idx: Mutex::new(0),
                 utxo_idx: Mutex::new(0),
+                send_single_idx: Mutex::new(0),
             }
         }
 
@@ -322,9 +346,28 @@ pub(crate) mod test_support {
         ) -> anyhow::Result<TxRecord> {
             self.record("send_single");
             self.check_fail("send_single")?;
-            self.canned_send_single
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("FakeMode::send_single: no canned value set"))
+            // First check the per-call sequence; once exhausted, fall through
+            // to the legacy single-value canned_send_single.
+            let outcome = {
+                let mut idx = self.send_single_idx.lock().unwrap();
+                if *idx < self.send_single_sequence.len() {
+                    let out = self.send_single_sequence[*idx].clone();
+                    *idx += 1;
+                    Some(out)
+                } else {
+                    None
+                }
+            };
+            match outcome {
+                Some(SendOutcome::Ok(rec)) => Ok(rec),
+                Some(SendOutcome::Err(msg)) => {
+                    anyhow::bail!("FakeMode::send_single: {msg}")
+                }
+                None => self
+                    .canned_send_single
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("FakeMode::send_single: no canned value set")),
+            }
         }
 
         async fn send_batch_one_to_many(
