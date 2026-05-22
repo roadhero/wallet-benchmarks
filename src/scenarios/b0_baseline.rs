@@ -44,9 +44,9 @@ pub struct B0Outcome {
     /// from-genesis scan only.
     pub t_scan_ms: u64,
     /// `blocks_per_sec` per `RESULT_PROFILE_SCHEMA.md §B0` —
-    /// `(tip_height_end - 0) / (t_scan_ms / 1000)`. `f64::NAN` when
+    /// `(tip_height_end - 0) / (t_scan_ms / 1000)`. `None` when
     /// `t_scan_ms == 0` (degenerate fake-mode case in tests).
-    pub blocks_per_sec: f64,
+    pub blocks_per_sec: Option<f64>,
     /// `h_tip_start` per `RESULT_PROFILE_SCHEMA.md §B0` — tip when scan
     /// begins (sourced from `ScanOutcome::h_tip_start`).
     pub h_tip_start: u64,
@@ -79,12 +79,14 @@ pub(super) async fn run(mode: &mut dyn Mode) -> anyhow::Result<B0Outcome> {
     let t_scan_ms = u64::try_from(scan_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // `blocks_per_sec` per schema: `(h_tip_end - 0) / (t_scan_ms / 1000)`.
-    // Use `f64::NAN` when `t_scan_ms == 0` so the value is loud (rather
-    // than silently zero) in the degenerate test-fake case.
+    // `None` when `t_scan_ms == 0` so downstream tests and the result-profile
+    // writer don't have to special-case `NAN` (which compares `!= NAN`).
+    // Establishes the pattern for all subsequent rate/throughput fields on
+    // S0..S7 Outcomes.
     let blocks_per_sec = if t_scan_ms == 0 {
-        f64::NAN
+        None
     } else {
-        (scan.h_tip_end as f64) / ((t_scan_ms as f64) / 1000.0)
+        Some((scan.h_tip_end as f64) / ((t_scan_ms as f64) / 1000.0))
     };
 
     Ok(B0Outcome {
@@ -127,6 +129,20 @@ mod tests {
         );
         assert_eq!(outcome.h_tip_start, 100);
         assert_eq!(outcome.h_tip_end, 200);
+        // `blocks_per_sec` is `None` only when `t_scan_ms == 0`; the in-fn
+        // timer reads `Instant::now()` twice across the `mode.scan_from_birthday`
+        // await point, so the elapsed time is non-zero in practice. Assert on
+        // the discriminant rather than the value so the test stays portable
+        // across CI runners with different clock granularities.
+        match outcome.blocks_per_sec {
+            Some(v) => assert!(
+                v.is_finite() && v >= 0.0,
+                "blocks_per_sec must be a finite non-negative rate: {v}",
+            ),
+            None => {
+                // Permitted in the degenerate `t_scan_ms == 0` case.
+            }
+        }
         assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
         assert!(outcome.peak_cpu_pct.is_none(), "sampler lands in 3j");
 
