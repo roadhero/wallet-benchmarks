@@ -62,6 +62,7 @@ mod tests {
         Config {
             network: network.to_string(),
             base_node_url: Url::parse(url).expect("test url parses"),
+            ..Config::default()
         }
     }
 
