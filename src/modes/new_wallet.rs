@@ -34,12 +34,16 @@
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
 
+use std::time::Instant;
+
 use crate::{
     broadcast::Broadcaster,
     config::Config,
     modes::{
         minotari_subprocess::{create_sign_and_submit, SeedRole},
-        minotari_wallet_ops::{rewrite_birthday, wipe_and_reimport_via_create},
+        minotari_wallet_ops::{
+            rewrite_birthday, run_scan_subprocess, wipe_and_reimport_via_create,
+        },
         Mode, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
@@ -63,6 +67,12 @@ pub struct NewWallet {
     broadcaster: Broadcaster,
     data_dir: HarnessDataDir,
     tx_idx: u64,
+    /// Cached [`ScanOutcome`] from the most recent successful
+    /// [`Mode::scan_from_birthday`] call. [`Mode::get_utxo_count`] reads
+    /// `outputs_found` from here per `analysis/DESIGN_AMENDMENT.md §8.3`
+    /// step 4 — the CLI exposes no separate UTXO-count subcommand, so the
+    /// scan's own discovery count is the canonical source.
+    last_scan: Option<ScanOutcome>,
 }
 
 impl NewWallet {
@@ -79,6 +89,7 @@ impl NewWallet {
             broadcaster,
             data_dir,
             tx_idx: 0,
+            last_scan: None,
         }
     }
 
@@ -146,8 +157,55 @@ impl Mode for NewWallet {
         .context("Mode 2 create_sign_and_submit (batch 1-to-many)")
     }
 
-    async fn scan_from_birthday(&mut self, _birthday: u16) -> anyhow::Result<ScanOutcome> {
-        anyhow::bail!(read_side_placeholder("scan_from_birthday"));
+    async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
+        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 1:
+        //   wipe_and_reimport(birthday) -> run minotari Scan -> return ScanOutcome.
+        // Fields the scenarios layer fills in (tip queries, balance,
+        // peak RSS/CPU) follow Mode 1's `OldWallet::scan_from_birthday`
+        // precedent of returning 0 — scenarios call `get_balance` and base-node
+        // tip queries to backfill before folding into the per-cell envelope.
+        let started = Instant::now();
+        self.wipe_and_reimport(birthday)
+            .await
+            .context("Mode 2 wipe_and_reimport prerequisite to scan")?;
+        let parsed = run_scan_subprocess(
+            &self.cfg,
+            self.data_dir.path(),
+            self.seeds
+                .wallet_password()
+                .context("reading wallet password for Mode 2 scan")?
+                .reveal(),
+            None,
+        )
+        .await
+        .context("Mode 2 run_scan_subprocess")?;
+        let t_scan_ms = started.elapsed().as_millis() as u64;
+        let outputs_found = parsed.outputs_found.unwrap_or(0);
+        let outcome = ScanOutcome {
+            t_scan_ms,
+            // h_tip_start / h_tip_end: scenarios layer fills these from
+            // base-node tip queries (Mode 1's old_wallet.rs uses the same
+            // "0 here means scenario fills it in" convention).
+            h_tip_start: 0,
+            h_tip_end: 0,
+            outputs_found,
+            // utxo_count: per `analysis/DESIGN_AMENDMENT.md §8.3` step 4 the
+            // CLI exposes no UTXO-count subcommand. The scan's own
+            // discovery count is the canonical source (an output is by
+            // construction a UTXO at discovery time).
+            utxo_count: outputs_found,
+            // balance_microtari: scenarios layer composes a `get_balance` call
+            // after `scan_from_birthday`; the post-scan balance subprocess is
+            // independent of the scan's outputs_found and lands in a later
+            // commit.
+            balance_microtari: 0,
+        };
+        self.last_scan = Some(outcome.clone());
+        log::info!(
+            target: LOG_TARGET,
+            "Mode 2 scan_from_birthday complete (birthday={birthday}, outputs_found={outputs_found}, t_scan_ms={t_scan_ms})",
+        );
+        Ok(outcome)
     }
 
     async fn get_balance(&mut self) -> anyhow::Result<u64> {
@@ -283,16 +341,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode2_scan_from_birthday_bails_with_amendment_pointer() {
+    async fn mode2_scan_from_birthday_attempts_subprocess() {
+        // Scan first wipes (which spawns `minotari Create`) and then scans
+        // (`minotari Scan`). With a non-existent binary the failure surfaces
+        // at the first spawn (inside wipe_and_reimport) with Mode 2's scan
+        // context wrapped over the inner wipe context.
         let (mut m, seeds) = build_mode2("SCAN");
+        m.cfg.minotari_path = Some(std::path::PathBuf::from(
+            "/wallet-benchmarks-test-nonexistent-minotari-binary",
+        ));
         let err = m
             .scan_from_birthday(0)
             .await
-            .expect_err("scan placeholder must bail");
+            .expect_err("missing binary must surface as a spawn error");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("DESIGN_AMENDMENT.md §8"),
-            "bail must point at the amendment: {msg}",
+            msg.contains("Mode 2") && msg.contains("scan"),
+            "error must name Mode 2's scan path: {msg}",
         );
         teardown_seeds(&seeds);
     }

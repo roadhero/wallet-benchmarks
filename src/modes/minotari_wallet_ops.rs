@@ -22,15 +22,23 @@
 //!   `--password <pw> --database-path <db> --account-name default --seed-words "<24 words>"`.
 //!   Successful exit means the wallet DB exists at `<db>`.
 //!
-//! Additional subcommand wiring (Scan, Balance) lands in subsequent commits.
+//! * **Scan** (one-shot scan up to `--max-blocks-to-scan` blocks):
+//!   `--password <pw> --database-path <db> --account-name default --max-blocks-to-scan <N>`.
+//!   Emits the result as `info!(event_count = events.len(); "Scan complete")` —
+//!   `log` crate, lands on stderr under env_logger. There is no
+//!   machine-readable `--output-format json` flag (DESIGN_AMENDMENT.md §8.1).
+//!
+//! Additional subcommand wiring (Balance) lands in subsequent commits.
 
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
+    sync::OnceLock,
 };
 
 use anyhow::Context;
+use regex::Regex;
 use tari_common_types::seeds::{
     cipher_seed::CipherSeed,
     mnemonic::{Mnemonic, MnemonicLanguage},
@@ -52,6 +60,16 @@ const NETWORK_FLAG_VALUE: &str = "esmeralda";
 /// Account name set on every subprocess `--account-name` flag. Mirrors
 /// [`crate::modes::minotari_subprocess::ACCOUNT_NAME`].
 const ACCOUNT_NAME: &str = "default";
+
+/// `--max-blocks-to-scan` value passed to `minotari Scan` when the caller does
+/// not specify one. The cli.rs default is 50 (per `cli.rs` line 165 at the
+/// pinned commit); the harness's B0/S2/S3/S6/S7 scenarios need a much higher
+/// ceiling because they walk from genesis to tip. `u64::MAX` lets the
+/// subprocess consume blocks until the wallet's underlying scan logic stops
+/// (typically when it catches up to the live tip).
+///
+/// Justified in commit body; logged in `analysis/API_DRIFT.md` Step 3i.
+const DEFAULT_MAX_BLOCKS_TO_SCAN: u64 = u64::MAX;
 
 /// Build the argv for `minotari Create --seed-words "<mnemonic>"`.
 ///
@@ -80,6 +98,34 @@ pub(super) fn build_create_argv(
         ACCOUNT_NAME.to_string(),
         "--seed-words".to_string(),
         mnemonic.to_string(),
+    ]
+}
+
+/// Build the argv for `minotari Scan`.
+///
+/// `max_blocks_to_scan` is the only knob the CLI exposes for bounding the
+/// scan (per `cli.rs` lines 154-167 at the pinned commit). The harness uses
+/// [`DEFAULT_MAX_BLOCKS_TO_SCAN`] when the caller passes `None`.
+pub(super) fn build_scan_argv(
+    harness_toml_path: &Path,
+    database_path: &Path,
+    password: &str,
+    max_blocks_to_scan: u64,
+) -> Vec<String> {
+    vec![
+        "--config".to_string(),
+        harness_toml_path.display().to_string(),
+        "--network".to_string(),
+        NETWORK_FLAG_VALUE.to_string(),
+        "scan".to_string(),
+        "--password".to_string(),
+        password.to_string(),
+        "--database-path".to_string(),
+        database_path.display().to_string(),
+        "--account-name".to_string(),
+        ACCOUNT_NAME.to_string(),
+        "--max-blocks-to-scan".to_string(),
+        max_blocks_to_scan.to_string(),
     ]
 }
 
@@ -207,6 +253,103 @@ pub(super) async fn wipe_and_reimport_via_create(
     Ok(())
 }
 
+/// Result of [`run_scan_subprocess`] — the parsed shape of `minotari Scan`'s
+/// observable output. `outputs_found` comes from the stderr `event_count=N`
+/// emission (log-crate's key-value formatting); `blocks_scanned` is taken from
+/// `max_blocks_to_scan` because the CLI does not emit the actual processed
+/// count separately (DESIGN_AMENDMENT.md §8 / API_DRIFT.md Step 3i).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScanStdoutParsed {
+    /// Wallet outputs discovered by the scan. Parsed from
+    /// `info!(event_count = events.len(); "Scan complete")` on the subprocess's
+    /// stderr. `None` when the line was absent (subprocess exited successfully
+    /// but emitted no `event_count` token — e.g. log level filtered it out).
+    pub outputs_found: Option<u64>,
+    /// Upper bound on the number of blocks scanned this invocation. The CLI
+    /// does not emit a precise post-hoc count; the harness records what it
+    /// asked for so scenarios can compare against base-node tip deltas.
+    #[allow(dead_code)]
+    pub max_blocks_to_scan: u64,
+}
+
+/// Spawn `minotari Scan` and capture its parsed result.
+///
+/// `RUST_LOG=info` is forced into the subprocess environment so the
+/// `info!(event_count = ...)` line is emitted at all. The parser is anchored
+/// on `event_count=N` (regex `event_count=(\d+)`); if the subprocess exits
+/// successfully but the line is absent, `outputs_found` is `None` and the
+/// caller decides whether that is a soft signal or a failure.
+pub(super) async fn run_scan_subprocess(
+    cfg: &Config,
+    data_dir: &Path,
+    password: &str,
+    max_blocks: Option<u64>,
+) -> anyhow::Result<ScanStdoutParsed> {
+    let harness_toml = write_harness_toml(data_dir)?;
+    let database_path = data_dir.join("wallet.sqlite3");
+    let max_blocks_to_scan = max_blocks.unwrap_or(DEFAULT_MAX_BLOCKS_TO_SCAN);
+    let argv = build_scan_argv(&harness_toml, &database_path, password, max_blocks_to_scan);
+    let binary = resolve_binary(cfg);
+    let (harness_home, path_env) = subprocess_env(data_dir);
+
+    log::debug!(
+        target: LOG_TARGET,
+        "spawning {} for Scan (data_dir={}, max_blocks_to_scan={max_blocks_to_scan}, password redacted)",
+        binary.display(),
+        data_dir.display(),
+    );
+
+    let output = Command::new(&binary)
+        .args(&argv)
+        .env_clear()
+        .env("HOME", &harness_home)
+        .env("PATH", &path_env)
+        .env("TARI_NETWORK", NETWORK_FLAG_VALUE)
+        // The CLI emits its scan-complete summary via the `log` crate at
+        // `info`. Without RUST_LOG=info the env_logger default ("error") drops
+        // the only token the harness can parse — force it explicitly.
+        .env("RUST_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| {
+            format!(
+                "spawning {} scan (is the binary on $PATH or set Config::minotari_path?)",
+                binary.display(),
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        anyhow::bail!("minotari scan exit {:?}; stderr={}", output.status, stderr,);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let outputs_found = parse_event_count(&stderr);
+    log::info!(
+        target: LOG_TARGET,
+        "minotari scan succeeded (outputs_found={outputs_found:?}, max_blocks_to_scan={max_blocks_to_scan})",
+    );
+    Ok(ScanStdoutParsed {
+        outputs_found,
+        max_blocks_to_scan,
+    })
+}
+
+/// Parse the `event_count=N` token from `Scan`'s stderr.
+///
+/// Anchor is structural (the literal key-value name emitted by the `log`
+/// crate's `info!(event_count = events.len(); ...)` macro form). Returns
+/// `None` if the token is absent (e.g. log level filtered it out).
+fn parse_event_count(stderr: &str) -> Option<u64> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        RE.get_or_init(|| Regex::new(r"event_count=(\d+)").expect("event_count regex compiles"));
+    let cap = re.captures(stderr)?;
+    cap.get(1).and_then(|m| m.as_str().parse::<u64>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -270,5 +413,47 @@ mod tests {
     fn default_binary_is_minotari() {
         assert_eq!(DEFAULT_BINARY, "minotari");
         assert_ne!(DEFAULT_BINARY, "minotari_console_wallet");
+    }
+
+    #[test]
+    fn build_scan_argv_has_top_level_flags_before_subcommand() {
+        let argv = build_scan_argv(
+            Path::new("/data/harness.toml"),
+            Path::new("/data/wallet.sqlite3"),
+            "pw",
+            12345,
+        );
+        assert_eq!(argv[0], "--config");
+        assert_eq!(argv[1], "/data/harness.toml");
+        assert_eq!(argv[2], "--network");
+        assert_eq!(argv[3], "esmeralda");
+        assert_eq!(argv[4], "scan");
+        assert_eq!(argv[5], "--password");
+        assert_eq!(argv[6], "pw");
+        assert_eq!(argv[7], "--database-path");
+        assert_eq!(argv[8], "/data/wallet.sqlite3");
+        assert_eq!(argv[9], "--account-name");
+        assert_eq!(argv[10], "default");
+        assert_eq!(argv[11], "--max-blocks-to-scan");
+        assert_eq!(argv[12], "12345");
+        assert_eq!(argv.len(), 13);
+    }
+
+    #[test]
+    fn parse_event_count_extracts_number() {
+        let stderr = "[2026-05-22T12:00:00 INFO minotari] event_count=42 Scan complete\n";
+        assert_eq!(parse_event_count(stderr), Some(42));
+    }
+
+    #[test]
+    fn parse_event_count_returns_none_when_absent() {
+        assert_eq!(parse_event_count("Scan complete\n"), None);
+        assert_eq!(parse_event_count(""), None);
+    }
+
+    #[test]
+    fn parse_event_count_extracts_zero() {
+        let stderr = "info: event_count=0 Scan complete";
+        assert_eq!(parse_event_count(stderr), Some(0));
     }
 }

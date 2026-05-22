@@ -27,12 +27,16 @@
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
 
+use std::time::Instant;
+
 use crate::{
     broadcast::Broadcaster,
     config::Config,
     modes::{
         minotari_subprocess::{create_sign_and_submit, SeedRole},
-        minotari_wallet_ops::{rewrite_birthday, wipe_and_reimport_via_create},
+        minotari_wallet_ops::{
+            rewrite_birthday, run_scan_subprocess, wipe_and_reimport_via_create,
+        },
         Mode, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
@@ -55,6 +59,11 @@ pub struct PaymentProcessor {
     broadcaster: Broadcaster,
     data_dir: HarnessDataDir,
     tx_idx: u64,
+    /// Cached [`ScanOutcome`] from the most recent successful
+    /// [`Mode::scan_from_birthday`] call. [`Mode::get_utxo_count`] reads
+    /// `outputs_found` from here per `analysis/DESIGN_AMENDMENT.md §8.3`
+    /// step 4 — same convention as [`crate::modes::new_wallet::NewWallet`].
+    last_scan: Option<ScanOutcome>,
 }
 
 impl PaymentProcessor {
@@ -68,6 +77,7 @@ impl PaymentProcessor {
             broadcaster,
             data_dir,
             tx_idx: 0,
+            last_scan: None,
         }
     }
 
@@ -135,8 +145,42 @@ impl Mode for PaymentProcessor {
         .context("Mode 3 create_sign_and_submit (batch 1-to-many)")
     }
 
-    async fn scan_from_birthday(&mut self, _birthday: u16) -> anyhow::Result<ScanOutcome> {
-        anyhow::bail!(read_side_placeholder("scan_from_birthday"));
+    async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
+        // Mirror of [`crate::modes::new_wallet::NewWallet::scan_from_birthday`];
+        // see that impl's comment for the design trace and field-by-field
+        // rationale. The only difference is the seed slot consumed by the
+        // prerequisite `wipe_and_reimport` (`mnemonic_payment_processor` here).
+        let started = Instant::now();
+        self.wipe_and_reimport(birthday)
+            .await
+            .context("Mode 3 wipe_and_reimport prerequisite to scan")?;
+        let parsed = run_scan_subprocess(
+            &self.cfg,
+            self.data_dir.path(),
+            self.seeds
+                .wallet_password()
+                .context("reading wallet password for Mode 3 scan")?
+                .reveal(),
+            None,
+        )
+        .await
+        .context("Mode 3 run_scan_subprocess")?;
+        let t_scan_ms = started.elapsed().as_millis() as u64;
+        let outputs_found = parsed.outputs_found.unwrap_or(0);
+        let outcome = ScanOutcome {
+            t_scan_ms,
+            h_tip_start: 0,
+            h_tip_end: 0,
+            outputs_found,
+            utxo_count: outputs_found,
+            balance_microtari: 0,
+        };
+        self.last_scan = Some(outcome.clone());
+        log::info!(
+            target: LOG_TARGET,
+            "Mode 3 scan_from_birthday complete (birthday={birthday}, outputs_found={outputs_found}, t_scan_ms={t_scan_ms})",
+        );
+        Ok(outcome)
     }
 
     async fn get_balance(&mut self) -> anyhow::Result<u64> {
@@ -268,14 +312,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode3_scan_from_birthday_bails_with_amendment_pointer() {
+    async fn mode3_scan_from_birthday_attempts_subprocess() {
+        // Mirror of the Mode 2 test — first spawn (inside wipe_and_reimport)
+        // fails because `minotari_path` points at a non-existent binary; the
+        // failure surfaces with Mode 3's scan context.
         let (mut m, seeds) = build_mode3("SCAN");
+        m.cfg.minotari_path = Some(std::path::PathBuf::from(
+            "/wallet-benchmarks-test-nonexistent-minotari-binary",
+        ));
         let err = m
             .scan_from_birthday(0)
             .await
-            .expect_err("scan placeholder must bail");
+            .expect_err("missing binary must surface as a spawn error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
+        assert!(
+            msg.contains("Mode 3") && msg.contains("scan"),
+            "error must name Mode 3's scan path: {msg}",
+        );
         teardown_seeds(&seeds);
     }
 
