@@ -8,11 +8,19 @@ pub mod cli;
 pub mod config;
 pub mod guards;
 
-use anyhow::{bail, Context};
-use tari_common_types::seeds::{
-    cipher_seed::CipherSeed,
-    mnemonic::{Mnemonic, MnemonicLanguage},
+use std::str::FromStr;
+
+use anyhow::Context;
+use tari_common::configuration::Network;
+use tari_common_types::{
+    seeds::{
+        cipher_seed::CipherSeed,
+        mnemonic::{Mnemonic, MnemonicLanguage},
+        seed_words::SeedWords,
+    },
+    tari_address::{TariAddress, TariAddressFeatures},
 };
+use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
 
 const LOG_TARGET: &str = "c::lib";
 
@@ -33,20 +41,53 @@ pub fn gen_seed() -> anyhow::Result<String> {
     Ok(seed_words.join(" ").reveal().to_string())
 }
 
-/// Stub for the `print-address` subcommand. The real implementation lands in a
-/// later commit; this placeholder lets the CLI shape parse and dispatch through
-/// the same code path.
-pub fn print_address(_seed_env_name: &str) -> anyhow::Result<String> {
-    bail!("print-address not yet implemented");
+/// Derives the Esmeralda wallet address from the seed mnemonic held in the named
+/// environment variable and returns it as a base58 string.
+///
+/// The address is built via the [`TariAddress::new_dual_address`] fallback path
+/// recorded in `analysis/API_DRIFT.md` Step 2 — `WalletType::tari_address()`
+/// does not exist on the published v5.3.1 surface, so the harness assembles the
+/// dual address from the wallet's public view/spend keys and the one-sided
+/// features flag, exactly as PR #99 does. Output uses base58 per
+/// DESIGN_ADDENDUM.md §S2 so it can be piped straight into
+/// `minotari --network esmeralda create-unsigned-transaction --recipient ...`.
+pub fn print_address(seed_env_name: &str) -> anyhow::Result<String> {
+    log::debug!(
+        target: LOG_TARGET,
+        "deriving address from seed env var {seed_env_name}",
+    );
+    let mnemonic = std::env::var(seed_env_name).with_context(|| {
+        format!("reading seed mnemonic from env var ${seed_env_name} (set it to the 24-word Tari mnemonic)")
+    })?;
+    let seed_words = SeedWords::from_str(&mnemonic).map_err(|e| {
+        anyhow::Error::msg(format!("parsing mnemonic words from ${seed_env_name}: {e}"))
+    })?;
+    let cipher_seed = <CipherSeed as Mnemonic<CipherSeed>>::from_mnemonic(&seed_words, None)
+        .map_err(|e| anyhow::Error::msg(format!("decoding CipherSeed from mnemonic: {e}")))?;
+    let seed_words_wallet =
+        SeedWordsWallet::construct_new(cipher_seed).map_err(anyhow::Error::msg)?;
+    let wallet = WalletType::SeedWords(seed_words_wallet);
+    let view_pub = wallet.get_public_view_key();
+    let spend_pub = wallet.get_public_spend_key();
+    let address = TariAddress::new_dual_address(
+        view_pub,
+        spend_pub,
+        Network::Esmeralda,
+        TariAddressFeatures::create_one_sided_only(),
+        None,
+    )
+    .map_err(|e| anyhow::Error::msg(format!("assembling TariAddress: {e}")))?;
+    Ok(address.to_base58())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
-    use tari_common_types::seeds::seed_words::SeedWords;
-
     use super::*;
+
+    /// Each test that exercises the env-var path uses a unique env var name to
+    /// avoid cross-test mutation races under cargo's default parallel runner.
+    const ROUNDTRIP_ENV: &str = "WALLET_BENCHMARKS_TEST_SEED_ROUNDTRIP";
+    const DETERMINISM_ENV: &str = "WALLET_BENCHMARKS_TEST_SEED_DETERMINISM";
 
     #[test]
     fn gen_seed_emits_24_english_words() {
@@ -79,5 +120,87 @@ mod tests {
         let a = gen_seed().expect("first gen_seed");
         let b = gen_seed().expect("second gen_seed");
         assert_ne!(a, b, "two CipherSeed::random invocations must differ");
+    }
+
+    #[test]
+    fn print_address_round_trips_through_base58() {
+        let mnemonic = gen_seed().expect("gen_seed succeeds");
+        // SAFETY: each test uses a unique env-var name to avoid cross-test races
+        // under cargo's default parallel runner. `set_var`/`remove_var` are
+        // `unsafe` on Rust 1.84+; the `unused_unsafe` lint is allowed for older
+        // toolchains.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(ROUNDTRIP_ENV, &mnemonic);
+        }
+        let base58 = print_address(ROUNDTRIP_ENV).expect("print_address succeeds");
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(ROUNDTRIP_ENV);
+        }
+        let decoded = TariAddress::from_base58(&base58).expect("base58 decodes");
+        assert_eq!(
+            decoded.to_base58(),
+            base58,
+            "base58 round-trip must be stable",
+        );
+    }
+
+    #[test]
+    fn print_address_is_deterministic_for_a_given_seed() {
+        let mnemonic = gen_seed().expect("gen_seed succeeds");
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(DETERMINISM_ENV, &mnemonic);
+        }
+        let first = print_address(DETERMINISM_ENV).expect("first print_address");
+        let second = print_address(DETERMINISM_ENV).expect("second print_address");
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(DETERMINISM_ENV);
+        }
+        assert_eq!(
+            first, second,
+            "two derivations of the same seed must produce the same address",
+        );
+    }
+
+    #[test]
+    fn print_address_errors_when_env_var_missing() {
+        const MISSING: &str = "WALLET_BENCHMARKS_NO_SUCH_SEED_ENV_FOR_TEST";
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(MISSING);
+        }
+        let err = print_address(MISSING).expect_err("missing env must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(MISSING),
+            "error should name the missing env var: {msg}",
+        );
+    }
+
+    #[test]
+    fn print_address_errors_on_invalid_mnemonic() {
+        const BAD: &str = "WALLET_BENCHMARKS_BAD_SEED_ENV_FOR_TEST";
+        // Twenty-four real-looking but unchecksummed words: parses past the
+        // SeedWords splitter but fails CipherSeed decoding.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(
+                BAD,
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+            );
+        }
+        let err = print_address(BAD).expect_err("bad mnemonic must error");
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(BAD);
+        }
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("CipherSeed") || msg.contains("mnemonic"),
+            "error should describe the decoding failure: {msg}",
+        );
     }
 }
