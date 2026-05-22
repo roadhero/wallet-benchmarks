@@ -18,6 +18,7 @@
 //! This module's job is just the trait + supporting types. Implementations
 //! live in sibling files added one step at a time per `DESIGN_ADDENDUM.md §S4`.
 
+pub(super) mod minotari_subprocess;
 pub mod old_wallet;
 
 use tari_common_types::tari_address::TariAddress;
@@ -152,4 +153,75 @@ pub struct UnsupportedOperation {
     pub op: &'static str,
     /// Short reason — surfaced into result-profile `errors.details`.
     pub reason: &'static str,
+}
+
+/// Per-tx status helper — folds into the schema's per-cell envelope under
+/// `RESULT_PROFILE_SCHEMA.md §4 tx_records[].status` ("success" / "failure" /
+/// "halted" / "timeout") and the `errors.details[].phase`
+/// ("construct" / "sign" / "broadcast" / "confirm" / "scan") field.
+///
+/// `TxRecord.status` itself is a `String` so the schema's required literal
+/// values land verbatim. These helpers provide typed entry points the modes
+/// call into to avoid stringly-typed bugs at the construction site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRecordStatus {
+    /// Broadcast accepted by the base node.
+    Success,
+    /// Broadcast returned a non-accept; `RejectionReason` lives in the record's
+    /// `error_string`.
+    Rejected,
+    /// Failed before broadcast completion. The accompanying [`TxRecordPhase`]
+    /// names where in the pipeline (construct / sign / broadcast / confirm).
+    Failed(TxRecordPhase),
+}
+
+impl TxRecordStatus {
+    /// Construct a `Failed(phase)` status — shorthand for the most common
+    /// constructor used by the Mode 2/3 subprocess pipeline.
+    pub fn failed(phase: TxRecordPhase) -> Self {
+        Self::Failed(phase)
+    }
+}
+
+impl std::fmt::Display for TxRecordStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Per `RESULT_PROFILE_SCHEMA.md §4` the status enum is
+            // {"success","failure","halted","timeout"}. "Rejected" surfaces as
+            // "failure" with the rejection_reason in error_string.
+            Self::Success => f.write_str("success"),
+            Self::Rejected => f.write_str("failure"),
+            Self::Failed(phase) => write!(f, "failure:{phase}"),
+        }
+    }
+}
+
+/// Where in the Mode 2/3 subprocess pipeline a failure occurred. Lifted from
+/// `RESULT_PROFILE_SCHEMA.md §4 errors.details[].phase`. Scenario code reads
+/// the suffix on a `failure:<phase>` status string to populate the per-cell
+/// `errors.details[].phase` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxRecordPhase {
+    /// `minotari create-unsigned-transaction` subprocess.
+    Construct,
+    /// In-process `sign_locked_transaction`.
+    Sign,
+    /// `Broadcaster::submit_transaction`.
+    Broadcast,
+    /// Confirmation polling (post-broadcast).
+    Confirm,
+    /// Wallet scan (B0/S2/S3/S6/S7).
+    Scan,
+}
+
+impl std::fmt::Display for TxRecordPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Construct => "construct",
+            Self::Sign => "sign",
+            Self::Broadcast => "broadcast",
+            Self::Confirm => "confirm",
+            Self::Scan => "scan",
+        })
+    }
 }

@@ -115,6 +115,15 @@ pub struct Config {
     /// a host-specific runtime setting, not a measurement parameter.
     #[serde(default)]
     pub minotari_console_wallet_path: Option<PathBuf>,
+
+    /// Optional override for the `minotari` (new-wallet CLI) binary path used by
+    /// Modes 2 and 3's `create-unsigned-transaction` subprocess pipeline. When
+    /// `None`, the harness resolves `"minotari"` via `$PATH`. `minotari_console_wallet`
+    /// (Mode 1's wallet) and `minotari` (the new wallet from `tari-project/minotari-cli`)
+    /// are different binaries; the harness records both paths separately so the
+    /// operator can point each at the local build location.
+    #[serde(default)]
+    pub minotari_path: Option<PathBuf>,
 }
 
 /// Names of the environment variables holding seed mnemonics and the wallet
@@ -199,6 +208,7 @@ impl Default for Config {
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
             seeds: Seeds::default(),
             minotari_console_wallet_path: None,
+            minotari_path: None,
         }
     }
 }
@@ -257,6 +267,7 @@ mod tests {
         assert_eq!(cfg.seeds.payment_processor, "HARNESS_SEED_PP");
         assert_eq!(cfg.seeds.wallet_password, "HARNESS_WALLET_PW");
         assert_eq!(cfg.minotari_console_wallet_path, None);
+        assert_eq!(cfg.minotari_path, None);
     }
 
     #[test]
@@ -302,6 +313,7 @@ mod tests {
             minotari_console_wallet_path: Some(PathBuf::from(
                 "/opt/tari/bin/minotari_console_wallet",
             )),
+            minotari_path: Some(PathBuf::from("/opt/tari/bin/minotari")),
         };
         let serialized = toml::to_string(&original).expect("serialize");
         let reloaded: Config = toml::from_str(&serialized).expect("round-trip");
