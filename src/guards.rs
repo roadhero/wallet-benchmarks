@@ -192,6 +192,27 @@ mod tests {
         enforce_esmeralda(&cfg).expect_err("empty network must be rejected");
     }
 
+    /// `url::Url::host_str` returns `"[::1]"` (bracketed) for an IPv6 URL —
+    /// confirmed in `analysis/API_DRIFT.md §Step 3c`. The mainnet denylist
+    /// is DNS-only, so an IPv6 loopback URL must pass; lock that in.
+    #[test]
+    fn accepts_ipv6_bracketed_loopback() {
+        let cfg = config("esmeralda", "https://[::1]:9005");
+        enforce_esmeralda(&cfg).expect("IPv6 loopback must pass the mainnet guard");
+    }
+
+    #[test]
+    fn accepts_ipv4_loopback() {
+        let cfg = config("esmeralda", "https://127.0.0.1:9005");
+        enforce_esmeralda(&cfg).expect("IPv4 loopback must pass the mainnet guard");
+    }
+
+    #[test]
+    fn accepts_localhost() {
+        let cfg = config("esmeralda", "https://localhost:9005");
+        enforce_esmeralda(&cfg).expect("localhost must pass the mainnet guard");
+    }
+
     // ----- enforce_funding tests -----
 
     use std::{cell::RefCell, collections::HashMap};
