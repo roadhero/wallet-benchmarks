@@ -254,3 +254,76 @@ This section supersedes DESIGN.md `§Dependency strategy` for purposes of swe-im
 ### 5. DESIGN_AMENDMENT.md disposition
 
 Left intact as the historical record of why we changed pinning. Do not edit. A reader can follow the chain `DESIGN.md` → `DESIGN_AMENDMENT.md` (diagnosis) → `DESIGN_ADDENDUM.md §Dependency strategy — resolved` (decision).
+
+## §Mode 3 CLI shape — proven
+
+Verified against `tari-project/minotari-cli` commit `52a7287a3fe1e7831855649c530534af9f2d4830` on 2026-05-22 by reading `minotari/src/cli.rs` (768 lines) and `integration-tests/steps/wallet_benchmark.rs` (313 lines) directly via `gh api`.
+
+**Proven flag:** repeated `--recipient` (`recipient: Vec<String>`). No `--recipients-file` flag exists.
+
+Source-of-truth excerpt from `minotari/src/cli.rs` lines 372–378 (the `CreateUnsignedTransaction` variant):
+
+```rust
+/// Recipients in `address::amount[::payment_id]` format. Repeatable.
+#[arg(
+    short,
+    long,
+    help = "Recipient address, amount and optional payment id (e.g., address::amount or address::amount::payment_id). Can be specified multiple times."
+)]
+recipient: Vec<String>,
+```
+
+`Vec<String>` under clap derive accepts the flag once per recipient — `--recipient a::100 --recipient b::200 --recipient c::300` is the proven batch shape.
+
+**Exact argv shape Mode 3 (and Mode 2) use:**
+
+```text
+minotari \
+  --network esmeralda \
+  create-unsigned-transaction \
+  --database-path <harness-tempdir>/wallet.sqlite3 \
+  --password <HARNESS_WALLET_PW> \
+  --account-name default \
+  --recipient <addr_base58>::<amount_microtari> \
+  [--recipient <addr_base58>::<amount_microtari> ...]   # Mode 3 only; Mode 2 passes exactly one
+  --output-file <harness-tempdir>/tx_<idx>.json
+```
+
+For Mode 3 S5 batch arm: K=10 `--recipient` flags per invocation, 10 invocations (per AC-19).
+For Mode 2: exactly one `--recipient` flag per invocation.
+
+**Cross-check against PR #99's `send_transactions` step** (`integration-tests/steps/wallet_benchmark.rs` lines 109–127): the step invokes the subprocess with the argv vector
+
+```text
+create-unsigned-transaction
+  --database-path  <db_path>
+  --password       <test_password>
+  --account-name   default
+  --recipient      <addr_base58>::1000
+  --output-file    <tmp>/tx_<i>.json
+```
+
+— exactly the single-recipient shape Mode 2 inherits. The step loops `num_transactions` times and sends one tx per loop iteration; it does **not** exercise the batch shape directly. The batch shape is proven by the `Vec<String>` clap declaration alone, with no behavioural counter-example in the upstream test corpus.
+
+**Flag-level differences vs DESIGN.md §Mode 2:**
+
+- `--network` is a **top-level** flag on `Cli` (line 30 of cli.rs), not a flag on the subcommand. DESIGN.md's snippet places it after `create-unsigned-transaction`; the proven shape places it before. swe-impl emits `minotari --network esmeralda create-unsigned-transaction ...` (Cli-level flag, then subcommand, then subcommand flags). PR #99 does not pass `--network` at all — it relies on `--config`'s default (`config/config.toml`) for network, which is acceptable only because PR #99 runs against `LocalNet` cucumber infrastructure that ships its own config. For Esmeralda we cannot rely on that default; the explicit `--network esmeralda` is the safety belt.
+- `--account-name` is **required** on this subcommand (declared `String`, not `Option<String>`, on line 371). DESIGN.md uses `default` — matches PR #99's literal string. Confirmed.
+- `--password` is **required** (declared `String` in `SecurityArgs`, line 41). DESIGN.md notes argv leakage is bounded; this remains true. The `env_clear()` + `env("HARNESS_WALLET_PW", ...)` plan in DESIGN.md §Secret handling does **not** apply to the subcommand's own `--password` — that one is read from argv. Env-clearing still applies to `HOME` / `TARI_NETWORK` / etc. surrounding the subprocess.
+- `--database-path` is **optional** on the subcommand (`Option<PathBuf>` in `DatabaseArgs`, line 48); when omitted, the CLI falls back to its config-file default. The harness always passes it explicitly (one path per mode tempdir).
+- `--output-file` is `String`, not `PathBuf` (line 386) — code-side `to_str().unwrap()` is acceptable since the tempdir is harness-controlled and known UTF-8. Default if omitted is `data/unsigned_transaction.json` (relative to CWD) — the harness always passes its own path to avoid the default writing into the operator's CWD.
+- `--seconds-to-lock` defaults to 86400 (24h UTXO auto-release, line 389). Harness uses the default — Mode 2/3 broadcast within seconds of construction, so the 24h lock is never the binding constraint. Recorded here so the field is not silently mis-tuned later.
+- Subcommand naming: clap derives `create-unsigned-transaction` (kebab-case) from `CreateUnsignedTransaction` (PascalCase). Confirmed by PR #99's literal `"create-unsigned-transaction"` argv at line 116.
+
+**Single-output invocation (Mode 2)** unchanged from DESIGN.md — one `--recipient` flag covers both repeated-flag and single-call cases. Mode 2 and Mode 3 share the same subprocess-construction helper, differing only in how many `--recipient` strings the caller pushes onto the args vector.
+
+**Edge cases observed (carry into implementation):**
+
+- `--recipient` value parser accepts the `address::amount::payment_id` triple shape (per the help text). Mode 2/3 use only the two-component shape `address::amount`. Don't append a payment ID — that would put a harness-controlled string into a recipient-visible field and complicate AC-19 reproducibility. Leave it off.
+- Top-level `--config` defaults to `config/config.toml` (relative to CWD, line 25). When the harness spawns the subprocess from a controlled tempdir as CWD, there is no `config/config.toml` there. Two options: (a) pass `--config <path-to-harness-supplied-toml>` explicitly with `network = "esmeralda"` in it, or (b) rely on the top-level `--network esmeralda` flag to override the config-file network and let the subprocess fail-soft on the missing config file. swe-impl: take option (a) — write a minimal `config.toml` per-mode tempdir containing `network = "esmeralda"` plus any other network-pinning keys the subprocess needs, and pass `--config <that-path>` before the subcommand. Empirical verification deferred to first Mode 2 module integration in step 3.
+- `--idempotency-key` and `--confirmation-window` flags exist on the subcommand via `TransactionArgs` (both `Option`, lines 73 and 77). Neither is needed by the harness; do not pass them. Their absence does not change semantics.
+- The subcommand creates an **unsigned** transaction only — no network call. So passing `--base-url` is not needed and not accepted (cli.rs `CreateUnsignedTransaction` does not flatten `NodeArgs`, lines 361–390). PR #99 correctly omits `--base-url` from this subcommand's argv (line 116–127) and only passes it to `scan` (line 39).
+- The subcommand **automatically locks input UTXOs** for `--seconds-to-lock` seconds (default 24h). In S4's high-N concurrent dispatch this matters: 128 simultaneous `create-unsigned-transaction` invocations may attempt to lock overlapping UTXO sets. Per AC-31 the harness does NOT pre-partition UTXOs — selection is delegated to the CLI. If two concurrent invocations select the same UTXO, one will fail at the lock step (recorded as a construction failure in `tx_records[].rejection_reason`, raw, not retried). This is the existing AC-32-compliant behaviour; documenting it here makes the failure-mode predictable.
+- `WalletType::new_random()` exists (PR #99 line 78). This is the API surface for the harness's `gen-seed` subcommand (per S1) — though the harness's `gen-seed` uses BIP39 mnemonic export rather than `new_random()` directly; the underlying primitive is the same. No change to S1's plan.
+- `TariAddress::new_dual_address(view, spend, network, features, payment_id)` is the constructor PR #99 uses (lines 81–88). The harness's address-derivation path (S1's `print-address`, M2's `enforce_funding`, Mode 2's recipient computation) uses `WalletType::tari_address()` instead — verified callable in the M1 spike. Both paths produce a `TariAddress` that `to_base58()`s into the same format; the difference is whether the harness assembles the address from view+spend keys (PR #99 style) or asks `WalletType` to do it (DESIGN.md S2 style). swe-impl uses the `WalletType::tari_address()` path for consistency across `gen-seed`, `print-address`, `enforce_funding`, and Mode 2/3. If `WalletType::tari_address()` proves to not exist at the pinned crates.io v5.3.1, fall back to the PR #99 `new_dual_address` path.
+- `TariAddressFeatures::create_one_sided_only()` is the features value PR #99 uses (line 85). The harness uses one-sided addresses for the same reason (the `create-unsigned-transaction` CLI builds one-sided txs per its doc-comment line 337–339). No interactive flow.
