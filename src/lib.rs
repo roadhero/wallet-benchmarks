@@ -4,6 +4,7 @@
 //! added in the order specified in `analysis/DESIGN_ADDENDUM.md §S4 Pre-flight
 //! execution order`.
 
+pub mod broadcast;
 pub mod cli;
 pub mod config;
 pub mod env_capture;
