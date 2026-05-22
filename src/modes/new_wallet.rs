@@ -22,13 +22,14 @@
 //! per call — no internal loops, semaphores, or sleeps.
 //!
 //! **Subprocess-backed read/scan flows (`scan_from_birthday`, `get_balance`,
-//! `wipe_and_reimport`)**: wired in step 3i.0 against the pinned
-//! `minotari-cli` commit per `analysis/DESIGN_AMENDMENT.md §8.3`. The shared
-//! orchestration lives in [`crate::modes::minotari_wallet_ops`] — Mode 2 and
-//! Mode 3 both route through it, differing only in seed slot (`mnemonic_new`
-//! here, `mnemonic_payment_processor` in Mode 3). `get_utxo_count` is still
-//! the §8-amendment placeholder pending its 3i.0.d wiring against the cached
-//! [`ScanOutcome`].
+//! `get_utxo_count`, `wipe_and_reimport`)**: wired in step 3i.0 against the
+//! pinned `minotari-cli` commit per `analysis/DESIGN_AMENDMENT.md §8.3`. The
+//! shared orchestration lives in
+//! [`crate::modes::minotari_wallet_ops`] — Mode 2 and Mode 3 both route
+//! through it, differing only in seed slot (`mnemonic_new` here,
+//! `mnemonic_payment_processor` in Mode 3). `get_utxo_count` reads from
+//! the cached [`ScanOutcome`] (step 4 of the amendment); the CLI exposes
+//! no UTXO-count subcommand.
 
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
@@ -217,7 +218,21 @@ impl Mode for NewWallet {
     }
 
     async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
-        anyhow::bail!(read_side_placeholder("get_utxo_count"));
+        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 4: the new CLI has no
+        // utxo-count subcommand. The canonical source is the most recent
+        // `scan_from_birthday` outcome's `outputs_found`. Bail if no scan has
+        // run yet — that's a programming error in the scenario layer (every
+        // scenario that needs a count runs a scan first per
+        // `analysis/DESIGN.md §Scenario state machine` B0/S2/S3/S6/S7).
+        match &self.last_scan {
+            Some(o) => Ok(o.utxo_count),
+            None => anyhow::bail!(
+                "Mode 2 get_utxo_count: no scan has been run yet — call \
+                 scan_from_birthday first. The new minotari CLI has no \
+                 utxo-count subcommand; the scan's outputs_found is the \
+                 canonical source (see analysis/DESIGN_AMENDMENT.md §8.3 step 4).",
+            ),
+        }
     }
 
     async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {
@@ -250,20 +265,6 @@ impl Mode for NewWallet {
         );
         Ok(())
     }
-}
-
-/// Structured placeholder message for Mode 2/3 read-side flows whose CLI shape
-/// at the pinned `minotari-cli` commit differs substantially from
-/// `DESIGN.md §Mode 2 step 7`. See `analysis/DESIGN_AMENDMENT.md §8`.
-fn read_side_placeholder(op: &'static str) -> String {
-    format!(
-        "Mode 2/3 {op} placeholder: the new minotari CLI's read-side subcommands \
-         (Scan / Balance / Create --seed-words) at minotari-cli pinned commit \
-         52a7287a3fe1e7831855649c530534af9f2d4830 differ from DESIGN.md §Mode 2 \
-         step 7 (no list-utxos, Balance emits human stdout, Create not import-seed). \
-         Real impl lands in step 3i once the scenarios layer knows the stdout-\
-         parsing contract. See analysis/DESIGN_AMENDMENT.md §8.",
-    )
 }
 
 #[cfg(test)]
@@ -385,14 +386,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode2_get_utxo_count_bails_with_amendment_pointer() {
+    async fn mode2_get_utxo_count_bails_when_no_scan_cached() {
+        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 4: `get_utxo_count`
+        // reads from the cached `last_scan` only. With no scan run yet, the
+        // method must bail with a clear "call scan_from_birthday first"
+        // message — and crucially must NOT spawn any subprocess.
         let (mut m, seeds) = build_mode2("UTXO");
         let err = m
             .get_utxo_count()
             .await
-            .expect_err("get_utxo_count placeholder must bail");
+            .expect_err("get_utxo_count without prior scan must bail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
+        assert!(
+            msg.contains("no scan has been run yet") && msg.contains("scan_from_birthday"),
+            "error must name the contract: {msg}",
+        );
+        teardown_seeds(&seeds);
+    }
+
+    #[test]
+    fn mode2_get_utxo_count_returns_cached_outputs_found() {
+        // Synthetic ScanOutcome — confirms the cached-read contract without
+        // spawning any subprocess. AC-trace: `analysis/DESIGN_AMENDMENT.md §8.3`
+        // step 4 "get_utxo_count returns outputs_found from the cached report".
+        let (mut m, seeds) = build_mode2("UTXO_CACHED");
+        m.last_scan = Some(ScanOutcome {
+            t_scan_ms: 1234,
+            h_tip_start: 0,
+            h_tip_end: 0,
+            outputs_found: 42,
+            utxo_count: 42,
+            balance_microtari: 0,
+        });
+        // Drive through the trait method via a tokio runtime — `get_utxo_count`
+        // is async by trait shape but contains no .await on the cached-hit path.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let n = rt
+            .block_on(m.get_utxo_count())
+            .expect("cached hit returns Ok");
+        assert_eq!(n, 42);
         teardown_seeds(&seeds);
     }
 

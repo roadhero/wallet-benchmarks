@@ -191,7 +191,16 @@ impl Mode for PaymentProcessor {
     }
 
     async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
-        anyhow::bail!(read_side_placeholder("get_utxo_count"));
+        // Mirror of [`crate::modes::new_wallet::NewWallet::get_utxo_count`].
+        match &self.last_scan {
+            Some(o) => Ok(o.utxo_count),
+            None => anyhow::bail!(
+                "Mode 3 get_utxo_count: no scan has been run yet — call \
+                 scan_from_birthday first. The new minotari CLI has no \
+                 utxo-count subcommand; the scan's outputs_found is the \
+                 canonical source (see analysis/DESIGN_AMENDMENT.md §8.3 step 4).",
+            ),
+        }
     }
 
     async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {
@@ -222,20 +231,6 @@ impl Mode for PaymentProcessor {
         );
         Ok(())
     }
-}
-
-/// Mirrors [`crate::modes::new_wallet::read_side_placeholder`] — Mode 3
-/// shares the same `minotari` CLI surface gap. See
-/// `analysis/DESIGN_AMENDMENT.md §8`.
-fn read_side_placeholder(op: &'static str) -> String {
-    format!(
-        "Mode 2/3 {op} placeholder: the new minotari CLI's read-side subcommands \
-         (Scan / Balance / Create --seed-words) at minotari-cli pinned commit \
-         52a7287a3fe1e7831855649c530534af9f2d4830 differ from DESIGN.md §Mode 2 \
-         step 7 (no list-utxos, Balance emits human stdout, Create not import-seed). \
-         Real impl lands in step 3i once the scenarios layer knows the stdout-\
-         parsing contract. See analysis/DESIGN_AMENDMENT.md §8.",
-    )
 }
 
 #[cfg(test)]
@@ -354,14 +349,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode3_get_utxo_count_bails_with_amendment_pointer() {
+    async fn mode3_get_utxo_count_bails_when_no_scan_cached() {
         let (mut m, seeds) = build_mode3("UTXO");
         let err = m
             .get_utxo_count()
             .await
-            .expect_err("get_utxo_count placeholder must bail");
+            .expect_err("get_utxo_count without prior scan must bail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("DESIGN_AMENDMENT.md §8"), "{msg}");
+        assert!(
+            msg.contains("no scan has been run yet") && msg.contains("scan_from_birthday"),
+            "error must name the contract: {msg}",
+        );
+        teardown_seeds(&seeds);
+    }
+
+    #[test]
+    fn mode3_get_utxo_count_returns_cached_outputs_found() {
+        let (mut m, seeds) = build_mode3("UTXO_CACHED");
+        m.last_scan = Some(ScanOutcome {
+            t_scan_ms: 0,
+            h_tip_start: 0,
+            h_tip_end: 0,
+            outputs_found: 13,
+            utxo_count: 13,
+            balance_microtari: 0,
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let n = rt
+            .block_on(m.get_utxo_count())
+            .expect("cached hit returns Ok");
+        assert_eq!(n, 13);
         teardown_seeds(&seeds);
     }
 
