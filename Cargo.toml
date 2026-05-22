@@ -42,6 +42,16 @@ tari_transaction_components = "5.3.1"
 tari_crypto                 = { version = "0.22.1", features = ["borsh"] }
 tari_utilities              = "0.8"
 
+# Trait objects with async fn — matches the maintainer-idiom used by
+# minotari_node_wallet_client and the tari ecosystem broadly.
+async-trait = "0.1"
+
+# POSIX signal delivery for ConsoleWalletLifecycle teardown (SIGTERM grace +
+# SIGKILL escalation per analysis/DESIGN.md §Mode 1 step 4).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
+
 [dev-dependencies]
 proptest = "1"
 walkdir  = "2"
+wiremock = "0.6"

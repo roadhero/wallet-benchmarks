@@ -10,6 +10,7 @@ pub mod env_capture;
 pub mod guards;
 pub mod seed;
 pub mod versions;
+pub mod wallet_lifecycle;
 
 use anyhow::Context;
 use tari_common_types::seeds::{
