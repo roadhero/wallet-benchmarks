@@ -199,6 +199,36 @@ impl ConsoleWalletLifecycle {
             anyhow!("ConsoleWalletLifecycle: client not yet connected (call wait_ready first)")
         })
     }
+
+    /// Mutable access to the owned [`HarnessDataDir`] for explicit wipe
+    /// calls — used by the Mode 1 `wipe_and_reimport` flow that AC-34
+    /// polices (path-confinement is enforced inside `HarnessDataDir::wipe`).
+    pub fn data_dir_mut(&mut self) -> &mut HarnessDataDir {
+        &mut self.data_dir
+    }
+
+    /// Replace the held seed mnemonic. The next call to [`Self::spawn`]
+    /// writes this new mnemonic into the freshly-wiped data dir's
+    /// `seed.txt`. Used by the Mode 1 birthday-rewrite flow (AC-24): the
+    /// caller decodes the existing mnemonic to a [`tari_common_types::seeds::cipher_seed::CipherSeed`],
+    /// calls `change_birthday`, re-encodes, then hands the new mnemonic
+    /// back via this method.
+    pub fn replace_mnemonic(&mut self, mnemonic: String) {
+        log::debug!(
+            target: LOG_TARGET,
+            "replacing held mnemonic (length={}); next spawn rewrites seed.txt",
+            mnemonic.len(),
+        );
+        self.seed_mnemonic = mnemonic;
+    }
+
+    /// Read-only access to the held mnemonic — used by the birthday-rewrite
+    /// flow that decodes-modifies-re-encodes before calling
+    /// [`Self::replace_mnemonic`]. The string is the operator's mnemonic
+    /// plaintext; treat the returned `&str` borrow accordingly.
+    pub fn mnemonic(&self) -> &str {
+        &self.seed_mnemonic
+    }
 }
 
 #[async_trait::async_trait]

@@ -18,6 +18,8 @@
 //! This module's job is just the trait + supporting types. Implementations
 //! live in sibling files added one step at a time per `DESIGN_ADDENDUM.md §S4`.
 
+pub mod old_wallet;
+
 use tari_common_types::tari_address::TariAddress;
 
 /// Per-transaction record produced by `Mode::send_single` /
