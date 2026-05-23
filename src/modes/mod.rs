@@ -170,6 +170,18 @@ pub trait Mode: Send + Sync {
     /// `tests/c_no_dispatch_serialization_in_s4.rs` static grep enforces this
     /// against `src/scenarios/s4_concurrent.rs`.
     fn dispatcher(&self) -> Arc<dyn S4Dispatcher>;
+
+    /// PID to sample for the per-scenario [`crate::sampler::ResourceSampler`].
+    ///
+    /// Default impl returns the harness's own PID — measures harness-side
+    /// overhead per the 3j brief's option (a) per-mode sampling choice.
+    /// Mode-specific overrides could point at e.g. the spawned
+    /// `console_wallet` PID for Mode 1; v1 keeps all three modes on the
+    /// default so cross-mode `peak_rss_bytes` / `peak_cpu_pct` comparisons
+    /// are apples-to-apples (each measures the same harness process).
+    fn target_pid_for_sampling(&self) -> i32 {
+        std::process::id() as i32
+    }
 }
 
 /// Clone-able dispatch handle for S4's concurrent construction (AC-17).

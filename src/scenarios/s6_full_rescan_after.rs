@@ -35,6 +35,8 @@
 use std::time::Instant;
 
 use crate::modes::Mode;
+use crate::sampler::Pid;
+use crate::scenarios::ScenarioCtx;
 
 /// S6's per-cell payload — identical structure to
 /// [`crate::scenarios::S2Outcome`]. `peak_rss_bytes` and `peak_cpu_pct`
@@ -89,7 +91,18 @@ pub struct S6Outcome {
 /// the caller maps that to a `status = "failure"` cell.
 /// `outputs_found_matches_expected = false` is **not** an `Err` — it
 /// rides on the outcome.
-pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::Result<S6Outcome> {
+pub(super) async fn run(
+    ctx: &ScenarioCtx<'_>,
+    mode: &mut dyn Mode,
+    expected_outputs: u64,
+) -> anyhow::Result<S6Outcome> {
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
+
     mode.wipe_and_reimport(0).await?;
 
     let scan_start = Instant::now();
@@ -106,6 +119,11 @@ pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::R
 
     let outputs_found_matches_expected = scan.outputs_found == expected_outputs;
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(S6Outcome {
         t_scan_ms,
         blocks_per_sec,
@@ -115,8 +133,8 @@ pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::R
         outputs_found: scan.outputs_found,
         expected_outputs,
         outputs_found_matches_expected,
-        peak_rss_bytes: None,
-        peak_cpu_pct: None,
+        peak_rss_bytes,
+        peak_cpu_pct,
     })
 }
 
@@ -124,6 +142,8 @@ pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::R
 mod tests {
     use super::*;
     use crate::modes::{test_support::FakeMode, ScanOutcome};
+    use crate::sampler::FakeSamplerFactory;
+    use crate::scenarios::test_support::TestCtxOwner;
 
     fn canned_scan(outputs_found: u64) -> ScanOutcome {
         ScanOutcome {
@@ -141,7 +161,10 @@ mod tests {
         let mut fake = FakeMode::new();
         fake.canned_scan = Some(canned_scan(256));
 
-        let outcome = run(&mut fake, 256).await.expect("S6 runs with canned scan");
+        let owner = TestCtxOwner::new();
+        let outcome = run(&owner.ctx(), &mut fake, 256)
+            .await
+            .expect("S6 runs with canned scan");
 
         assert_eq!(outcome.outputs_found, 256);
         assert_eq!(outcome.expected_outputs, 256);
@@ -152,8 +175,14 @@ mod tests {
         assert_eq!(outcome.h_tip_start, 100);
         assert_eq!(outcome.h_tip_end, 1100);
         assert_eq!(outcome.blocks_scanned, 1000, "h_tip_end - h_tip_start");
-        assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
-        assert!(outcome.peak_cpu_pct.is_none(), "sampler lands in 3j");
+        assert!(
+            outcome.peak_rss_bytes.is_none(),
+            "sampler_factory: None → peak_rss_bytes is None",
+        );
+        assert!(
+            outcome.peak_cpu_pct.is_none(),
+            "sampler_factory: None → peak_cpu_pct is None",
+        );
 
         let calls = fake.calls.lock().unwrap().clone();
         assert_eq!(
@@ -168,7 +197,8 @@ mod tests {
         let mut fake = FakeMode::new();
         fake.canned_scan = Some(canned_scan(256));
 
-        let outcome = run(&mut fake, 255)
+        let owner = TestCtxOwner::new();
+        let outcome = run(&owner.ctx(), &mut fake, 255)
             .await
             .expect("mismatch must NOT be an Err");
 
@@ -185,7 +215,8 @@ mod tests {
         let mut fake = FakeMode::new();
         fake.fail_with = Some("simulated S6 scan failure".to_string());
 
-        let err = run(&mut fake, 0)
+        let owner = TestCtxOwner::new();
+        let err = run(&owner.ctx(), &mut fake, 0)
             .await
             .expect_err("scan failure must bubble up");
         let msg = format!("{err:#}");
@@ -193,5 +224,20 @@ mod tests {
             msg.contains("simulated S6 scan failure"),
             "error message must carry the underlying error: {msg}",
         );
+    }
+
+    /// 3j wiring: peak_rss_bytes populated from FakeSamplerFactory.
+    #[tokio::test]
+    async fn s6_populates_peaks_from_sampler() {
+        let mut fake = FakeMode::new();
+        fake.canned_scan = Some(canned_scan(256));
+        let factory = FakeSamplerFactory::new(vec![32768], vec![]);
+        let mut owner = TestCtxOwner::new();
+        owner.config.sampler_interval_ms = 5;
+        let outcome = run(&owner.ctx_with_sampler(&factory), &mut fake, 256)
+            .await
+            .expect("S6 runs");
+        assert_eq!(outcome.peak_rss_bytes, Some(32768));
+        assert!(outcome.peak_cpu_pct.is_none());
     }
 }

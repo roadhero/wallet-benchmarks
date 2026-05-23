@@ -32,6 +32,8 @@
 use std::time::Instant;
 
 use crate::modes::Mode;
+use crate::sampler::Pid;
+use crate::scenarios::ScenarioCtx;
 
 /// B0's per-cell payload, matching `RESULT_PROFILE_SCHEMA.md §B0 scenario`.
 ///
@@ -71,9 +73,20 @@ pub struct B0Outcome {
 
 /// Run B0 against the given mode.
 ///
+/// Wraps the scan in a [`crate::sampler::ResourceSampler`] (if `ctx.sampler_factory`
+/// is `Some`) to populate `peak_rss_bytes` / `peak_cpu_pct`. When `None`,
+/// peaks stay `None` per the schema's `u64 | null` / `f64 | null` permission.
+///
 /// Returns `Err` on scan failure; the caller (scenarios::run_scenario / the
 /// run loop in step 3i.2) maps that to a `status = "failure"` cell.
-pub(super) async fn run(mode: &mut dyn Mode) -> anyhow::Result<B0Outcome> {
+pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::Result<B0Outcome> {
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
+
     let scan_start = Instant::now();
     let scan = mode.scan_from_birthday(0).await?;
     let t_scan_ms = u64::try_from(scan_start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -89,13 +102,18 @@ pub(super) async fn run(mode: &mut dyn Mode) -> anyhow::Result<B0Outcome> {
         Some((scan.h_tip_end as f64) / ((t_scan_ms as f64) / 1000.0))
     };
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(B0Outcome {
         t_scan_ms,
         blocks_per_sec,
         h_tip_start: scan.h_tip_start,
         h_tip_end: scan.h_tip_end,
-        peak_rss_bytes: None,
-        peak_cpu_pct: None,
+        peak_rss_bytes,
+        peak_cpu_pct,
         utxo_count_verified: scan.utxo_count,
         balance_verified_microtari: scan.balance_microtari,
         outputs_found: scan.outputs_found,
@@ -106,6 +124,8 @@ pub(super) async fn run(mode: &mut dyn Mode) -> anyhow::Result<B0Outcome> {
 mod tests {
     use super::*;
     use crate::modes::{test_support::FakeMode, ScanOutcome};
+    use crate::sampler::FakeSamplerFactory;
+    use crate::scenarios::test_support::TestCtxOwner;
 
     #[tokio::test]
     async fn b0_reads_canned_scan_outcome() {
@@ -119,7 +139,10 @@ mod tests {
             balance_microtari: 0,
         });
 
-        let outcome = run(&mut fake).await.expect("B0 runs with canned scan");
+        let owner = TestCtxOwner::new();
+        let outcome = run(&owner.ctx(), &mut fake)
+            .await
+            .expect("B0 runs with canned scan");
 
         assert_eq!(outcome.outputs_found, 0, "AC-10 expects outputs_found == 0");
         assert_eq!(outcome.utxo_count_verified, 0, "AC-10 expects 0 UTXOs");
@@ -143,8 +166,14 @@ mod tests {
                 // Permitted in the degenerate `t_scan_ms == 0` case.
             }
         }
-        assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
-        assert!(outcome.peak_cpu_pct.is_none(), "sampler lands in 3j");
+        assert!(
+            outcome.peak_rss_bytes.is_none(),
+            "sampler_factory: None → peak_rss_bytes is None",
+        );
+        assert!(
+            outcome.peak_cpu_pct.is_none(),
+            "sampler_factory: None → peak_cpu_pct is None",
+        );
 
         let calls = fake.calls.lock().unwrap().clone();
         assert_eq!(
@@ -159,7 +188,8 @@ mod tests {
         let mut fake = FakeMode::new();
         fake.fail_with = Some("simulated scan failure".to_string());
 
-        let err = run(&mut fake)
+        let owner = TestCtxOwner::new();
+        let err = run(&owner.ctx(), &mut fake)
             .await
             .expect_err("scan failure must bubble up");
         let msg = format!("{err:#}");
@@ -167,5 +197,38 @@ mod tests {
             msg.contains("simulated scan failure"),
             "error message must carry the underlying scan error: {msg}",
         );
+    }
+
+    /// 3j wiring: with a `Some(&FakeSamplerFactory)` carrying canned
+    /// values, the B0Outcome's peak fields are populated from the
+    /// sampler rather than left at None. Uses a 5ms interval against
+    /// a 4KB canned RSS so the sampler ticks at least once before
+    /// scan_from_birthday returns.
+    #[tokio::test]
+    async fn b0_populates_peaks_from_sampler() {
+        let mut fake = FakeMode::new();
+        fake.canned_scan = Some(ScanOutcome {
+            t_scan_ms: 0,
+            h_tip_start: 100,
+            h_tip_end: 200,
+            outputs_found: 0,
+            utxo_count: 0,
+            balance_microtari: 0,
+        });
+        let factory = FakeSamplerFactory::new(vec![4096], vec![]);
+        let mut owner = TestCtxOwner::new();
+        owner.config.sampler_interval_ms = 5;
+        let ctx = owner.ctx_with_sampler(&factory);
+        // Sampler's first sample happens immediately on task entry; the
+        // await on scan_from_birthday gives the spawn enough time to land
+        // it before stop().
+        let outcome = run(&ctx, &mut fake).await.expect("B0 runs");
+        assert_eq!(
+            outcome.peak_rss_bytes,
+            Some(4096),
+            "FakeSamplerFactory canned RSS must flow into peak_rss_bytes",
+        );
+        // No CPU values pushed → still None (sampler needs ≥2 samples).
+        assert!(outcome.peak_cpu_pct.is_none());
     }
 }

@@ -165,6 +165,12 @@ pub(super) async fn run(
     seed_role_for_mode: SeedRole,
 ) -> anyhow::Result<S5Outcome> {
     let config = ctx.config;
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            crate::sampler::Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
     let fee_rate = config.fee_rate;
     let amount_per_recipient: u64 = 1_000;
     let m = config.s5_m;
@@ -228,6 +234,11 @@ pub(super) async fn run(
 
     let throughput_multiplier = compute_throughput_multiplier(&individual, &batch);
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(S5Outcome {
         success_count,
         rejection_count,
@@ -236,8 +247,8 @@ pub(super) async fn run(
         details,
         arms: S5Arms { individual, batch },
         throughput_multiplier,
-        peak_rss_bytes: None,
-        peak_cpu_pct: None,
+        peak_rss_bytes,
+        peak_cpu_pct,
     })
 }
 
@@ -553,6 +564,7 @@ mod tests {
             redaction,
             clock,
             recipients: RecipientStrategy::SelfAddress(SeedRole::New),
+            sampler_factory: None,
         }
     }
 

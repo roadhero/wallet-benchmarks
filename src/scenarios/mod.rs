@@ -44,6 +44,7 @@ use tari_common_types::tari_address::TariAddress;
 use crate::clock::Clock;
 use crate::config::Config;
 use crate::modes::Mode;
+use crate::sampler::SamplerFactory;
 use crate::seed::redact::RedactionDenylist;
 use crate::seed::{SeedHandle, SeedRole};
 
@@ -123,6 +124,13 @@ pub struct ScenarioCtx<'a> {
     /// How to choose the destination address per per-tx slot. See
     /// [`RecipientStrategy`].
     pub recipients: RecipientStrategy<'a>,
+    /// Per-scenario resource sampler factory. `None` disables sampling
+    /// — the scenario's `peak_rss_bytes` / `peak_cpu_pct` fields stay
+    /// `None`. Production code passes `Some(&LiveSamplerFactory)` via
+    /// `main.rs` (3k). Tests default to `None` for fixtures that don't
+    /// care about peaks, and `Some(&FakeSamplerFactory { ... })` for
+    /// per-scenario peak-population assertions.
+    pub sampler_factory: Option<&'a dyn SamplerFactory>,
 }
 
 /// Recipient picker for the per-tx send loop. Variants cover the three
@@ -349,7 +357,7 @@ pub async fn run_scenario(
     input: &ScenarioInput,
 ) -> anyhow::Result<ScenarioOutcome> {
     match id {
-        ScenarioId::B0 => b0_baseline::run(mode).await.map(ScenarioOutcome::B0),
+        ScenarioId::B0 => b0_baseline::run(ctx, mode).await.map(ScenarioOutcome::B0),
         ScenarioId::S0 => s0_warmup::run(ctx, mode).await.map(ScenarioOutcome::S0),
         ScenarioId::S1 => s1_volume::run(ctx, mode, None)
             .await
@@ -361,7 +369,7 @@ pub async fn run_scenario(
                      (AC-15 verification target)"
                 )
             })?;
-            s2_full_rescan::run(mode, expected)
+            s2_full_rescan::run(ctx, mode, expected)
                 .await
                 .map(ScenarioOutcome::S2)
         }
@@ -378,7 +386,7 @@ pub async fn run_scenario(
                      (S0's funding height, u16 days-since-2022-01-01)"
                 )
             })?;
-            s3_birthday_rescan::run(mode, expected, h_birth)
+            s3_birthday_rescan::run(ctx, mode, expected, h_birth)
                 .await
                 .map(ScenarioOutcome::S3)
         }
@@ -401,7 +409,7 @@ pub async fn run_scenario(
                      (S1 net + S5 net; AC-15-mirror verification target)"
                 )
             })?;
-            s6_full_rescan_after::run(mode, expected)
+            s6_full_rescan_after::run(ctx, mode, expected)
                 .await
                 .map(ScenarioOutcome::S6)
         }
@@ -418,9 +426,73 @@ pub async fn run_scenario(
                      (S0's funding height, u16 days-since-2022-01-01)"
                 )
             })?;
-            s7_birthday_rescan_after::run(mode, expected, h_birth)
+            s7_birthday_rescan_after::run(ctx, mode, expected, h_birth)
                 .await
                 .map(ScenarioOutcome::S7)
+        }
+    }
+}
+
+/// Cross-test fixtures for the scenario layer. Lets B0/S2/S3/S6/S7
+/// tests (which don't currently maintain their own ctx fixture
+/// machinery) build a minimal-no-sampler `ScenarioCtx` in two lines.
+/// Same convention as `crate::modes::test_support::FakeMode`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::clock::RealClock;
+    use crate::config::{Config, Seeds};
+    use crate::seed::redact::RedactionDenylist;
+    use crate::seed::SeedHandle;
+
+    /// Owns the lifetime-bound inputs for a [`ScenarioCtx`] in tests.
+    /// The fields stay on `Self`; `ctx()` borrows them into a fresh
+    /// `ScenarioCtx<'_>` per call.
+    pub(crate) struct TestCtxOwner {
+        pub config: Config,
+        pub seeds: SeedHandle,
+        pub redaction: RedactionDenylist,
+        pub clock: RealClock,
+    }
+
+    impl TestCtxOwner {
+        /// Build a default owner. `Config::default()`, `Seeds::default()`,
+        /// `RedactionDenylist::for_test()`, `RealClock`. No env vars set —
+        /// scan-only scenarios (B0/S2/S3/S6/S7) don't touch the seed
+        /// derivation chain.
+        pub fn new() -> Self {
+            Self {
+                config: Config::default(),
+                seeds: SeedHandle::new(&Seeds::default()),
+                redaction: RedactionDenylist::for_test(),
+                clock: RealClock,
+            }
+        }
+
+        /// Build a no-sampler ctx — `peak_rss_bytes` / `peak_cpu_pct`
+        /// stay `None` post-run, matching the pre-3j test behaviour.
+        pub fn ctx(&self) -> ScenarioCtx<'_> {
+            ScenarioCtx {
+                config: &self.config,
+                seeds: &self.seeds,
+                redaction: &self.redaction,
+                clock: &self.clock,
+                recipients: RecipientStrategy::SelfAddress(SeedRole::New),
+                sampler_factory: None,
+            }
+        }
+
+        /// Build a ctx wired to the supplied sampler factory — used by
+        /// the per-scenario peak-population tests.
+        pub fn ctx_with_sampler<'a>(&'a self, factory: &'a dyn SamplerFactory) -> ScenarioCtx<'a> {
+            ScenarioCtx {
+                config: &self.config,
+                seeds: &self.seeds,
+                redaction: &self.redaction,
+                clock: &self.clock,
+                recipients: RecipientStrategy::SelfAddress(SeedRole::New),
+                sampler_factory: Some(factory),
+            }
         }
     }
 }

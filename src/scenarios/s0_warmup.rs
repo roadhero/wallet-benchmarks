@@ -38,6 +38,7 @@
 use std::time::Duration;
 
 use crate::modes::{Mode, TxRecord};
+use crate::sampler::Pid;
 use crate::scenarios::ScenarioCtx;
 
 /// S0's per-cell payload, matching `RESULT_PROFILE_SCHEMA.md §S0` plus the
@@ -102,6 +103,13 @@ const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// send-to-self scenarios (S4/S6/S7).
 pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::Result<S0Outcome> {
     let config = ctx.config;
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
+
     let recipient = ctx.recipients.resolve_for(ctx.seeds, 0)?;
 
     let pre_balance = mode.get_balance().await?;
@@ -159,6 +167,11 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
     let t_construct_ms = tx_record.t_total_ms.checked_sub(tx_record.t_broadcast_ms);
     let t_broadcast_ms = tx_record.t_broadcast_ms;
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(S0Outcome {
         pre_balance,
         post_balance,
@@ -170,8 +183,8 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         t_broadcast_ms,
         t_confirm_ms,
         tx_record,
-        peak_rss_bytes: None,
-        peak_cpu_pct: None,
+        peak_rss_bytes,
+        peak_cpu_pct,
     })
 }
 
@@ -235,6 +248,7 @@ mod tests {
             redaction: &redaction,
             clock: &clock,
             recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
         };
 
         let outcome = run(&ctx, &mut fake)
@@ -303,6 +317,7 @@ mod tests {
             redaction: &redaction,
             clock: &clock,
             recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
         };
 
         let outcome = run(&ctx, &mut fake)
@@ -339,6 +354,7 @@ mod tests {
             redaction: &redaction,
             clock: &clock,
             recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
         };
 
         let err = run(&ctx, &mut fake)

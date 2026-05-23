@@ -93,6 +93,14 @@ pub struct S4Outcome {
     /// with `phase = Broadcast`. Aborted-by-budget tasks feed `timeout_count`,
     /// NOT `details[]`. Rejections feed `rejection_count`, NOT `details[]`.
     pub details: Vec<DetailRecord>,
+    /// `peak_rss_bytes` per `RESULT_PROFILE_SCHEMA.md` lines 126-127 —
+    /// `None` when `ctx.sampler_factory` is `None` (matches the schema's
+    /// `u64 | null` permission).
+    pub peak_rss_bytes: Option<u64>,
+    /// `peak_cpu_pct` per `RESULT_PROFILE_SCHEMA.md` lines 126-127 —
+    /// `None` when `ctx.sampler_factory` is `None`, or when fewer than
+    /// 2 samples were collected (CPU% needs a delta).
+    pub peak_cpu_pct: Option<f64>,
 }
 
 /// Per-N (sub-block) measurement, matching
@@ -197,6 +205,12 @@ impl std::fmt::Display for BroadcastOutcome {
 /// rule.
 pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::Result<S4Outcome> {
     let config = ctx.config;
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            crate::sampler::Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
     let fee_rate = config.fee_rate;
     let amount_per_task: u64 = 1_000;
     let budget = Duration::from_millis(config.s4_t_budget_ms);
@@ -253,6 +267,11 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
     // and `analysis/API_DRIFT.md §3i.1.g`.
     let stall_count: u64 = 0;
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(S4Outcome {
         sub_blocks,
         success_count,
@@ -260,6 +279,8 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         stall_count,
         timeout_count,
         details,
+        peak_rss_bytes,
+        peak_cpu_pct,
     })
 }
 
@@ -622,6 +643,7 @@ mod tests {
             redaction,
             clock,
             recipients: RecipientStrategy::SelfAddress(SeedRole::New),
+            sampler_factory: None,
         }
     }
 

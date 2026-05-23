@@ -272,6 +272,69 @@ fn clock_ticks_per_sec() -> u64 {
     }
 }
 
+/// Factory for [`ResourceSampler`] instances. Plumbed via
+/// `ScenarioCtx::sampler_factory` so production code uses
+/// [`LiveSamplerFactory`] while unit tests inject [`FakeSamplerFactory`]
+/// (under `#[cfg(test)]`) for deterministic peak-population assertions.
+///
+/// The trait surface is intentionally one method: start a sampler for a
+/// given PID + interval. Stop / drop semantics live on the returned
+/// [`ResourceSampler`] — the factory is fire-and-forget.
+pub trait SamplerFactory: Send + Sync {
+    /// Start a sampler for `pid` at `interval_ms` milliseconds.
+    fn start(&self, pid: Pid, interval_ms: u64) -> ResourceSampler;
+}
+
+/// Production [`SamplerFactory`] — constructs a [`LiveSampler`] for each
+/// call to [`Self::start`]. Cheap to clone / pass by reference.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LiveSamplerFactory;
+
+impl SamplerFactory for LiveSamplerFactory {
+    fn start(&self, pid: Pid, interval_ms: u64) -> ResourceSampler {
+        ResourceSampler::start(Arc::new(LiveSampler), pid, interval_ms)
+    }
+}
+
+/// Deterministic [`SamplerFactory`] for unit tests. Returns a
+/// [`ResourceSampler`] backed by a [`FakeSampler`] pre-loaded with the
+/// canned values supplied at construction time. Used by the per-scenario
+/// peak-population tests to assert that the scenario's `*Outcome` carries
+/// the peaks the sampler observed.
+#[cfg(test)]
+pub struct FakeSamplerFactory {
+    canned_rss: Vec<u64>,
+    canned_cpu: Vec<(u64, u64)>,
+}
+
+#[cfg(test)]
+impl FakeSamplerFactory {
+    /// Build a factory whose samplers replay the supplied RSS and CPU
+    /// tick sequences. Each `start` returns a fresh sampler with its own
+    /// copy of the queues; samplers don't share state across factory
+    /// invocations.
+    pub fn new(canned_rss: Vec<u64>, canned_cpu: Vec<(u64, u64)>) -> Self {
+        Self {
+            canned_rss,
+            canned_cpu,
+        }
+    }
+}
+
+#[cfg(test)]
+impl SamplerFactory for FakeSamplerFactory {
+    fn start(&self, pid: Pid, interval_ms: u64) -> ResourceSampler {
+        let fake = Arc::new(FakeSampler::new());
+        for v in &self.canned_rss {
+            fake.push_rss(*v);
+        }
+        for v in &self.canned_cpu {
+            fake.push_cpu(v.0, v.1);
+        }
+        ResourceSampler::start(fake as Arc<dyn Sampler>, pid, interval_ms)
+    }
+}
+
 /// Deterministic [`Sampler`] for unit tests. Returns canned values popped
 /// from per-call queues; `None` once a queue is exhausted (so tests can
 /// assert "after K samples the loop sees no more data").

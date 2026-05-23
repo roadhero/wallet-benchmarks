@@ -40,6 +40,8 @@
 use std::time::Instant;
 
 use crate::modes::Mode;
+use crate::sampler::Pid;
+use crate::scenarios::ScenarioCtx;
 
 /// S2's per-cell payload, matching `RESULT_PROFILE_SCHEMA.md §S2`.
 ///
@@ -100,7 +102,18 @@ pub struct S2Outcome {
 /// the caller maps that to a `status = "failure"` cell. AC-15
 /// `outputs_found_matches_expected = false` is **not** an `Err` — it
 /// rides on the outcome and the cell-envelope writer decides.
-pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::Result<S2Outcome> {
+pub(super) async fn run(
+    ctx: &ScenarioCtx<'_>,
+    mode: &mut dyn Mode,
+    expected_outputs: u64,
+) -> anyhow::Result<S2Outcome> {
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
+
     // birthday=0 is full-history per AC-24. wipe_and_reimport teardown is
     // a Mode-trait concern (see `analysis/DESIGN.md §6 Birthday rewrite`).
     mode.wipe_and_reimport(0).await?;
@@ -126,6 +139,11 @@ pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::R
 
     let outputs_found_matches_expected = scan.outputs_found == expected_outputs;
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(S2Outcome {
         t_scan_ms,
         blocks_per_sec,
@@ -135,8 +153,8 @@ pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::R
         outputs_found: scan.outputs_found,
         expected_outputs,
         outputs_found_matches_expected,
-        peak_rss_bytes: None,
-        peak_cpu_pct: None,
+        peak_rss_bytes,
+        peak_cpu_pct,
     })
 }
 
@@ -144,6 +162,8 @@ pub(super) async fn run(mode: &mut dyn Mode, expected_outputs: u64) -> anyhow::R
 mod tests {
     use super::*;
     use crate::modes::{test_support::FakeMode, ScanOutcome};
+    use crate::sampler::FakeSamplerFactory;
+    use crate::scenarios::test_support::TestCtxOwner;
 
     fn canned_scan(outputs_found: u64) -> ScanOutcome {
         ScanOutcome {
@@ -161,7 +181,10 @@ mod tests {
         let mut fake = FakeMode::new();
         fake.canned_scan = Some(canned_scan(128));
 
-        let outcome = run(&mut fake, 128).await.expect("S2 runs with canned scan");
+        let owner = TestCtxOwner::new();
+        let outcome = run(&owner.ctx(), &mut fake, 128)
+            .await
+            .expect("S2 runs with canned scan");
 
         assert_eq!(outcome.outputs_found, 128);
         assert_eq!(outcome.expected_outputs, 128);
@@ -172,8 +195,14 @@ mod tests {
         assert_eq!(outcome.h_tip_start, 100);
         assert_eq!(outcome.h_tip_end, 1100);
         assert_eq!(outcome.blocks_scanned, 1000, "h_tip_end - h_tip_start");
-        assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
-        assert!(outcome.peak_cpu_pct.is_none(), "sampler lands in 3j");
+        assert!(
+            outcome.peak_rss_bytes.is_none(),
+            "sampler_factory: None → peak_rss_bytes is None",
+        );
+        assert!(
+            outcome.peak_cpu_pct.is_none(),
+            "sampler_factory: None → peak_cpu_pct is None",
+        );
 
         // Mode call order: wipe_and_reimport must precede scan_from_birthday
         // (AC-24 / AC-34); the wipe is the precondition for the rescan.
@@ -192,7 +221,8 @@ mod tests {
         // matches_expected=false and Ok(outcome); MUST NOT bail.
         fake.canned_scan = Some(canned_scan(128));
 
-        let outcome = run(&mut fake, 127)
+        let owner = TestCtxOwner::new();
+        let outcome = run(&owner.ctx(), &mut fake, 127)
             .await
             .expect("AC-15 mismatch must NOT be an Err");
 
@@ -209,7 +239,8 @@ mod tests {
         let mut fake = FakeMode::new();
         fake.fail_with = Some("simulated S2 scan failure".to_string());
 
-        let err = run(&mut fake, 0)
+        let owner = TestCtxOwner::new();
+        let err = run(&owner.ctx(), &mut fake, 0)
             .await
             .expect_err("scan failure must bubble up");
         let msg = format!("{err:#}");
@@ -217,5 +248,21 @@ mod tests {
             msg.contains("simulated S2 scan failure"),
             "error message must carry the underlying error: {msg}",
         );
+    }
+
+    /// 3j wiring: with a `Some(&FakeSamplerFactory)` the S2Outcome's
+    /// peak_rss_bytes is populated from the sampler rather than None.
+    #[tokio::test]
+    async fn s2_populates_peaks_from_sampler() {
+        let mut fake = FakeMode::new();
+        fake.canned_scan = Some(canned_scan(128));
+        let factory = FakeSamplerFactory::new(vec![8192], vec![]);
+        let mut owner = TestCtxOwner::new();
+        owner.config.sampler_interval_ms = 5;
+        let outcome = run(&owner.ctx_with_sampler(&factory), &mut fake, 128)
+            .await
+            .expect("S2 runs");
+        assert_eq!(outcome.peak_rss_bytes, Some(8192));
+        assert!(outcome.peak_cpu_pct.is_none());
     }
 }

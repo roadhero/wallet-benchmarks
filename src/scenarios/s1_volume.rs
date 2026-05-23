@@ -141,6 +141,12 @@ pub(super) async fn run(
     rounds_override: Option<u8>,
 ) -> anyhow::Result<S1Outcome> {
     let config = ctx.config;
+    let sampler = ctx.sampler_factory.map(|f| {
+        f.start(
+            crate::sampler::Pid(mode.target_pid_for_sampling()),
+            ctx.config.sampler_interval_ms,
+        )
+    });
     let total_rounds = rounds_override.unwrap_or(S1_ROUNDS);
     let mut rounds = Vec::with_capacity(total_rounds as usize);
     let mut success_count: u64 = 0;
@@ -235,6 +241,11 @@ pub(super) async fn run(
         });
     }
 
+    let (peak_rss_bytes, peak_cpu_pct) = match sampler {
+        Some(s) => s.stop().await,
+        None => (None, None),
+    };
+
     Ok(S1Outcome {
         rounds,
         success_count,
@@ -243,8 +254,8 @@ pub(super) async fn run(
         // S1 has no budget timeout — schema field kept for uniformity.
         timeout_count: 0,
         details,
-        peak_rss_bytes: None,
-        peak_cpu_pct: None,
+        peak_rss_bytes,
+        peak_cpu_pct,
     })
 }
 
@@ -348,6 +359,7 @@ mod tests {
             redaction: &redaction,
             clock: &clock,
             recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
         };
         let outcome = run(&ctx, &mut fake, Some(1))
             .await
@@ -407,6 +419,7 @@ mod tests {
             redaction: &redaction,
             clock: &clock,
             recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
         };
 
         let outcome = run(&ctx, &mut fake, Some(2))

@@ -32,6 +32,7 @@ mod defaults {
     pub(super) const FEE_RATE: u64 = 5;
     pub(super) const NETWORK: &str = "esmeralda";
     pub(super) const PER_TX_CONFIRMATION_TIMEOUT_MS: u64 = 1_800_000;
+    pub(super) const SAMPLER_INTERVAL_MS: u64 = 1_000;
 
     pub(super) const SEED_ENV_OLD: &str = "HARNESS_SEED_OLD";
     pub(super) const SEED_ENV_NEW: &str = "HARNESS_SEED_NEW";
@@ -100,6 +101,14 @@ pub struct Config {
     /// Per-tx confirmation wait, in milliseconds. Schema: `per_tx_confirmation_timeout_ms`.
     #[serde(default = "Config::default_per_tx_confirmation_timeout_ms")]
     pub per_tx_confirmation_timeout_ms: u64,
+
+    /// Resource sampler tick interval, in milliseconds. Drives
+    /// [`crate::sampler::ResourceSampler`]'s background loop for the
+    /// per-scenario `peak_rss_bytes` / `peak_cpu_pct` fields. Default
+    /// 1000 (1 Hz per `analysis/DESIGN.md §Sampling`). Schema:
+    /// `sampler_interval_ms`.
+    #[serde(default = "Config::default_sampler_interval_ms")]
+    pub sampler_interval_ms: u64,
 
     /// Names of the environment variables holding seed and passphrase material. The
     /// values themselves are read at runtime; only the names are persisted.
@@ -188,6 +197,9 @@ impl Config {
     fn default_per_tx_confirmation_timeout_ms() -> u64 {
         defaults::PER_TX_CONFIRMATION_TIMEOUT_MS
     }
+    fn default_sampler_interval_ms() -> u64 {
+        defaults::SAMPLER_INTERVAL_MS
+    }
 }
 
 impl Default for Config {
@@ -206,6 +218,7 @@ impl Default for Config {
             network: Self::default_network(),
             base_node_url: Self::default_base_node_url(),
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
+            sampler_interval_ms: Self::default_sampler_interval_ms(),
             seeds: Seeds::default(),
             minotari_console_wallet_path: None,
             minotari_path: None,
@@ -262,6 +275,7 @@ mod tests {
             "https://rpc.esmeralda.tari.com/"
         );
         assert_eq!(cfg.per_tx_confirmation_timeout_ms, 1_800_000);
+        assert_eq!(cfg.sampler_interval_ms, 1_000);
         assert_eq!(cfg.seeds.old, "HARNESS_SEED_OLD");
         assert_eq!(cfg.seeds.new, "HARNESS_SEED_NEW");
         assert_eq!(cfg.seeds.payment_processor, "HARNESS_SEED_PP");
@@ -304,6 +318,7 @@ mod tests {
             network: "esmeralda".to_string(),
             base_node_url: Url::parse("https://rpc.esmeralda.tari.com").unwrap(),
             per_tx_confirmation_timeout_ms: 10,
+            sampler_interval_ms: 250,
             seeds: Seeds {
                 old: "OLD".to_string(),
                 new: "NEW".to_string(),
