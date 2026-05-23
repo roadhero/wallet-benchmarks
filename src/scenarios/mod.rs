@@ -26,6 +26,7 @@ mod s2_full_rescan;
 mod s3_birthday_rescan;
 mod s4_concurrent;
 mod s5_throughput;
+mod s6_full_rescan_after;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
@@ -34,6 +35,7 @@ pub use s2_full_rescan::S2Outcome;
 pub use s3_birthday_rescan::S3Outcome;
 pub use s4_concurrent::{BroadcastOutcome, S4Outcome, SubBlockOutcome, TaskOutcome};
 pub use s5_throughput::{ArmOutcome, S5Arms, S5Outcome};
+pub use s6_full_rescan_after::S6Outcome;
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -204,6 +206,14 @@ pub struct ScenarioInput {
     /// for `expected_outputs_s2` / `h_birth_s3`). `None` for dispatches
     /// that don't need it; the S5 arm bails with a clear error if `None`.
     pub s5_seed_role_for_mode: Option<SeedRole>,
+    /// AC-15-mirror verification target for S6: the count of outputs
+    /// S6's post-S5 full-history rescan is expected to rediscover (S1's
+    /// net plus S5's net). Conceptually distinct from
+    /// `expected_outputs_s2` — S6 runs after a different upstream
+    /// scenario — so it gets its own slot per the duplicate-with-purpose
+    /// preference. `None` for dispatches that don't need it; the S6 arm
+    /// bails with a clear error if `None`.
+    pub s6_expected_outputs: Option<u64>,
 }
 
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
@@ -297,8 +307,10 @@ pub enum ScenarioOutcome {
     /// S5 — batch vs. individual arms across the 100-recipient list
     /// (AC-19/AC-20).
     S5(S5Outcome),
+    /// S6 — wipe + birthday=0 + full-history rescan after S5.
+    S6(S6Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   …      → S6..S7
+    //   …      → S7
 }
 
 /// Run the named scenario against the given mode.
@@ -365,10 +377,21 @@ pub async fn run_scenario(
                 .await
                 .map(ScenarioOutcome::S5)
         }
-        ScenarioId::S6 | ScenarioId::S7 => {
+        ScenarioId::S6 => {
+            let expected = input.s6_expected_outputs.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S6 requires ScenarioInput::s6_expected_outputs \
+                     (S1 net + S5 net; AC-15-mirror verification target)"
+                )
+            })?;
+            s6_full_rescan_after::run(mode, expected)
+                .await
+                .map(ScenarioOutcome::S6)
+        }
+        ScenarioId::S7 => {
             anyhow::bail!(
-                "scenario {id} not yet implemented (step 3i.1.g lands S5; \
-             subsequent scenarios follow in DESIGN.md swe-impl execution order)"
+                "scenario {id} not yet implemented (step 3i.1.h lands S6; \
+             S7 follows in DESIGN.md swe-impl execution order)"
             )
         }
     }
