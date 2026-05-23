@@ -25,12 +25,12 @@
 //! S4 happens at the scenario level via `tokio::JoinSet`; this module makes
 //! one gRPC call per `Mode::send_*` invocation, no internal loops.
 
-use std::{str::FromStr, time::Instant};
+use std::{str::FromStr, sync::Arc, time::Instant};
 
 use anyhow::Context;
 use minotari_app_grpc::tari_rpc::{
-    payment_recipient::PaymentType, Empty, GetBalanceRequest, GetStateRequest, PaymentRecipient,
-    TransferRequest,
+    payment_recipient::PaymentType, wallet_client::WalletClient, Empty, GetBalanceRequest,
+    GetStateRequest, PaymentRecipient, TransferRequest,
 };
 use tari_common_types::{
     seeds::{
@@ -40,10 +40,10 @@ use tari_common_types::{
     },
     tari_address::TariAddress,
 };
-use tonic::Request;
+use tonic::{transport::Channel, Request};
 
 use crate::{
-    modes::{Mode, ScanOutcome, TxRecord, UnsupportedOperation},
+    modes::{Mode, S4Dispatcher, ScanOutcome, TxRecord, UnsupportedOperation},
     wallet_lifecycle::{console_wallet::ConsoleWalletLifecycle, WalletLifecycle},
 };
 
@@ -204,6 +204,25 @@ impl Mode for OldWallet {
         Ok(resp.amount.len() as u64)
     }
 
+    fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
+        // Clone the connected gRPC client — tonic's generated `WalletClient<T>`
+        // derives `Clone` (see
+        // `target/release/build/minotari_app_grpc-*/out/tari.rpc.rs:6920`
+        // `#[derive(Debug, Clone)]`), and a clone of `WalletClient<Channel>`
+        // shares the same underlying `tonic::transport::Channel` connection
+        // pool — cheap to clone, safe to invoke from multiple tasks. Per
+        // `analysis/DESIGN_AMENDMENT.md §9.6` Option B.
+        //
+        // If `wait_ready` has not yet succeeded, the held client is `None`
+        // and a clone is not possible. `OldWalletDispatcher` stores the
+        // `Option` and surfaces the "not connected" error at `dispatch` time
+        // — the trait method itself cannot return `Result` (`Mode::dispatcher`
+        // returns the handle unconditionally so the scenario layer can call
+        // it before checking liveness).
+        let client = self.lifecycle.client_handle_for_dispatcher().cloned();
+        Arc::new(OldWalletDispatcher { client })
+    }
+
     async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {
         // 1. Teardown the running wallet.
         self.lifecycle.teardown().await.context("teardown")?;
@@ -239,6 +258,91 @@ impl Mode for OldWallet {
             "Mode 1 wipe_and_reimport complete (birthday={birthday})",
         );
         Ok(())
+    }
+}
+
+/// S4 dispatch handle for Mode 1. Holds a cloned
+/// [`WalletClient<Channel>`] — tonic's generated client derives `Clone` and a
+/// clone shares the same underlying [`tonic::transport::Channel`] connection
+/// pool, so N concurrent tasks can each call `transfer(...)` against their
+/// own handle without contending for a mutex. Per
+/// `analysis/DESIGN_AMENDMENT.md §9.6` Option B.
+///
+/// `client` is `None` when [`OldWallet::dispatcher`] is called before
+/// [`OldWallet::spawn_and_wait_ready`] succeeded; [`Self::dispatch`] surfaces
+/// the "not connected" error at call time so the scenario layer sees the
+/// same `not yet connected` semantics it would see from a sequential
+/// `mode.send_single` call against an unconnected wallet.
+pub struct OldWalletDispatcher {
+    /// Cloned gRPC client. The underlying tonic `Channel` is reference-counted,
+    /// so this clone is cheap and the concurrent `dispatch` calls each get
+    /// their own typed handle.
+    client: Option<WalletClient<Channel>>,
+}
+
+#[async_trait::async_trait]
+impl S4Dispatcher for OldWalletDispatcher {
+    async fn dispatch(
+        &self,
+        recipient: TariAddress,
+        amount_microtari: u64,
+        fee_rate: u64,
+    ) -> anyhow::Result<TxRecord> {
+        let mut client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OldWalletDispatcher: client not yet connected (call \
+                     OldWallet::spawn_and_wait_ready before invoking dispatcher)",
+                )
+            })?
+            .clone();
+        let started = Instant::now();
+        let req = TransferRequest {
+            recipients: vec![PaymentRecipient {
+                address: recipient.to_base58(),
+                amount: amount_microtari,
+                fee_per_gram: fee_rate,
+                payment_type: PaymentType::OneSidedToStealthAddress as i32,
+                raw_payment_id: Vec::new(),
+                user_payment_id: None,
+            }],
+            single_tx: true,
+        };
+        log::debug!(
+            target: LOG_TARGET,
+            "Mode 1 dispatcher: address={} amount={amount_microtari} fee_rate={fee_rate}",
+            recipient.to_base58(),
+        );
+        let resp = client
+            .transfer(Request::new(req))
+            .await
+            .context("Mode 1 dispatcher Transfer (single-recipient) failed")?
+            .into_inner();
+        let t_total = started.elapsed().as_millis() as u64;
+        let result = resp.results.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("Mode 1 dispatcher Transfer returned an empty results vector")
+        })?;
+        let status = if result.is_success {
+            "success".to_string()
+        } else {
+            "failure".to_string()
+        };
+        let error_string = if result.is_success {
+            None
+        } else {
+            Some(result.failure_message.clone())
+        };
+        Ok(TxRecord {
+            txid: result.transaction_id.to_string(),
+            t_total_ms: t_total,
+            t_broadcast_ms: t_total,
+            t_confirm_ms: None,
+            status,
+            error_string,
+            fee_microtari: 0,
+        })
     }
 }
 

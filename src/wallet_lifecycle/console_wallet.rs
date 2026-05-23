@@ -200,6 +200,21 @@ impl ConsoleWalletLifecycle {
         })
     }
 
+    /// Shared (immutable) handle for the connected gRPC client, intended for
+    /// cloning into an S4 dispatcher. Returns `None` if [`Self::wait_ready`]
+    /// has not yet succeeded — the caller surfaces the "not connected" error
+    /// at dispatch time (the [`crate::modes::Mode::dispatcher`] method must
+    /// return the handle unconditionally, so liveness is checked one layer
+    /// later).
+    ///
+    /// Cloning the returned reference yields an independent
+    /// [`WalletClient<Channel>`] sharing the same underlying
+    /// [`tonic::transport::Channel`] connection pool — cheap, safe across
+    /// concurrent tasks.
+    pub fn client_handle_for_dispatcher(&self) -> Option<&WalletClient<Channel>> {
+        self.client.as_ref()
+    }
+
     /// Mutable access to the owned [`HarnessDataDir`] for explicit wipe
     /// calls — used by the Mode 1 `wipe_and_reimport` flow that AC-34
     /// polices (path-confinement is enforced inside `HarnessDataDir::wipe`).

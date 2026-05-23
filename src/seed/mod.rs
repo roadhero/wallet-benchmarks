@@ -100,6 +100,13 @@ pub enum SeedRole {
 /// reconstructing the handle. The trade-off is documented per-accessor:
 /// callers MUST NOT cache the returned [`RedactedString`] across long-lived
 /// boundaries; the runtime contract is "fresh value per call".
+///
+/// `Clone` is derived because S4's [`crate::modes::S4Dispatcher`] handles
+/// (per `analysis/DESIGN_AMENDMENT.md §9.6` Option B) capture this handle
+/// inside an `Arc` shared across N concurrent dispatch tasks. The handle
+/// holds only env-var names, so cloning is a pointer-and-string copy with
+/// no secret material involved.
+#[derive(Clone)]
 pub struct SeedHandle {
     seeds_config: crate::config::Seeds,
 }

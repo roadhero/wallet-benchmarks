@@ -30,6 +30,10 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Instant,
 };
 
@@ -55,7 +59,7 @@ use tokio::process::Command;
 use crate::{
     broadcast::Broadcaster,
     config::Config,
-    modes::{TxRecord, TxRecordPhase, TxRecordStatus},
+    modes::{S4Dispatcher, TxRecord, TxRecordPhase, TxRecordStatus},
     seed::SeedHandle,
 };
 
@@ -456,6 +460,90 @@ pub(super) async fn create_sign_and_submit(
         // not "actually zero".
         fee_microtari: 0,
     })
+}
+
+/// Shared S4 dispatch handle for Modes 2 and 3.
+///
+/// Both modes route through [`create_sign_and_submit`] — same pipeline, the
+/// only operational difference is the seed slot. The dispatcher captures
+/// `Arc<Config>` / `Arc<SeedHandle>` / `Arc<Broadcaster>` / `Arc<PathBuf>`
+/// (data dir) so N concurrent tasks can each clone the Arc bundle and call
+/// the free function without contending for a `&mut Mode`. Per
+/// `analysis/DESIGN_AMENDMENT.md §9.6` Option B (greenlit by main thread).
+///
+/// Each `dispatch` call assigns its own monotonically increasing
+/// `tx_idx` via an `Arc<AtomicU64>` so per-task output filenames don't
+/// collide in the per-mode data dir (each task writes `tx_<idx>.json`
+/// inside the subprocess pipeline, deleted on success, preserved on
+/// failure per the helper's contract).
+pub(super) struct MinotariSubprocessDispatcher {
+    /// Harness config — read for `minotari_path`, `fee_rate`, and
+    /// network plumbing inside `create_sign_and_submit`.
+    cfg: Arc<Config>,
+    /// Runtime seed accessor — read per `seed_role` to reconstitute the
+    /// `KeyManager` for in-process signing.
+    seeds: Arc<SeedHandle>,
+    /// HTTP broadcaster — shared across tasks (the upstream
+    /// `BaseNodeHttpClient` is `Clone` and carries its own
+    /// `reqwest` connection pool).
+    broadcaster: Arc<Broadcaster>,
+    /// Per-mode data dir — each dispatched task writes a uniquely-named
+    /// `tx_<idx>.json` inside it.
+    data_dir: Arc<PathBuf>,
+    /// Which seed slot the helper reads — `SeedRole::New` for Mode 2,
+    /// `SeedRole::Pp` for Mode 3.
+    seed_role: SeedRole,
+    /// Shared monotonic counter for the per-task `tx_idx` argument that
+    /// disambiguates the per-task output files. Lock-free via
+    /// `fetch_add(Ordering::SeqCst)`.
+    tx_idx: Arc<AtomicU64>,
+}
+
+impl MinotariSubprocessDispatcher {
+    /// Construct a new dispatcher. Visible to the parent module so
+    /// `NewWallet::dispatcher` and `PaymentProcessor::dispatcher` can wire
+    /// the per-mode Arcs without exposing the type publicly.
+    pub(super) fn new(
+        cfg: Arc<Config>,
+        seeds: Arc<SeedHandle>,
+        broadcaster: Arc<Broadcaster>,
+        data_dir: Arc<PathBuf>,
+        seed_role: SeedRole,
+        tx_idx_start: u64,
+    ) -> Self {
+        Self {
+            cfg,
+            seeds,
+            broadcaster,
+            data_dir,
+            seed_role,
+            tx_idx: Arc::new(AtomicU64::new(tx_idx_start)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl S4Dispatcher for MinotariSubprocessDispatcher {
+    async fn dispatch(
+        &self,
+        recipient: TariAddress,
+        amount_microtari: u64,
+        fee_rate: u64,
+    ) -> anyhow::Result<TxRecord> {
+        let idx = self.tx_idx.fetch_add(1, Ordering::SeqCst);
+        let recipients = [(recipient, amount_microtari)];
+        create_sign_and_submit(
+            &self.cfg,
+            &self.seeds,
+            self.seed_role,
+            &recipients,
+            fee_rate,
+            &self.broadcaster,
+            self.data_dir.as_path(),
+            idx,
+        )
+        .await
+    }
 }
 
 /// Build a [`TxRecord`] describing a failure at `phase` with `error_string`.

@@ -24,6 +24,8 @@ pub mod new_wallet;
 pub mod old_wallet;
 pub mod payment_processor;
 
+use std::sync::Arc;
+
 use tari_common_types::tari_address::TariAddress;
 
 /// Per-transaction record produced by `Mode::send_single` /
@@ -141,6 +143,56 @@ pub trait Mode: Send + Sync {
     /// re-import, and spawn the wallet again. Called by B0/S2/S3/S6/S7
     /// per `RESULT_PROFILE_SCHEMA.md §4` and AC-24.
     async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()>;
+
+    /// Return a clone-able dispatch handle for S4's concurrent construction.
+    ///
+    /// Realizes `DESIGN.md §S4 state machine` line 415's `mode.clone_handle()`
+    /// intent via Option B from `analysis/DESIGN_AMENDMENT.md §9.6` (greenlit
+    /// by main thread). The trait's `send_*` methods take `&mut self` — fine
+    /// for sequential scenarios but incompatible with `tokio::JoinSet::spawn`'s
+    /// `'static + Send` future requirement when N tasks each need to invoke
+    /// the construction pipeline concurrently.
+    ///
+    /// Each impl returns an `Arc<dyn S4Dispatcher>` capturing its own
+    /// concurrency-safe immutable state:
+    ///
+    /// * Mode 1 (`OldWallet`): a cloned `WalletClient<Channel>` (tonic
+    ///   `#[derive(Clone)]` on the generated client; the gRPC channel is
+    ///   cheap to clone — see `target/release/build/minotari_app_grpc-*/out/tari.rpc.rs:6920`).
+    /// * Mode 2 (`NewWallet`) / Mode 3 (`PaymentProcessor`): `Arc<Config>`,
+    ///   `Arc<SeedHandle>`, `Arc<Broadcaster>`, `Arc<PathBuf>` (data dir),
+    ///   and the per-mode [`crate::modes::minotari_subprocess::SeedRole`].
+    ///   `create_sign_and_submit` is already a free function taking shared
+    ///   references; the Arc bundle is what makes the cross-task clone work.
+    ///
+    /// **No Mutex on the production dispatcher surface** — concurrency safety
+    /// comes from Arc-clone of immutable state, not from runtime locking. The
+    /// `tests/c_no_dispatch_serialization_in_s4.rs` static grep enforces this
+    /// against `src/scenarios/s4_concurrent.rs`.
+    fn dispatcher(&self) -> Arc<dyn S4Dispatcher>;
+}
+
+/// Clone-able dispatch handle for S4's concurrent construction (AC-17).
+///
+/// One handle per scenario; N concurrent tasks each hold an `Arc<dyn S4Dispatcher>`
+/// clone and call [`Self::dispatch`] without coordinating through a shared
+/// `&mut Mode`. The receiver is `&self` so the borrow checker permits N
+/// concurrent invocations.
+///
+/// Returns the same [`TxRecord`] shape as [`Mode::send_single`] so the S4
+/// scenario can fold per-task outcomes into its `tx_records[]` aggregate
+/// without re-deriving timing fields.
+#[async_trait::async_trait]
+pub trait S4Dispatcher: Send + Sync {
+    /// Construct, sign, and broadcast a single-recipient transaction. Same
+    /// contract as [`Mode::send_single`] — failure surfaces as a `TxRecord`
+    /// with `status != "success"` (no retry, no backoff, per AC-30/31/32).
+    async fn dispatch(
+        &self,
+        recipient: TariAddress,
+        amount_microtari: u64,
+        fee_rate: u64,
+    ) -> anyhow::Result<TxRecord>;
 }
 
 /// Error returned by Mode implementations that don't support a given
@@ -242,7 +294,10 @@ impl std::fmt::Display for TxRecordPhase {
 /// (mock the Mode trait surface for scenario unit tests) is preserved.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
 
     use super::*;
 
@@ -425,6 +480,75 @@ pub(crate) mod test_support {
             self.check_fail("wipe_and_reimport")?;
             Ok(())
         }
+
+        fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
+            // Snapshot the FakeMode's current `send_single_sequence` into a
+            // shared `Arc<Mutex<Vec<SendOutcome>>>` so N concurrent S4 tasks
+            // can pop from the same canned sequence. The Mutex lives ONLY
+            // inside the `#[cfg(test)]` test-fixture surface — production
+            // dispatchers (Mode 1/2/3) carry no Mutex per
+            // `analysis/DESIGN_AMENDMENT.md §9.6` Option B and the brief's
+            // sharper STOP triggers.
+            Arc::new(FakeModeDispatcher {
+                sequence: Arc::new(Mutex::new(self.send_single_sequence.clone())),
+                cursor: Arc::new(AtomicUsize::new(0)),
+                canned_default: self.canned_send_single.clone(),
+            })
+        }
+    }
+
+    /// Test-only `S4Dispatcher` for the scenario suite.
+    ///
+    /// Pops outcomes from a shared canned sequence under a `Mutex<Vec<SendOutcome>>`
+    /// (sequence storage) + `AtomicUsize` (cursor). This Mutex is **fixture
+    /// state**, not production dispatcher state — the brief's "no Mutex on the
+    /// production dispatcher surface" prohibition is satisfied because this
+    /// type lives under `#[cfg(test)] mod test_support`. Same precedent as
+    /// FakeMode itself: hand-rolled fakes carry whatever interior mutability
+    /// the scenario unit tests need.
+    pub(crate) struct FakeModeDispatcher {
+        /// Shared canned outcomes — one cursor advance per `dispatch` call.
+        /// Once the cursor passes the sequence length, falls through to
+        /// `canned_default` (matches FakeMode's `send_single` semantics).
+        sequence: Arc<Mutex<Vec<SendOutcome>>>,
+        /// Position cursor for the next `dispatch` call. `AtomicUsize` so the
+        /// fetch-and-increment is lock-free across concurrent tasks; the
+        /// Mutex on `sequence` is held only briefly to clone the indexed
+        /// element out.
+        cursor: Arc<AtomicUsize>,
+        /// Fallback `Ok(TxRecord)` returned once the sequence is exhausted.
+        /// `None` means "bail with a 'no canned value set' error" matching
+        /// FakeMode::send_single's contract.
+        canned_default: Option<TxRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl S4Dispatcher for FakeModeDispatcher {
+        async fn dispatch(
+            &self,
+            _recipient: TariAddress,
+            _amount_microtari: u64,
+            _fee_rate: u64,
+        ) -> anyhow::Result<TxRecord> {
+            let idx = self.cursor.fetch_add(1, Ordering::SeqCst);
+            let outcome = {
+                let seq = self.sequence.lock().unwrap();
+                if idx < seq.len() {
+                    Some(seq[idx].clone())
+                } else {
+                    None
+                }
+            };
+            match outcome {
+                Some(SendOutcome::Ok(rec)) => Ok(rec),
+                Some(SendOutcome::Err(msg)) => {
+                    anyhow::bail!("FakeModeDispatcher::dispatch: {msg}")
+                }
+                None => self.canned_default.clone().ok_or_else(|| {
+                    anyhow::anyhow!("FakeModeDispatcher::dispatch: no canned value set")
+                }),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -479,6 +603,80 @@ pub(crate) mod test_support {
                 msg.contains("forced for test"),
                 "error must carry fail_with payload: {msg}",
             );
+        }
+
+        fn sample_tx_record(tag: &str) -> TxRecord {
+            TxRecord {
+                txid: format!("txid-{tag}"),
+                t_total_ms: 1,
+                t_broadcast_ms: 1,
+                t_confirm_ms: None,
+                status: "success".to_string(),
+                error_string: None,
+                fee_microtari: 0,
+            }
+        }
+
+        /// FakeMode::dispatcher returns an Arc-shareable handle that can be
+        /// cloned and invoked from a tokio context. Proves the trait method
+        /// is wired through and that the dispatcher Arc is usable as the
+        /// `Arc<dyn S4Dispatcher>` shape S4's JoinSet pattern needs.
+        #[tokio::test]
+        async fn fake_mode_dispatcher_returns_arc_and_is_invokable() {
+            let mut fake = FakeMode::new();
+            fake.send_single_sequence = vec![SendOutcome::Ok(sample_tx_record("solo"))];
+            let dispatcher = fake.dispatcher();
+            let recipient = derive_test_address();
+            let rec = dispatcher
+                .dispatch(recipient, 1_000, 25)
+                .await
+                .expect("dispatch ok");
+            assert_eq!(rec.txid, "txid-solo");
+        }
+
+        /// 4 concurrent dispatch tasks against a FakeModeDispatcher
+        /// consume all 4 canned outcomes; cursor advances atomically across
+        /// tasks. Proves the dispatcher is genuinely concurrent — Arc clone
+        /// is sufficient, no `&mut self` required.
+        #[tokio::test]
+        async fn fake_dispatcher_pops_canned_sequence_concurrently() {
+            let mut fake = FakeMode::new();
+            fake.send_single_sequence = vec![
+                SendOutcome::Ok(sample_tx_record("a")),
+                SendOutcome::Ok(sample_tx_record("b")),
+                SendOutcome::Ok(sample_tx_record("c")),
+                SendOutcome::Ok(sample_tx_record("d")),
+            ];
+            let dispatcher = fake.dispatcher();
+
+            let mut joinset = tokio::task::JoinSet::new();
+            for _ in 0..4 {
+                let d = dispatcher.clone();
+                let recipient = derive_test_address();
+                joinset.spawn(async move { d.dispatch(recipient, 1_000, 25).await });
+            }
+            let mut txids: Vec<String> = Vec::new();
+            while let Some(joined) = joinset.join_next().await {
+                let rec = joined.expect("join ok").expect("dispatch ok");
+                txids.push(rec.txid);
+            }
+            txids.sort();
+            assert_eq!(
+                txids,
+                vec![
+                    "txid-a".to_string(),
+                    "txid-b".to_string(),
+                    "txid-c".to_string(),
+                    "txid-d".to_string(),
+                ],
+                "all 4 canned outcomes must be consumed exactly once \
+                 (order is not deterministic across tasks)",
+            );
+        }
+
+        fn derive_test_address() -> TariAddress {
+            let mnemonic = crate::gen_seed().expect("gen_seed");
+            crate::seed::derive_address(&mnemonic).expect("derive_address")
         }
     }
 }

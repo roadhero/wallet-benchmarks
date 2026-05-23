@@ -34,18 +34,18 @@
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
 
-use std::time::Instant;
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use crate::{
     broadcast::Broadcaster,
     config::Config,
     modes::{
-        minotari_subprocess::{create_sign_and_submit, SeedRole},
+        minotari_subprocess::{create_sign_and_submit, MinotariSubprocessDispatcher, SeedRole},
         minotari_wallet_ops::{
             rewrite_birthday, run_balance_subprocess, run_scan_subprocess,
             wipe_and_reimport_via_create,
         },
-        Mode, ScanOutcome, TxRecord,
+        Mode, S4Dispatcher, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
     wallet_lifecycle::HarnessDataDir,
@@ -233,6 +233,22 @@ impl Mode for NewWallet {
                  canonical source (see analysis/DESIGN_AMENDMENT.md §8.3 step 4).",
             ),
         }
+    }
+
+    fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
+        // Wrap Mode 2's already-held state in Arcs for cross-task sharing.
+        // Constructing fresh Arcs every call is the simplest contract — the
+        // caller (S4 scenario, scenarios/s4_concurrent.rs) acquires the
+        // dispatcher once per sub-block and clones the inner Arc inside each
+        // spawned task. Per `analysis/DESIGN_AMENDMENT.md §9.6` Option B.
+        Arc::new(MinotariSubprocessDispatcher::new(
+            Arc::new(self.cfg.clone()),
+            Arc::new(self.seeds.clone()),
+            Arc::new(Broadcaster::new(&self.cfg.base_node_url)),
+            Arc::new(PathBuf::from(self.data_dir.path())),
+            SeedRole::New,
+            self.tx_idx,
+        ))
     }
 
     async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {

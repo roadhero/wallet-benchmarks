@@ -27,18 +27,18 @@
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
 
-use std::time::Instant;
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use crate::{
     broadcast::Broadcaster,
     config::Config,
     modes::{
-        minotari_subprocess::{create_sign_and_submit, SeedRole},
+        minotari_subprocess::{create_sign_and_submit, MinotariSubprocessDispatcher, SeedRole},
         minotari_wallet_ops::{
             rewrite_birthday, run_balance_subprocess, run_scan_subprocess,
             wipe_and_reimport_via_create,
         },
-        Mode, ScanOutcome, TxRecord,
+        Mode, S4Dispatcher, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
     wallet_lifecycle::HarnessDataDir,
@@ -201,6 +201,21 @@ impl Mode for PaymentProcessor {
                  canonical source (see analysis/DESIGN_AMENDMENT.md §8.3 step 4).",
             ),
         }
+    }
+
+    fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
+        // Mirror of [`crate::modes::new_wallet::NewWallet::dispatcher`];
+        // see that impl for the design trace. The only difference is the
+        // seed slot threaded into the shared `MinotariSubprocessDispatcher`
+        // (`SeedRole::Pp` here vs `SeedRole::New` for Mode 2).
+        Arc::new(MinotariSubprocessDispatcher::new(
+            Arc::new(self.cfg.clone()),
+            Arc::new(self.seeds.clone()),
+            Arc::new(Broadcaster::new(&self.cfg.base_node_url)),
+            Arc::new(PathBuf::from(self.data_dir.path())),
+            SeedRole::Pp,
+            self.tx_idx,
+        ))
     }
 
     async fn wipe_and_reimport(&mut self, birthday: u16) -> anyhow::Result<()> {
