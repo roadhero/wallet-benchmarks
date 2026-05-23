@@ -41,6 +41,17 @@ pub enum Commands {
         /// current working directory.
         #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
+        /// Path to write the canonical result-profile JSON. Defaults to
+        /// `baselines/esmeralda_canonical.json` per
+        /// `analysis/DESIGN_ADDENDUM.md §M4`.
+        #[arg(long, default_value = "baselines/esmeralda_canonical.json")]
+        output: PathBuf,
+        /// Skip the funding pre-flight (`enforce_funding`). For testing
+        /// only — production baseline runs MUST use the live pre-flight to
+        /// catch under-funded seeds before consuming ~hours of scenario
+        /// time. See `analysis/PR_BODY_PLAN.md §Operator Setup`.
+        #[arg(long = "skip-funding-preflight")]
+        skip_funding_preflight: bool,
     },
     /// Generate a fresh 24-word Tari mnemonic and print it to stdout.
     GenSeed,
@@ -59,6 +70,8 @@ impl Cli {
     pub fn resolved_command(self) -> Commands {
         self.command.unwrap_or(Commands::Run {
             config: PathBuf::from(DEFAULT_CONFIG_PATH),
+            output: PathBuf::from("baselines/esmeralda_canonical.json"),
+            skip_funding_preflight: false,
         })
     }
 }
@@ -76,6 +89,8 @@ mod tests {
             cli.resolved_command(),
             Commands::Run {
                 config: PathBuf::from("foo.toml"),
+                output: PathBuf::from("baselines/esmeralda_canonical.json"),
+                skip_funding_preflight: false,
             }
         );
     }
@@ -109,6 +124,8 @@ mod tests {
             cli.resolved_command(),
             Commands::Run {
                 config: PathBuf::from(DEFAULT_CONFIG_PATH),
+                output: PathBuf::from("baselines/esmeralda_canonical.json"),
+                skip_funding_preflight: false,
             }
         );
     }
@@ -120,6 +137,8 @@ mod tests {
             cli.resolved_command(),
             Commands::Run {
                 config: PathBuf::from(DEFAULT_CONFIG_PATH),
+                output: PathBuf::from("baselines/esmeralda_canonical.json"),
+                skip_funding_preflight: false,
             }
         );
     }
