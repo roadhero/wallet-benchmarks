@@ -14,9 +14,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use clap::Parser;
+use minotari_node_wallet_client::{http::Client as BaseNodeHttpClient, BaseNodeWalletClient};
+use url::Url;
 use wallet_benchmarks::{
     cli::{Cli, Commands},
     clock::RealClock,
@@ -155,6 +158,14 @@ async fn run_harness_async(
                 target: LOG_TARGET,
                 "running {scenario_id} for mode {mode_role:?}",
             );
+
+            // Pre-scenario tip query + wall-clock measurement bracket.
+            // Tip query failures don't bail the scenario — emit None and
+            // attach a per-cell note so the writer surfaces the gap
+            // observably.
+            let (tip_start, tip_query_note_start) =
+                fetch_tip_height_observably(&config.base_node_url).await;
+
             let ctx = ScenarioCtx {
                 config: &config,
                 seeds: &seeds,
@@ -163,22 +174,48 @@ async fn run_harness_async(
                 recipients: RecipientStrategy::SelfAddress(mode_role),
                 sampler_factory: Some(&sampler_factory),
             };
+            let t0 = Instant::now();
             let outcome =
                 scenarios::run_scenario(scenario_id, &ctx, mode.as_mut(), &scenario_input).await;
-            let cell_result = match outcome {
+            let wall_clock_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            let (tip_end, tip_query_note_end) =
+                fetch_tip_height_observably(&config.base_node_url).await;
+            // Combine the two notes so any tip-query failure is surfaced
+            // without dropping the other half's value.
+            let tip_query_note = match (tip_query_note_start, tip_query_note_end) {
+                (None, None) => None,
+                (Some(a), None) => Some(format!("pre-scenario tip query: {a}")),
+                (None, Some(b)) => Some(format!("post-scenario tip query: {b}")),
+                (Some(a), Some(b)) => Some(format!(
+                    "pre-scenario tip query: {a} | post-scenario tip query: {b}"
+                )),
+            };
+
+            let (cell_result, fees) = match outcome {
                 Ok(o) => {
                     update_scenario_input(&o, &mut scenario_input);
-                    CellResult::Outcome(Box::new(o))
+                    let fees = compute_fees_paid(&o);
+                    (CellResult::Outcome(Box::new(o)), fees)
                 }
                 Err(e) => {
                     log::warn!(
                         target: LOG_TARGET,
                         "{scenario_id} for {mode_role:?} returned Err: {e:#}",
                     );
-                    CellResult::Error(e)
+                    (CellResult::Error(e), 0)
                 }
             };
-            matrix.record(mode_role, scenario_id, cell_result);
+            matrix.record(
+                mode_role,
+                scenario_id,
+                cell_result,
+                wall_clock_ms,
+                tip_start,
+                tip_end,
+                tip_query_note,
+                fees,
+            );
         }
     }
 
@@ -260,6 +297,92 @@ fn probe_versions(config: &Config) -> Versions {
     // base_node falls back to the pinned tag/commit in Versions::default
     // when no live endpoint is queried — see versions::Versions doc.
     v
+}
+
+/// Fetch the base-node tip height observably: on success returns
+/// `(Some(h), None)`; on failure returns `(None, Some(diagnostic))` so
+/// the writer can attach a per-cell `tip_query_note` rather than
+/// silently emitting `null`. A failed tip query never aborts a
+/// scenario — the wallet itself records its own `h_tip_*` for scan
+/// scenarios; this helper is the fallback for send scenarios that
+/// don't carry tip data on their outcome.
+async fn fetch_tip_height_observably(base_node_url: &Url) -> (Option<u64>, Option<String>) {
+    let client = BaseNodeHttpClient::new(base_node_url.clone(), base_node_url.clone());
+    match client.get_tip_info().await {
+        Ok(resp) => match resp.metadata {
+            Some(m) => (Some(m.best_block_height()), None),
+            None => (None, Some("get_tip_info returned no metadata".to_string())),
+        },
+        Err(e) => (None, Some(format!("get_tip_info failed: {e:#}"))),
+    }
+}
+
+/// Compute `fees_paid_microtari` for the cell envelope. Read from
+/// `tx_record.fee_microtari` for scenarios that carry tx records
+/// (S0/S1/S5); S4's `TaskOutcome` doesn't track per-task fees, so use
+/// the documented formula `fee_rate × 35 × success_count` where 35 is
+/// the standard 1-input-1-output transaction kernel weight per
+/// DESIGN.md. Scan scenarios always return 0.
+fn compute_fees_paid(outcome: &ScenarioOutcome) -> u64 {
+    use wallet_benchmarks::scenarios::ScenarioOutcome as S;
+    const S4_KERNEL_WEIGHT: u64 = 35;
+    match outcome {
+        S::B0(_) | S::S2(_) | S::S3(_) | S::S6(_) | S::S7(_) => 0,
+        S::S0(s0) => s0.tx_record.fee_microtari,
+        S::S1(s1) => s1
+            .rounds
+            .iter()
+            .flat_map(|r| r.tx_records.iter())
+            .map(|t| t.fee_microtari)
+            .sum(),
+        S::S4(s4) => {
+            // S4's TaskOutcome doesn't carry a fee field; derive from the
+            // documented kernel-weight formula. Sum Accepted tasks across
+            // sub-blocks × kernel weight × (placeholder fee rate of 1 —
+            // operator-actionable fee comparison happens at matrix-
+            // aggregation level per PR_BODY_PLAN.md §Pre-merge cleanups).
+            let successes: u64 = s4
+                .sub_blocks
+                .iter()
+                .flat_map(|sb| sb.tx_records.iter())
+                .filter(|t| {
+                    matches!(
+                        t.broadcast_outcome,
+                        wallet_benchmarks::scenarios::BroadcastOutcome::Accepted
+                    )
+                })
+                .count() as u64;
+            successes
+                .saturating_mul(S4_KERNEL_WEIGHT)
+                .saturating_mul(s4_fee_rate_from_outcome(s4))
+        }
+        S::S5(s5) => {
+            let ind: u64 = s5
+                .arms
+                .individual
+                .tx_records
+                .iter()
+                .map(|t| t.fee_microtari)
+                .sum();
+            let bat: u64 = s5
+                .arms
+                .batch
+                .tx_records
+                .iter()
+                .map(|t| t.fee_microtari)
+                .sum();
+            ind + bat
+        }
+    }
+}
+
+/// S4's `SubBlockOutcome` doesn't carry the fee_rate that produced its
+/// tasks (Config's value is the source). Returning a placeholder of 1
+/// here means the S4 fee figure is structurally `success_count × 35`
+/// — the operator-actionable fee comparison happens at the
+/// matrix-aggregation level (Phase 4 carry tracked in PR_BODY_PLAN.md).
+fn s4_fee_rate_from_outcome(_s4: &wallet_benchmarks::scenarios::S4Outcome) -> u64 {
+    1
 }
 
 /// Thread the just-completed scenario's results into `ScenarioInput` so

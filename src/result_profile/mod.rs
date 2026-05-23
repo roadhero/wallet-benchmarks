@@ -49,12 +49,29 @@ pub enum CellResult {
     NotRun,
 }
 
-/// Matrix of `(mode, scenario)` → `CellResult` populated by
+/// Cell envelope captured by the run loop alongside each [`CellResult`].
+/// Closes the common-envelope coverage gap for fields the
+/// `ScenarioOutcome` types don't carry intrinsically.
+///
+/// `tip_height_start` / `tip_height_end` are `None` when the base-node
+/// tip query failed for that cell — the writer emits `null` plus a
+/// per-cell `tip_query_note` rather than the catch-all
+/// `envelope_coverage_note`.
+pub struct CellEntry {
+    pub result: CellResult,
+    pub wall_clock_ms: u64,
+    pub tip_height_start: Option<u64>,
+    pub tip_height_end: Option<u64>,
+    pub tip_query_note: Option<String>,
+    pub fees_paid_microtari: u64,
+}
+
+/// Matrix of `(mode, scenario)` → `CellEntry` populated by
 /// `main::run_harness_async`. Up to 27 cells (3 modes × 9 scenarios);
 /// `NotRun` cells are stored explicitly so the writer can emit `null`
 /// at the appropriate JSON slot.
 pub struct Matrix {
-    pub cells: HashMap<(SeedRole, ScenarioId), CellResult>,
+    pub cells: HashMap<(SeedRole, ScenarioId), CellEntry>,
 }
 
 impl Matrix {
@@ -64,11 +81,32 @@ impl Matrix {
         }
     }
 
-    pub fn record(&mut self, role: SeedRole, scenario: ScenarioId, result: CellResult) {
-        self.cells.insert((role, scenario), result);
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        role: SeedRole,
+        scenario: ScenarioId,
+        result: CellResult,
+        wall_clock_ms: u64,
+        tip_height_start: Option<u64>,
+        tip_height_end: Option<u64>,
+        tip_query_note: Option<String>,
+        fees_paid_microtari: u64,
+    ) {
+        self.cells.insert(
+            (role, scenario),
+            CellEntry {
+                result,
+                wall_clock_ms,
+                tip_height_start,
+                tip_height_end,
+                tip_query_note,
+                fees_paid_microtari,
+            },
+        );
     }
 
-    pub fn get(&self, role: SeedRole, scenario: ScenarioId) -> Option<&CellResult> {
+    pub fn get(&self, role: SeedRole, scenario: ScenarioId) -> Option<&CellEntry> {
         self.cells.get(&(role, scenario))
     }
 }
@@ -187,43 +225,62 @@ fn modes_block(matrix: &Matrix) -> Value {
     Value::Object(modes)
 }
 
-fn cell_to_json(cell: Option<&CellResult>) -> Value {
-    let cell = match cell {
+fn cell_to_json(cell: Option<&CellEntry>) -> Value {
+    let entry = match cell {
         Some(c) => c,
         None => return Value::Null,
     };
-    match cell {
+    match &entry.result {
         CellResult::NotRun => Value::Null,
-        CellResult::Error(e) => {
-            json!({
-                "status": "failure",
-                "wall_clock_ms": 0,
-                "tip_height_start": 0,
-                "tip_height_end": 0,
-                "fees_paid_microtari": 0,
-                "balance_before_microtari": 0,
-                "balance_after_microtari": 0,
-                "balance_delta_microtari": 0,
-                "balance_reconciliation_ok": false,
-                "errors": {
-                    "success_count": 0,
-                    "rejection_count": 0,
-                    "stall_count": 0,
-                    "timeout_count": 0,
-                    "details": [{
-                        "txid": null,
-                        "error_string": format!("{e:#}"),
-                        "phase": "scan",
-                    }],
-                },
-                "payload": null,
-            })
-        }
-        CellResult::Outcome(outcome) => outcome_to_envelope_json(outcome.as_ref()),
+        CellResult::Error(e) => error_envelope_json(e, entry),
+        CellResult::Outcome(outcome) => outcome_to_envelope_json(outcome.as_ref(), entry),
     }
 }
 
-fn outcome_to_envelope_json(outcome: &ScenarioOutcome) -> Value {
+fn error_envelope_json(e: &anyhow::Error, entry: &CellEntry) -> Value {
+    let mut v = json!({
+        "status": "failure",
+        "wall_clock_ms": entry.wall_clock_ms,
+        "tip_height_start": entry.tip_height_start,
+        "tip_height_end": entry.tip_height_end,
+        "fees_paid_microtari": entry.fees_paid_microtari,
+        "balance_before_microtari": 0,
+        "balance_after_microtari": 0,
+        "balance_delta_microtari": 0,
+        "balance_reconciliation_ok": false,
+        "balance_coverage_note": BALANCE_COVERAGE_NOTE,
+        "errors": {
+            "success_count": 0,
+            "rejection_count": 0,
+            "stall_count": 0,
+            "timeout_count": 0,
+            "details": [{
+                "txid": null,
+                "error_string": format!("{e:#}"),
+                "phase": "scan",
+            }],
+        },
+        "payload": null,
+    });
+    if let Some(note) = entry.tip_query_note.as_ref() {
+        if let Value::Object(ref mut m) = v {
+            m.insert("tip_query_note".to_string(), Value::String(note.clone()));
+        }
+    }
+    v
+}
+
+/// Note attached to every cell's balance trio. Tracked in
+/// PR_BODY_PLAN.md §Pre-merge cleanups — explicit Phase 4 carry, NOT
+/// the generic envelope_coverage_note.
+const BALANCE_COVERAGE_NOTE: &str =
+    "balance_before_microtari / balance_after_microtari / balance_delta_microtari / \
+     balance_reconciliation_ok are emitted as 0 / false defaults; each would require a \
+     WalletGrpcBalanceQuery call (~30s for Mode 1) per cell. 27 cells × ~30s = ~13min \
+     added to the canonical run; deferred to Phase 4 per analysis/PR_BODY_PLAN.md \
+     §Pre-merge cleanups.";
+
+fn outcome_to_envelope_json(outcome: &ScenarioOutcome, entry: &CellEntry) -> Value {
     let (status, errors, peak_rss, peak_cpu, payload) = match outcome {
         ScenarioOutcome::B0(b) => (
             "success",
@@ -308,35 +365,52 @@ fn outcome_to_envelope_json(outcome: &ScenarioOutcome) -> Value {
         ),
     };
 
+    // tip_height_start / tip_height_end: prefer the outcome's intrinsic
+    // value (scans carry h_tip_*) over the caller-supplied entry value
+    // (which comes from a base-node tip query). Scan outcomes are the
+    // canonical source for their own scan range — the outer tip query is
+    // a fallback for send scenarios that don't carry tip data on their
+    // outcome.
+    let (intrinsic_tip_start, intrinsic_tip_end) = intrinsic_tips_for(outcome);
+    let tip_start = intrinsic_tip_start.or(entry.tip_height_start);
+    let tip_end = intrinsic_tip_end.or(entry.tip_height_end);
+
     let mut envelope = json!({
         "status": status,
-        "wall_clock_ms": 0,
-        "tip_height_start": 0,
-        "tip_height_end": 0,
-        "fees_paid_microtari": 0,
+        "wall_clock_ms": entry.wall_clock_ms,
+        "tip_height_start": tip_start,
+        "tip_height_end": tip_end,
+        "fees_paid_microtari": entry.fees_paid_microtari,
         "balance_before_microtari": 0,
         "balance_after_microtari": 0,
         "balance_delta_microtari": 0,
         "balance_reconciliation_ok": true,
+        "balance_coverage_note": BALANCE_COVERAGE_NOTE,
         "errors": errors,
         "peak_rss_bytes": peak_rss,
         "peak_cpu_pct": peak_cpu,
         "payload": payload,
     });
-    if let Value::Object(ref mut m) = envelope {
-        m.insert(
-            "envelope_coverage_note".to_string(),
-            Value::String(
-                "wall_clock_ms / tip_height_* / fees_paid_microtari / balance_* / \
-                 balance_reconciliation_ok are emitted as 0/null/true defaults; \
-                 full envelope coverage lands in Phase 4 alongside the canonical \
-                 baseline run (see analysis/PR_BODY_PLAN.md §Phase 4 \
-                 envelope-coverage gap)."
-                    .to_string(),
-            ),
-        );
+    if let Some(note) = entry.tip_query_note.as_ref() {
+        if let Value::Object(ref mut m) = envelope {
+            m.insert("tip_query_note".to_string(), Value::String(note.clone()));
+        }
     }
     envelope
+}
+
+/// Returns `(h_tip_start, h_tip_end)` from a scan-shaped outcome. None
+/// for tx-shaped scenarios (S0/S1/S4/S5) whose tip range comes from the
+/// caller-supplied `CellEntry::tip_height_*` fields instead.
+fn intrinsic_tips_for(outcome: &ScenarioOutcome) -> (Option<u64>, Option<u64>) {
+    match outcome {
+        ScenarioOutcome::B0(b) => (Some(b.h_tip_start), Some(b.h_tip_end)),
+        ScenarioOutcome::S2(s) => (Some(s.h_tip_start), Some(s.h_tip_end)),
+        ScenarioOutcome::S3(s) => (Some(s.h_tip_start), Some(s.h_tip_end)),
+        ScenarioOutcome::S6(s) => (Some(s.h_tip_start), Some(s.h_tip_end)),
+        ScenarioOutcome::S7(s) => (Some(s.h_tip_start), Some(s.h_tip_end)),
+        _ => (None, None),
+    }
 }
 
 fn default_errors() -> Value {
@@ -658,8 +732,8 @@ where
     Value::Object(out)
 }
 
-fn scan_t_scan_ms(cell: Option<&CellResult>) -> Option<u64> {
-    let outcome = match cell {
+fn scan_t_scan_ms(cell: Option<&CellEntry>) -> Option<u64> {
+    let outcome = match cell.map(|e| &e.result) {
         Some(CellResult::Outcome(o)) => o.as_ref(),
         _ => return None,
     };
@@ -672,7 +746,7 @@ fn scan_t_scan_ms(cell: Option<&CellResult>) -> Option<u64> {
 }
 
 fn s5_individual_t_total_ms(matrix: &Matrix, role: SeedRole) -> Option<u64> {
-    match matrix.get(role, ScenarioId::S5)? {
+    match &matrix.get(role, ScenarioId::S5)?.result {
         CellResult::Outcome(boxed) => match boxed.as_ref() {
             ScenarioOutcome::S5(s) => Some(s.arms.individual.t_total_ms),
             _ => None,
@@ -682,7 +756,7 @@ fn s5_individual_t_total_ms(matrix: &Matrix, role: SeedRole) -> Option<u64> {
 }
 
 fn s5_batch_t_total_ms(matrix: &Matrix, role: SeedRole) -> Option<u64> {
-    match matrix.get(role, ScenarioId::S5)? {
+    match &matrix.get(role, ScenarioId::S5)?.result {
         CellResult::Outcome(boxed) => match boxed.as_ref() {
             ScenarioOutcome::S5(s) if s.arms.batch.applies => Some(s.arms.batch.t_total_ms),
             _ => None,
@@ -803,16 +877,31 @@ mod tests {
                 role,
                 ScenarioId::B0,
                 CellResult::Outcome(Box::new(ScenarioOutcome::B0(fake_b0()))),
+                0,
+                None,
+                None,
+                None,
+                0,
             );
             matrix.record(
                 role,
                 ScenarioId::S2,
                 CellResult::Outcome(Box::new(ScenarioOutcome::S2(fake_s2()))),
+                0,
+                None,
+                None,
+                None,
+                0,
             );
             matrix.record(
                 role,
                 ScenarioId::S6,
                 CellResult::Outcome(Box::new(ScenarioOutcome::S6(fake_s6()))),
+                0,
+                None,
+                None,
+                None,
+                0,
             );
         }
 
@@ -864,18 +953,33 @@ mod tests {
             SeedRole::Old,
             ScenarioId::B0,
             CellResult::Outcome(Box::new(ScenarioOutcome::B0(fake_b0()))),
+            0,
+            None,
+            None,
+            None,
+            0,
         );
         // S2 t_scan_ms=1500, B0 t_scan_ms=500 → delta=1000, ratio=3.0
         matrix.record(
             SeedRole::Old,
             ScenarioId::S2,
             CellResult::Outcome(Box::new(ScenarioOutcome::S2(fake_s2()))),
+            0,
+            None,
+            None,
+            None,
+            0,
         );
         // S6 t_scan_ms=2500, S2=1500 → delta_s6_s2=1000; S6/B0 ratio=5.0
         matrix.record(
             SeedRole::Old,
             ScenarioId::S6,
             CellResult::Outcome(Box::new(ScenarioOutcome::S6(fake_s6()))),
+            0,
+            None,
+            None,
+            None,
+            0,
         );
 
         let deltas = deltas_block(&matrix);
@@ -907,6 +1011,11 @@ mod tests {
             SeedRole::Old,
             ScenarioId::B0,
             CellResult::Error(anyhow::anyhow!("simulated scan failure")),
+            0,
+            None,
+            None,
+            None,
+            0,
         );
         let cell = cell_to_json(matrix.get(SeedRole::Old, ScenarioId::B0));
         assert_eq!(cell.get("status").unwrap().as_str(), Some("failure"));

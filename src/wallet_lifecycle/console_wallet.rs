@@ -571,8 +571,8 @@ mod tests {
         };
         let seeds = SeedHandle::new(&seeds_cfg);
         let data_dir = HarnessDataDir::new("rm_test", "old_wallet").expect("data_dir");
-        let mut lifecycle = ConsoleWalletLifecycle::new(&cfg, &seeds, data_dir)
-            .expect("lifecycle constructs");
+        let mut lifecycle =
+            ConsoleWalletLifecycle::new(&cfg, &seeds, data_dir).expect("lifecycle constructs");
 
         // Pre-spawn: replace_mnemonic succeeds.
         lifecycle
@@ -583,7 +583,10 @@ mod tests {
         lifecycle
             .force_spawned_for_test()
             .expect("force_spawned_for_test");
-        assert!(lifecycle.is_spawned(), "after force_spawned, is_spawned == true");
+        assert!(
+            lifecycle.is_spawned(),
+            "after force_spawned, is_spawned == true"
+        );
 
         let err = lifecycle
             .replace_mnemonic("second replacement".to_string())
