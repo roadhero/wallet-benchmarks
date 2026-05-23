@@ -265,6 +265,57 @@ pub fn derive_address(mnemonic: &str) -> anyhow::Result<TariAddress> {
     .map_err(|e| anyhow::Error::msg(format!("assembling TariAddress: {e}")))
 }
 
+/// Derive a pool of `size` distinct dual addresses from the seed mnemonic at
+/// `role`. Each slot `i` carries a distinct `payment_id_user_data = [i as bytes]`
+/// — per `tari_common_types::tari_address::DualAddress`, supplying a non-`None`
+/// payment-id sets the `PAYMENT_ID` features bit and encodes the bytes into
+/// the address payload, so every slot serialises (`to_base58()`) to a distinct
+/// string while sharing the same underlying view/spend keypair.
+///
+/// Used by S5 (AC-19) to materialise a 100-recipient pool that survives both
+/// the individual arm (100 single-recipient sends) and the batch arm (10
+/// 10-recipient batch sends) against a single seed — no per-slot mnemonic
+/// derivation needed. Deterministic in `size` and `role`: the same call
+/// reproduces the same list, so re-runs against the same seed produce the
+/// same `recipient_list_hash` (schema §S5 line 206).
+pub fn derive_recipient_pool(
+    seeds: &SeedHandle,
+    role: SeedRole,
+    size: usize,
+) -> anyhow::Result<Vec<TariAddress>> {
+    let mnemonic = match role {
+        SeedRole::Old => seeds.mnemonic_old()?,
+        SeedRole::New => seeds.mnemonic_new()?,
+        SeedRole::Pp => seeds.mnemonic_payment_processor()?,
+    };
+    let seed_words = SeedWords::from_str(mnemonic.reveal())
+        .map_err(|e| anyhow::Error::msg(format!("parsing mnemonic words: {e}")))?;
+    let cipher_seed = <CipherSeed as Mnemonic<CipherSeed>>::from_mnemonic(&seed_words, None)
+        .map_err(|e| anyhow::Error::msg(format!("decoding CipherSeed from mnemonic: {e}")))?;
+    let seed_words_wallet =
+        SeedWordsWallet::construct_new(cipher_seed).map_err(anyhow::Error::msg)?;
+    let wallet = WalletType::SeedWords(seed_words_wallet);
+    let view_pub = wallet.get_public_view_key();
+    let spend_pub = wallet.get_public_spend_key();
+    let mut pool = Vec::with_capacity(size);
+    for i in 0..size {
+        // Little-endian u64 of the slot index — 8 bytes, well under
+        // `MAX_ENCRYPTED_DATA_SIZE`. Distinct per slot, so each address
+        // serialises to a distinct base58.
+        let payment_id = (i as u64).to_le_bytes().to_vec();
+        let addr = TariAddress::new_dual_address(
+            view_pub.clone(),
+            spend_pub.clone(),
+            Network::Esmeralda,
+            TariAddressFeatures::create_one_sided_only(),
+            Some(payment_id),
+        )
+        .map_err(|e| anyhow::Error::msg(format!("assembling pool address {i}: {e}")))?;
+        pool.push(addr);
+    }
+    Ok(pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

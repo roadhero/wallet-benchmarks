@@ -25,6 +25,7 @@ mod s1_volume;
 mod s2_full_rescan;
 mod s3_birthday_rescan;
 mod s4_concurrent;
+mod s5_throughput;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
@@ -32,6 +33,7 @@ pub use s1_volume::{RoundOutcome, S1Outcome};
 pub use s2_full_rescan::S2Outcome;
 pub use s3_birthday_rescan::S3Outcome;
 pub use s4_concurrent::{BroadcastOutcome, S4Outcome, SubBlockOutcome, TaskOutcome};
+pub use s5_throughput::{ArmOutcome, S5Arms, S5Outcome};
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -192,6 +194,16 @@ pub struct ScenarioInput {
     /// signature. `None` for dispatches that don't need it; the S3 arm
     /// bails with a clear error if `None`.
     pub h_birth_s3: Option<u16>,
+    /// S5 (AC-19, AC-20) — which seed slot to derive the recipient pool
+    /// from AND which mode the cell belongs to. The latter drives the
+    /// batch-arm skip on Mode 1 (`SeedRole::Old` → `arms.batch.applies =
+    /// false` because gRPC `Transfer` is single-recipient per
+    /// `DESIGN.md §Mode 1` line 319). Routed through `ScenarioInput`
+    /// rather than inspecting `mode.name()` so the scenario stays mode-
+    /// agnostic at the type level (matches the existing dispatch shape
+    /// for `expected_outputs_s2` / `h_birth_s3`). `None` for dispatches
+    /// that don't need it; the S5 arm bails with a clear error if `None`.
+    pub s5_seed_role_for_mode: Option<SeedRole>,
 }
 
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
@@ -282,8 +294,11 @@ pub enum ScenarioOutcome {
     S3(S3Outcome),
     /// S4 — concurrent construction, N ∈ {8,16,32,64,128} (AC-17/AC-18).
     S4(S4Outcome),
+    /// S5 — batch vs. individual arms across the 100-recipient list
+    /// (AC-19/AC-20).
+    S5(S5Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   …      → S5..S7
+    //   …      → S6..S7
 }
 
 /// Run the named scenario against the given mode.
@@ -339,9 +354,20 @@ pub async fn run_scenario(
                 .map(ScenarioOutcome::S3)
         }
         ScenarioId::S4 => s4_concurrent::run(ctx, mode).await.map(ScenarioOutcome::S4),
-        ScenarioId::S5 | ScenarioId::S6 | ScenarioId::S7 => {
+        ScenarioId::S5 => {
+            let role = input.s5_seed_role_for_mode.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S5 requires ScenarioInput::s5_seed_role_for_mode \
+                     (drives Mode 1 batch-arm skip per AC-20)"
+                )
+            })?;
+            s5_throughput::run(ctx, mode, role)
+                .await
+                .map(ScenarioOutcome::S5)
+        }
+        ScenarioId::S6 | ScenarioId::S7 => {
             anyhow::bail!(
-                "scenario {id} not yet implemented (step 3i.1.f lands S4; \
+                "scenario {id} not yet implemented (step 3i.1.g lands S5; \
              subsequent scenarios follow in DESIGN.md swe-impl execution order)"
             )
         }
