@@ -33,6 +33,12 @@ mod defaults {
     pub(super) const NETWORK: &str = "esmeralda";
     pub(super) const PER_TX_CONFIRMATION_TIMEOUT_MS: u64 = 1_800_000;
     pub(super) const SAMPLER_INTERVAL_MS: u64 = 1_000;
+    /// Default per-tx amount for S1 volume sends, in microTari. Must
+    /// exceed `fee_rate × kernel_weight` (≈ 175 µT at default fee_rate=5,
+    /// kernel weight 35) so the resulting change UTXOs are net-positive
+    /// and spendable. 1000 µT = 0.001 XTM provides ~825 µT net per
+    /// resulting UTXO at default fee_rate.
+    pub(super) const S1_AMOUNT_PER_TX_MICROTARI: u64 = 1_000;
 
     pub(super) const SEED_ENV_OLD: &str = "HARNESS_SEED_OLD";
     pub(super) const SEED_ENV_NEW: &str = "HARNESS_SEED_NEW";
@@ -109,6 +115,15 @@ pub struct Config {
     /// `sampler_interval_ms`.
     #[serde(default = "Config::default_sampler_interval_ms")]
     pub sampler_interval_ms: u64,
+
+    /// Per-tx amount for S1 volume sends (microTari). Must exceed
+    /// `fee_rate × kernel_weight` (≈ 175 µT at default fee_rate=5)
+    /// so resulting change UTXOs are spendable. Default 1000 µT
+    /// (= 0.001 XTM). Operator-controllable so funding-budget vs.
+    /// spendable-UTXO-threshold tradeoffs can be tuned without code
+    /// changes.
+    #[serde(default = "Config::default_s1_amount_per_tx_microtari")]
+    pub s1_amount_per_tx_microtari: u64,
 
     /// Names of the environment variables holding seed and passphrase material. The
     /// values themselves are read at runtime; only the names are persisted.
@@ -200,6 +215,9 @@ impl Config {
     fn default_sampler_interval_ms() -> u64 {
         defaults::SAMPLER_INTERVAL_MS
     }
+    fn default_s1_amount_per_tx_microtari() -> u64 {
+        defaults::S1_AMOUNT_PER_TX_MICROTARI
+    }
 }
 
 impl Default for Config {
@@ -219,6 +237,7 @@ impl Default for Config {
             base_node_url: Self::default_base_node_url(),
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
             sampler_interval_ms: Self::default_sampler_interval_ms(),
+            s1_amount_per_tx_microtari: Self::default_s1_amount_per_tx_microtari(),
             seeds: Seeds::default(),
             minotari_console_wallet_path: None,
             minotari_path: None,
@@ -276,6 +295,7 @@ mod tests {
         );
         assert_eq!(cfg.per_tx_confirmation_timeout_ms, 1_800_000);
         assert_eq!(cfg.sampler_interval_ms, 1_000);
+        assert_eq!(cfg.s1_amount_per_tx_microtari, 1_000);
         assert_eq!(cfg.seeds.old, "HARNESS_SEED_OLD");
         assert_eq!(cfg.seeds.new, "HARNESS_SEED_NEW");
         assert_eq!(cfg.seeds.payment_processor, "HARNESS_SEED_PP");
@@ -319,6 +339,7 @@ mod tests {
             base_node_url: Url::parse("https://rpc.esmeralda.tari.com").unwrap(),
             per_tx_confirmation_timeout_ms: 10,
             sampler_interval_ms: 250,
+            s1_amount_per_tx_microtari: 1234,
             seeds: Seeds {
                 old: "OLD".to_string(),
                 new: "NEW".to_string(),

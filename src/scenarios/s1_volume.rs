@@ -191,7 +191,7 @@ pub(super) async fn run(
         let mut tx_records = Vec::with_capacity(tx_count as usize);
 
         for _tx_slot in 0..tx_count {
-            let amount = config.fee_rate.saturating_mul(10);
+            let amount = config.s1_amount_per_tx_microtari;
             let recipient = ctx.recipients.resolve_for(ctx.seeds, tx_idx)?;
             tx_idx = tx_idx.saturating_add(1);
             let send_result = mode.send_single(&recipient, amount, config.fee_rate).await;
@@ -236,7 +236,7 @@ pub(super) async fn run(
             for _ in 0..fanout_k {
                 let r = ctx.recipients.resolve_for(ctx.seeds, tx_idx)?;
                 tx_idx = tx_idx.saturating_add(1);
-                recipients.push((r, config.fee_rate.saturating_mul(10)));
+                recipients.push((r, config.s1_amount_per_tx_microtari));
             }
 
             // Mode 1 fallback: gRPC Transfer is N-independent single-recipient
