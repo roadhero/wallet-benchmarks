@@ -24,12 +24,14 @@ mod s0_warmup;
 mod s1_volume;
 mod s2_full_rescan;
 mod s3_birthday_rescan;
+mod s4_concurrent;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
 pub use s1_volume::{RoundOutcome, S1Outcome};
 pub use s2_full_rescan::S2Outcome;
 pub use s3_birthday_rescan::S3Outcome;
+pub use s4_concurrent::{BroadcastOutcome, S4Outcome, SubBlockOutcome, TaskOutcome};
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -278,8 +280,10 @@ pub enum ScenarioOutcome {
     S2(S2Outcome),
     /// S3 — wipe + birthday=`h_birth` + post-funding-height rescan (AC-16).
     S3(S3Outcome),
+    /// S4 — concurrent construction, N ∈ {8,16,32,64,128} (AC-17/AC-18).
+    S4(S4Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   …      → S4..S7
+    //   …      → S5..S7
 }
 
 /// Run the named scenario against the given mode.
@@ -334,9 +338,10 @@ pub async fn run_scenario(
                 .await
                 .map(ScenarioOutcome::S3)
         }
-        ScenarioId::S4 | ScenarioId::S5 | ScenarioId::S6 | ScenarioId::S7 => {
+        ScenarioId::S4 => s4_concurrent::run(ctx, mode).await.map(ScenarioOutcome::S4),
+        ScenarioId::S5 | ScenarioId::S6 | ScenarioId::S7 => {
             anyhow::bail!(
-                "scenario {id} not yet implemented (step 3i.1.d/e lands S2/S3; \
+                "scenario {id} not yet implemented (step 3i.1.f lands S4; \
              subsequent scenarios follow in DESIGN.md swe-impl execution order)"
             )
         }
