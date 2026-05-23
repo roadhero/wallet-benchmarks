@@ -6,6 +6,7 @@
 
 pub mod broadcast;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod env_capture;
 pub mod guards;

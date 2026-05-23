@@ -55,3 +55,8 @@ nix = { version = "0.29", features = ["signal"] }
 proptest = "1"
 walkdir  = "2"
 wiremock = "0.6"
+# tokio's `test-util` feature gates `tokio::time::pause()` and `advance()`,
+# which the `FakeClock` test uses to drive deterministic sleep resolution
+# without real wall-clock waits. Dev-only — production builds do not pull
+# the `test-util` feature.
+tokio    = { version = "1.47", features = ["test-util"] }
