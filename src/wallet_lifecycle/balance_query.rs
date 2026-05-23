@@ -92,7 +92,7 @@ impl WalletGrpcBalanceQuery {
         // `mnemonic_old` — override via `replace_mnemonic` before spawn so
         // the wallet boots with the role's actual seed.
         let mut lifecycle = ConsoleWalletLifecycle::new(&self.config, &self.seeds, data_dir)?;
-        lifecycle.replace_mnemonic(mnemonic.reveal().to_string());
+        lifecycle.replace_mnemonic(mnemonic.reveal().to_string())?;
 
         // Spawn + wait_ready + query, capturing the result regardless of
         // the wait_ready outcome so teardown still runs below.

@@ -232,7 +232,9 @@ impl Mode for OldWallet {
         let original = self.lifecycle.mnemonic().to_string();
         let rewritten = rewrite_birthday(&original, birthday)
             .context("rewriting CipherSeed birthday for re-import")?;
-        self.lifecycle.replace_mnemonic(rewritten);
+        self.lifecycle
+            .replace_mnemonic(rewritten)
+            .context("replacing held mnemonic for birthday rewrite")?;
 
         // 3. Wipe the data dir. The lifecycle's `HarnessDataDir::wipe` is
         //    path-confinement-enforced (AC-34); the path we wipe IS the

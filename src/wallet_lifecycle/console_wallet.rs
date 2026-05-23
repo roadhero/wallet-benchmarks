@@ -222,19 +222,41 @@ impl ConsoleWalletLifecycle {
         &mut self.data_dir
     }
 
+    /// Returns `true` between a successful [`Self::spawn`] and the next
+    /// [`Self::teardown`]. Used by [`Self::replace_mnemonic`] to refuse
+    /// post-spawn mnemonic swaps that would silently desync the held
+    /// value from the running wallet's loaded seed.
+    pub fn is_spawned(&self) -> bool {
+        self.child.is_some()
+    }
+
     /// Replace the held seed mnemonic. The next call to [`Self::spawn`]
     /// writes this new mnemonic into the freshly-wiped data dir's
     /// `seed.txt`. Used by the Mode 1 birthday-rewrite flow (AC-24): the
     /// caller decodes the existing mnemonic to a [`tari_common_types::seeds::cipher_seed::CipherSeed`],
     /// calls `change_birthday`, re-encodes, then hands the new mnemonic
     /// back via this method.
-    pub fn replace_mnemonic(&mut self, mnemonic: String) {
+    ///
+    /// Bails when called post-spawn: a swap there would silently desync
+    /// the held mnemonic from the running wallet's loaded seed (the
+    /// wallet keeps using the previously-loaded value while `seed.txt`
+    /// regenerates only on next spawn). Call before [`Self::spawn`] or
+    /// after [`Self::teardown`].
+    pub fn replace_mnemonic(&mut self, mnemonic: String) -> anyhow::Result<()> {
+        if self.is_spawned() {
+            anyhow::bail!(
+                "replace_mnemonic called after spawn; this would silently desync the held \
+                 mnemonic from the running wallet's loaded seed. Call before spawn() or \
+                 after teardown().",
+            );
+        }
         log::debug!(
             target: LOG_TARGET,
             "replacing held mnemonic (length={}); next spawn rewrites seed.txt",
             mnemonic.len(),
         );
         self.seed_mnemonic = mnemonic;
+        Ok(())
     }
 
     /// Read-only access to the held mnemonic — used by the birthday-rewrite
@@ -243,6 +265,21 @@ impl ConsoleWalletLifecycle {
     /// plaintext; treat the returned `&str` borrow accordingly.
     pub fn mnemonic(&self) -> &str {
         &self.seed_mnemonic
+    }
+
+    /// Force the lifecycle into the post-spawn state for unit tests
+    /// without requiring a real `minotari_console_wallet` binary. Spawns
+    /// `/bin/sleep` (kill-on-drop) and parks its `Child` in
+    /// `self.child` so [`Self::is_spawned`] reports `true`.
+    #[cfg(test)]
+    fn force_spawned_for_test(&mut self) -> anyhow::Result<()> {
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning /bin/sleep for test")?;
+        self.child = Some(child);
+        Ok(())
     }
 }
 
@@ -503,5 +540,66 @@ mod tests {
             argv.iter().any(|a| a == "/ip4/127.0.0.1/tcp/12345"),
             "argv must reference the dynamic port literally: {argv:?}",
         );
+    }
+
+    /// Replacing the held mnemonic after `spawn` is a footgun: the
+    /// running wallet keeps using the previously-loaded seed while
+    /// `seed.txt` regenerates only on next spawn. The guard added
+    /// alongside step 3k commit 3 refuses the swap. Verify it bails
+    /// with the documented diagnostic.
+    #[tokio::test]
+    async fn replace_mnemonic_bails_after_spawn() {
+        use crate::config::{Config, Seeds};
+        use crate::seed::SeedHandle;
+        use crate::wallet_lifecycle::HarnessDataDir;
+
+        let seeds_cfg = Seeds {
+            old: "WALLET_BENCHMARKS_TEST_RM_OLD".to_string(),
+            new: "WALLET_BENCHMARKS_TEST_RM_NEW".to_string(),
+            payment_processor: "WALLET_BENCHMARKS_TEST_RM_PP".to_string(),
+            wallet_password: "WALLET_BENCHMARKS_TEST_RM_PW".to_string(),
+        };
+        let m = crate::gen_seed().expect("gen_seed");
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(&seeds_cfg.old, &m);
+            std::env::set_var(&seeds_cfg.wallet_password, "test-password");
+        }
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            ..Config::default()
+        };
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let data_dir = HarnessDataDir::new("rm_test", "old_wallet").expect("data_dir");
+        let mut lifecycle = ConsoleWalletLifecycle::new(&cfg, &seeds, data_dir)
+            .expect("lifecycle constructs");
+
+        // Pre-spawn: replace_mnemonic succeeds.
+        lifecycle
+            .replace_mnemonic("first replacement".to_string())
+            .expect("pre-spawn swap allowed");
+
+        // Force into spawned state, then assert the guard fires.
+        lifecycle
+            .force_spawned_for_test()
+            .expect("force_spawned_for_test");
+        assert!(lifecycle.is_spawned(), "after force_spawned, is_spawned == true");
+
+        let err = lifecycle
+            .replace_mnemonic("second replacement".to_string())
+            .expect_err("post-spawn swap must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("after spawn"),
+            "guard message must call out the post-spawn condition: {msg}",
+        );
+
+        // Cleanup the /bin/sleep child via Drop.
+        drop(lifecycle);
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(&seeds_cfg.old);
+            std::env::remove_var(&seeds_cfg.wallet_password);
+        }
     }
 }
