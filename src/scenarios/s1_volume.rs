@@ -1,9 +1,28 @@
-//! S1 volume — 127 txs across 7 doubling rounds.
+//! S1 volume — 127 txs across 6 doubling rounds + 1 fan-out round.
 //!
 //! Per `analysis/DESIGN.md §Scenario state machine §S1`,
 //! `analysis/RESULT_PROFILE_SCHEMA.md §S1 scenario (AC-12, AC-13, AC-14)`,
-//! and the main-thread S1 directive: 7 rounds, round `k` dispatches
-//! `2^(k-1)` serial transactions (1, 2, 4, 8, 16, 32, 64; total 127).
+//! and the bounty spec:
+//!
+//! * **Doubling phase (rounds 1..=`config.doubling_rounds`, default 6)** —
+//!   round `k` dispatches `2^(k-1)` serial single-recipient transactions
+//!   via `mode.send_single`. Each tx is 1-in / 1-recipient (+1 change),
+//!   net +1 UTXO per tx. After 6 doubling rounds: 1+2+4+8+16+32 = 63 txs,
+//!   chain has 64 UTXOs.
+//! * **Fan-out phase (round `doubling_rounds + 1`, default round 7)** —
+//!   `2^doubling_rounds` (default 64) slots, each slot a single 1-input /
+//!   `config.fanout_outputs_per_tx` (default 8)-output transaction via
+//!   `mode.send_batch_one_to_many` (Mode 2 / Mode 3). After fan-out:
+//!   chain has 64 + 64×7 = 512 UTXOs.
+//! * **Mode 1 fan-out fallback** — `OldWallet::send_batch_one_to_many`
+//!   returns `UnsupportedOperation` per `DESIGN.md §Mode 1 step 3` (gRPC
+//!   `Transfer.results` is semantically N independent 1-in/1-out txs).
+//!   For Mode 1 each fan-out slot becomes `K` sequential `send_single`
+//!   calls, accumulating `K` `TxRecord`s in the same round slot. UTXO
+//!   trajectory differs (each Mode 1 single-send is +1 net UTXO, so 64×K
+//!   sends = +512 UTXOs, vs. Mode 2/3's +448 from 64 batch-of-K). The
+//!   asymmetry is operator-visible in the result profile; tracked in
+//!   `analysis/PR_BODY_PLAN.md §Pain Points`.
 //!
 //! Loop discipline:
 //!
@@ -61,10 +80,11 @@ use crate::scenarios::{DetailPhase, DetailRecord, ScenarioCtx};
 /// not a throttle (AC-32 exempted as it sits inside `tokio::select!`).
 const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Canonical number of rounds. `config.doubling_rounds` defaults to 6, but
-/// `RESULT_PROFILE_SCHEMA.md §S1` includes one fan-out round (round 7) for
-/// a total of 7 — kept as a constant here so the meaning is grep-able.
-const S1_ROUNDS: u8 = 7;
+/// Canonical number of rounds = `config.doubling_rounds + 1` fan-out
+/// round. Kept derivable from config so operator overrides flow through.
+fn total_rounds_for(config: &Config) -> u32 {
+    config.doubling_rounds.saturating_add(1)
+}
 
 /// One round's worth of per-round aggregates plus the raw `TxRecord`s.
 /// Mirrors `RESULT_PROFILE_SCHEMA.md` line 156: `failure_count` is the only
@@ -147,98 +167,124 @@ pub(super) async fn run(
             ctx.config.sampler_interval_ms,
         )
     });
-    let total_rounds = rounds_override.unwrap_or(S1_ROUNDS);
+    let total_rounds = rounds_override
+        .map(u32::from)
+        .unwrap_or_else(|| total_rounds_for(config));
+    let doubling_rounds = config.doubling_rounds.min(total_rounds);
+    let fanout_round_idx = config.doubling_rounds.saturating_add(1);
+    let fanout_k = config.fanout_outputs_per_tx;
     let mut rounds = Vec::with_capacity(total_rounds as usize);
     let mut success_count: u64 = 0;
     let mut rejection_count: u64 = 0;
     let mut stall_count: u64 = 0;
     let mut details: Vec<DetailRecord> = Vec::new();
     // Monotonically increasing across rounds so RecipientStrategy::Pool
-    // round-robins correctly across the whole scenario.
+    // round-robins correctly across the whole scenario AND fan-out slots
+    // get distinct per-output recipient indices.
     let mut tx_idx: u32 = 0;
 
-    for round_idx in 1..=total_rounds {
+    // Doubling phase: rounds 1..=doubling_rounds. Each round k dispatches
+    // 2^(k-1) serial single-recipient sends.
+    for round_idx in 1..=doubling_rounds {
         let tx_count: u32 = 1u32 << (round_idx - 1);
         let round_start = ctx.clock.now();
         let mut tx_records = Vec::with_capacity(tx_count as usize);
 
         for _tx_slot in 0..tx_count {
-            // Construct + submit one tx. The wallet's own UTXO selection
-            // logic decides inputs — NO pre-partitioning of any kind.
-            // Amount is `config.fee_rate` plus a nominal payload; the
-            // production payload value is calibrated per
-            // `RESULT_PROFILE_SCHEMA.md §S1` round-to-round-fanout decisions
-            // (out of scope for this commit; reuses the value the run
-            // loop in step 3i.2 will plumb through).
             let amount = config.fee_rate.saturating_mul(10);
             let recipient = ctx.recipients.resolve_for(ctx.seeds, tx_idx)?;
             tx_idx = tx_idx.saturating_add(1);
             let send_result = mode.send_single(&recipient, amount, config.fee_rate).await;
-            match send_result {
-                Ok(tx_record) => {
-                    // Classify by `status` per the universal cell-level
-                    // counters in `RESULT_PROFILE_SCHEMA.md` lines 112-116.
-                    let txid_opt = if tx_record.txid.is_empty() {
-                        None
-                    } else {
-                        Some(tx_record.txid.clone())
-                    };
-                    if tx_record.status == "success" {
-                        // Tentative success — confirmation polling below
-                        // may downgrade this to a stall per AC-33.
-                        let confirmed = wait_for_state_change(config, mode).await?;
-                        if confirmed {
-                            success_count += 1;
-                        } else {
-                            // AC-33: accepted but unconfirmed within
-                            // `per_tx_confirmation_timeout_ms` → stall.
-                            // Strict mutual exclusion with success.
-                            stall_count += 1;
-                        }
-                    } else {
-                        // Base-node rejection (DoubleSpend, FeeTooLow, etc.).
-                        // Schema collapses these into rejection_count;
-                        // the specific reason rides on tx_record.error_string.
-                        rejection_count += 1;
-                        details.push(DetailRecord {
-                            txid: txid_opt,
-                            error_string: tx_record.error_string.clone().unwrap_or_default(),
-                            phase: DetailPhase::Broadcast,
-                        });
-                    }
-                    tx_records.push(tx_record);
+            classify_single_send_result(
+                send_result,
+                config,
+                mode,
+                &mut tx_records,
+                &mut success_count,
+                &mut rejection_count,
+                &mut stall_count,
+                &mut details,
+            )
+            .await?;
+        }
+
+        push_round(
+            &mut rounds,
+            round_idx,
+            tx_count,
+            &round_start,
+            ctx,
+            tx_records,
+        );
+    }
+
+    // Fan-out phase: round `doubling_rounds + 1`. 2^doubling_rounds slots,
+    // each slot a 1-input / fanout_k-output tx. Skipped when rounds_override
+    // caps the loop at doubling_rounds (or below).
+    if total_rounds >= fanout_round_idx {
+        let fanout_tx_count: u32 = 1u32 << (fanout_round_idx - 1);
+        let round_start = ctx.clock.now();
+        let mut tx_records: Vec<TxRecord> = Vec::with_capacity(fanout_tx_count as usize);
+
+        for _slot in 0..fanout_tx_count {
+            // Build K distinct (or repeatable-per-slot) recipients via the
+            // ctx strategy. Each output consumes one tx_idx slot — the
+            // monotonic counter guarantees distinct payment IDs under
+            // RecipientStrategy::SelfAddress.
+            let mut recipients: Vec<(tari_common_types::tari_address::TariAddress, u64)> =
+                Vec::with_capacity(fanout_k as usize);
+            for _ in 0..fanout_k {
+                let r = ctx.recipients.resolve_for(ctx.seeds, tx_idx)?;
+                tx_idx = tx_idx.saturating_add(1);
+                recipients.push((r, config.fee_rate.saturating_mul(10)));
+            }
+
+            // Mode 1 fallback: gRPC Transfer is N-independent single-recipient
+            // txs per DESIGN.md §Mode 1 step 3. Substitute K sequential
+            // send_single calls per slot — produces K independent txs (each
+            // with 1 change output), netting +K UTXOs vs Mode 2/3's +K-1.
+            // The asymmetry is operator-visible in the result profile.
+            if mode.name() == "old_wallet" {
+                for (recipient, amount) in &recipients {
+                    let send_result = mode.send_single(recipient, *amount, config.fee_rate).await;
+                    classify_single_send_result(
+                        send_result,
+                        config,
+                        mode,
+                        &mut tx_records,
+                        &mut success_count,
+                        &mut rejection_count,
+                        &mut stall_count,
+                        &mut details,
+                    )
+                    .await?;
                 }
-                Err(send_err) => {
-                    // Send-side error: record a synthetic TxRecord with
-                    // failure status AND a DetailRecord with phase=Construct
-                    // per schema line 116. NO retry (AC-30) — move on.
-                    // Construct/Sign/Broadcast-phase failures live in
-                    // details[] only — they do NOT increment rejection_count
-                    // (which is reserved for base-node rejections per
-                    // schema line 113).
-                    let error_string = format!("{send_err:#}");
-                    details.push(DetailRecord {
-                        txid: None,
-                        error_string: error_string.clone(),
-                        phase: DetailPhase::Construct,
-                    });
-                    tx_records.push(synthesize_failure_record(&error_string));
-                }
+            } else {
+                let send_result = mode
+                    .send_batch_one_to_many(&recipients, config.fee_rate)
+                    .await;
+                classify_single_send_result(
+                    send_result,
+                    config,
+                    mode,
+                    &mut tx_records,
+                    &mut success_count,
+                    &mut rejection_count,
+                    &mut stall_count,
+                    &mut details,
+                )
+                .await?;
             }
         }
 
-        let round_elapsed = ctx.clock.now().duration_since(round_start);
-        let t_round_ms = u64::try_from(round_elapsed.as_millis()).unwrap_or(u64::MAX);
-        let failure_count =
-            u32::try_from(tx_records.iter().filter(|r| r.status != "success").count())
-                .unwrap_or(u32::MAX);
-        rounds.push(RoundOutcome {
-            round_idx: u32::from(round_idx),
-            tx_count,
-            failure_count,
-            t_round_ms,
+        push_round(
+            &mut rounds,
+            fanout_round_idx,
+            fanout_tx_count,
+            &round_start,
+            ctx,
             tx_records,
-        });
+        );
     }
 
     let (peak_rss_bytes, peak_cpu_pct) = match sampler {
@@ -257,6 +303,82 @@ pub(super) async fn run(
         peak_rss_bytes,
         peak_cpu_pct,
     })
+}
+
+/// Push one round's aggregated metrics onto the rounds vec. Extracted so
+/// the doubling-phase loop and the fan-out branch don't duplicate the
+/// elapsed-time math and `failure_count` aggregation.
+fn push_round(
+    rounds: &mut Vec<RoundOutcome>,
+    round_idx: u32,
+    tx_count: u32,
+    round_start: &std::time::Instant,
+    ctx: &ScenarioCtx<'_>,
+    tx_records: Vec<TxRecord>,
+) {
+    let round_elapsed = ctx.clock.now().duration_since(*round_start);
+    let t_round_ms = u64::try_from(round_elapsed.as_millis()).unwrap_or(u64::MAX);
+    let failure_count = u32::try_from(tx_records.iter().filter(|r| r.status != "success").count())
+        .unwrap_or(u32::MAX);
+    rounds.push(RoundOutcome {
+        round_idx,
+        tx_count,
+        failure_count,
+        t_round_ms,
+        tx_records,
+    });
+}
+
+/// Classify the result of one `mode.send_*` call into the appropriate
+/// cell-level counter (success / rejection / stall / details) and append
+/// a `TxRecord` (synthesizing one on send-side `Err`). Extracted so
+/// doubling and fan-out paths share the classification logic verbatim.
+#[allow(clippy::too_many_arguments)]
+async fn classify_single_send_result(
+    send_result: anyhow::Result<TxRecord>,
+    config: &Config,
+    mode: &mut dyn Mode,
+    tx_records: &mut Vec<TxRecord>,
+    success_count: &mut u64,
+    rejection_count: &mut u64,
+    stall_count: &mut u64,
+    details: &mut Vec<DetailRecord>,
+) -> anyhow::Result<()> {
+    match send_result {
+        Ok(tx_record) => {
+            let txid_opt = if tx_record.txid.is_empty() {
+                None
+            } else {
+                Some(tx_record.txid.clone())
+            };
+            if tx_record.status == "success" {
+                let confirmed = wait_for_state_change(config, mode).await?;
+                if confirmed {
+                    *success_count += 1;
+                } else {
+                    *stall_count += 1;
+                }
+            } else {
+                *rejection_count += 1;
+                details.push(DetailRecord {
+                    txid: txid_opt,
+                    error_string: tx_record.error_string.clone().unwrap_or_default(),
+                    phase: DetailPhase::Broadcast,
+                });
+            }
+            tx_records.push(tx_record);
+        }
+        Err(send_err) => {
+            let error_string = format!("{send_err:#}");
+            details.push(DetailRecord {
+                txid: None,
+                error_string: error_string.clone(),
+                phase: DetailPhase::Construct,
+            });
+            tx_records.push(synthesize_failure_record(&error_string));
+        }
+    }
+    Ok(())
 }
 
 /// Construct a synthetic `TxRecord` for a send-side error. Used when
