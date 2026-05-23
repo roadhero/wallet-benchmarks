@@ -4310,6 +4310,7 @@ dependencies = [
  "clap 4.6.1",
  "env_logger",
  "hex",
+ "libc",
  "log",
  "minotari_app_grpc",
  "minotari_node_wallet_client",

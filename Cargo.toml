@@ -48,8 +48,11 @@ async-trait = "0.1"
 
 # POSIX signal delivery for ConsoleWalletLifecycle teardown (SIGTERM grace +
 # SIGKILL escalation per analysis/DESIGN.md §Mode 1 step 4).
+# libc for the sampler module's /proc parsing (Linux) and proc_pidinfo FFI
+# (macOS) — see src/sampler/{linux,macos}.rs.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal"] }
+nix  = { version = "0.29", features = ["signal"] }
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"

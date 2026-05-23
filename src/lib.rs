@@ -11,6 +11,7 @@ pub mod config;
 pub mod env_capture;
 pub mod guards;
 pub mod modes;
+pub mod sampler;
 pub mod scenarios;
 pub mod seed;
 pub mod versions;
