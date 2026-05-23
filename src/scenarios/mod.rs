@@ -23,11 +23,13 @@ mod b0_baseline;
 mod s0_warmup;
 mod s1_volume;
 mod s2_full_rescan;
+mod s3_birthday_rescan;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
 pub use s1_volume::{RoundOutcome, S1Outcome};
 pub use s2_full_rescan::S2Outcome;
+pub use s3_birthday_rescan::S3Outcome;
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -178,9 +180,16 @@ impl<'a> RecipientStrategy<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct ScenarioInput {
     /// AC-15 verification target: the count of outputs S2's rescan is
-    /// expected to rediscover. `None` for non-S2 dispatches; the S2 arm
-    /// bails with a clear error if `None`.
+    /// expected to rediscover. Also serves AC-16's S3 target — the chain
+    /// state is unchanged between S2 and S3, so both rescans verify
+    /// against the same value. `None` for dispatches that don't need it;
+    /// the S2/S3 arms bail with a clear error if `None`.
     pub expected_outputs_s2: Option<u64>,
+    /// AC-16 birthday target: S0's funding height encoded as
+    /// days-since-2022-01-01 per `Mode::scan_from_birthday`'s `u16`
+    /// signature. `None` for dispatches that don't need it; the S3 arm
+    /// bails with a clear error if `None`.
+    pub h_birth_s3: Option<u16>,
 }
 
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
@@ -267,8 +276,10 @@ pub enum ScenarioOutcome {
     S1(S1Outcome),
     /// S2 — wipe + birthday=0 + full-history rescan (AC-15/AC-24/AC-34).
     S2(S2Outcome),
+    /// S3 — wipe + birthday=`h_birth` + post-funding-height rescan (AC-16).
+    S3(S3Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   …      → S3..S7
+    //   …      → S4..S7
 }
 
 /// Run the named scenario against the given mode.
@@ -306,9 +317,26 @@ pub async fn run_scenario(
                 .await
                 .map(ScenarioOutcome::S2)
         }
-        ScenarioId::S3 | ScenarioId::S4 | ScenarioId::S5 | ScenarioId::S6 | ScenarioId::S7 => {
+        ScenarioId::S3 => {
+            let expected = input.expected_outputs_s2.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S3 requires ScenarioInput::expected_outputs_s2 \
+                     (AC-16 verification target — same as S2)"
+                )
+            })?;
+            let h_birth = input.h_birth_s3.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S3 requires ScenarioInput::h_birth_s3 \
+                     (S0's funding height, u16 days-since-2022-01-01)"
+                )
+            })?;
+            s3_birthday_rescan::run(mode, expected, h_birth)
+                .await
+                .map(ScenarioOutcome::S3)
+        }
+        ScenarioId::S4 | ScenarioId::S5 | ScenarioId::S6 | ScenarioId::S7 => {
             anyhow::bail!(
-                "scenario {id} not yet implemented (step 3i.1.d/e lands S2; \
+                "scenario {id} not yet implemented (step 3i.1.d/e lands S2/S3; \
              subsequent scenarios follow in DESIGN.md swe-impl execution order)"
             )
         }
