@@ -170,6 +170,18 @@ impl SeedHandle {
         let m = self.mnemonic_payment_processor()?;
         derive_address(m.reveal())
     }
+
+    /// Thin test-only constructor — wraps a freshly-defaulted [`Seeds`].
+    /// Used by scenario unit tests that need a `&SeedHandle` to populate
+    /// [`crate::scenarios::ScenarioCtx`] without touching env vars. The
+    /// resulting handle's accessors will return env-var-missing errors if
+    /// called; tests that need a real value set the env explicitly.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            seeds_config: crate::config::Seeds::default(),
+        }
+    }
 }
 
 /// Read an env var by name into a [`RedactedString`], with a context-rich

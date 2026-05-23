@@ -29,8 +29,11 @@ pub use s1_volume::{RoundOutcome, S1Outcome};
 
 use tari_common_types::tari_address::TariAddress;
 
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::modes::Mode;
+use crate::seed::redact::RedactionDenylist;
+use crate::seed::SeedHandle;
 
 /// One record per non-success event surfaced by a scenario, mirroring
 /// `RESULT_PROFILE_SCHEMA.md §errors sub-object` line 116:
@@ -79,23 +82,83 @@ impl std::fmt::Display for DetailPhase {
     }
 }
 
-/// Per-run context passed to scenarios. Carries the harness configuration
-/// (which scenarios read for `c_min`, `a_fund`, `fee_rate`,
-/// `per_tx_confirmation_timeout_ms`, etc.) plus the harness-controlled
-/// recipient address scenarios send to.
+/// Per-run context passed to scenarios. Carries the harness configuration,
+/// the runtime seed handle, the result-profile redaction denylist, the
+/// scenario clock, and the recipient strategy that picks an address per
+/// per-tx slot.
 ///
 /// Lifted out of `run_scenario`'s arguments so the dispatch signature stays
-/// stable as additional scenarios that need configuration (S1..S7) come
-/// online. B0 ignores all fields; S0 reads them.
+/// stable as additional scenarios that need configuration (S2..S7) come
+/// online. B0 ignores all fields; S0/S1 read the relevant subset; S2-S7
+/// will land on this shape.
 pub struct ScenarioCtx<'a> {
     /// Harness configuration (mirrors `RESULT_PROFILE_SCHEMA.md §1`).
     pub config: &'a Config,
-    /// Destination address for scenario-level sends (S0's funding-style tx,
-    /// S1's UTXO-multiplication rounds, S4's concurrent dispatch, S5's
-    /// arm-specific recipient lists). The harness's run loop derives this
-    /// from the configured seed environment per `DESIGN.md §Scenario state
-    /// machine §S0`.
-    pub recipient: &'a TariAddress,
+    /// Runtime seed accessor. S5's recipient pool derives addresses from
+    /// the same seed material the harness already owns; future scenarios
+    /// that need to address-derive on demand pull from here rather than
+    /// re-reading env vars at the scenario layer.
+    pub seeds: &'a SeedHandle,
+    /// Result-profile redaction denylist. Plumbed through ctx so any
+    /// scenario-level `error_string` capture can be checked against the
+    /// denylist before being folded into a `DetailRecord`. Static for
+    /// the duration of the run.
+    pub redaction: &'a RedactionDenylist,
+    /// Scenario clock — `RealClock` in production, `FakeClock` (under
+    /// `#[cfg(test)]`) for deterministic test sleeps via
+    /// `tokio::time::pause()`.
+    pub clock: &'a dyn Clock,
+    /// How to choose the destination address per per-tx slot. See
+    /// [`RecipientStrategy`].
+    pub recipients: RecipientStrategy<'a>,
+}
+
+/// Recipient picker for the per-tx send loop. Variants cover the three
+/// patterns scenarios need:
+///
+/// * `SelfAddress` — scenario sends to the wallet's own address. NOTE:
+///   the current [`Mode`] trait does not expose an own-address accessor;
+///   `resolve_for` returns an error explaining the gap until that method
+///   lands (recorded in `analysis/API_DRIFT.md`). Production callers use
+///   `Fixed` or `Pool`.
+/// * `Fixed(&TariAddress)` — every tx in the scenario sends to the same
+///   recipient. Used by S0/S1 against the harness's "second mode-2 seed".
+/// * `Pool(&[TariAddress])` — round-robin recipient list. Used by S5 to
+///   amortise the 100-recipient list across the per-tx loop.
+pub enum RecipientStrategy<'a> {
+    /// Send to the wallet's own address.
+    SelfAddress,
+    /// Fixed single recipient for the whole scenario.
+    Fixed(&'a TariAddress),
+    /// Round-robin pool of recipients.
+    Pool(&'a [TariAddress]),
+}
+
+impl<'a> RecipientStrategy<'a> {
+    /// Resolve the recipient for the `tx_idx`-th tx in the scenario.
+    ///
+    /// * `Fixed(a)` → clones `a`.
+    /// * `Pool(p)` → `p[tx_idx % p.len()]`; bails when `p` is empty.
+    /// * `SelfAddress` → currently bails because the [`Mode`] trait
+    ///   does not expose an own-address accessor (per
+    ///   `analysis/API_DRIFT.md`). Reserved for the day that method
+    ///   lands; production callers use `Fixed` or `Pool`.
+    pub fn resolve_for(&self, _mode: &dyn Mode, tx_idx: u32) -> anyhow::Result<TariAddress> {
+        match self {
+            RecipientStrategy::SelfAddress => {
+                anyhow::bail!(
+                    "RecipientStrategy::SelfAddress is unsupported: the Mode trait does not \
+                     expose an own-address accessor (see analysis/API_DRIFT.md). Use \
+                     RecipientStrategy::Fixed or RecipientStrategy::Pool.",
+                )
+            }
+            RecipientStrategy::Fixed(a) => Ok((*a).clone()),
+            RecipientStrategy::Pool([]) => {
+                anyhow::bail!("RecipientStrategy::Pool is empty")
+            }
+            RecipientStrategy::Pool(p) => Ok(p[(tx_idx as usize) % p.len()].clone()),
+        }
+    }
 }
 
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
@@ -197,10 +260,8 @@ pub async fn run_scenario(
 ) -> anyhow::Result<ScenarioOutcome> {
     match id {
         ScenarioId::B0 => b0_baseline::run(mode).await.map(ScenarioOutcome::B0),
-        ScenarioId::S0 => s0_warmup::run(ctx.config, mode, ctx.recipient)
-            .await
-            .map(ScenarioOutcome::S0),
-        ScenarioId::S1 => s1_volume::run(ctx.config, mode, ctx.recipient, None)
+        ScenarioId::S0 => s0_warmup::run(ctx, mode).await.map(ScenarioOutcome::S0),
+        ScenarioId::S1 => s1_volume::run(ctx, mode, None)
             .await
             .map(ScenarioOutcome::S1),
         ScenarioId::S2

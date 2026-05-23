@@ -51,13 +51,11 @@
 //! inside the select body — the AC-32 carve-out
 //! (`tests/c_no_retry_backoff_throttle.rs`) excises that body before grep.
 
-use std::time::{Duration, Instant};
-
-use tari_common_types::tari_address::TariAddress;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::modes::{Mode, TxRecord};
-use crate::scenarios::{DetailPhase, DetailRecord};
+use crate::scenarios::{DetailPhase, DetailRecord, ScenarioCtx};
 
 /// Poll cadence inside the per-tx confirmation loop. Same value as S0 —
 /// not a throttle (AC-32 exempted as it sits inside `tokio::select!`).
@@ -127,30 +125,35 @@ pub struct S1Outcome {
 
 /// Run S1 against the given mode.
 ///
-/// `recipient` is the destination address for every send; the wallet's
-/// own UTXO-selection logic decides which UTXOs to consume per tx.
-/// Production caller (step 3i.2) supplies the harness-controlled
-/// recipient; tests pass an arbitrary `TariAddress`.
+/// The destination address for each per-tx slot is picked from
+/// `ctx.recipients` via `resolve_for(mode, tx_idx)` — production callers
+/// wire `RecipientStrategy::Fixed` against the harness-controlled
+/// recipient; future S5-style scenarios swap to `RecipientStrategy::Pool`.
+/// The wallet's own UTXO-selection logic decides which UTXOs to consume
+/// per tx — NO pre-partitioning of any kind (AC-30/31).
 ///
 /// `rounds_override` lets the unit test cap the loop to a single round
 /// without running the full 127-tx, multi-minute sequence. Production
 /// callers pass `None` to get the canonical 7-round loop.
 pub(super) async fn run(
-    config: &Config,
+    ctx: &ScenarioCtx<'_>,
     mode: &mut dyn Mode,
-    recipient: &TariAddress,
     rounds_override: Option<u8>,
 ) -> anyhow::Result<S1Outcome> {
+    let config = ctx.config;
     let total_rounds = rounds_override.unwrap_or(S1_ROUNDS);
     let mut rounds = Vec::with_capacity(total_rounds as usize);
     let mut success_count: u64 = 0;
     let mut rejection_count: u64 = 0;
     let mut stall_count: u64 = 0;
     let mut details: Vec<DetailRecord> = Vec::new();
+    // Monotonically increasing across rounds so RecipientStrategy::Pool
+    // round-robins correctly across the whole scenario.
+    let mut tx_idx: u32 = 0;
 
     for round_idx in 1..=total_rounds {
         let tx_count: u32 = 1u32 << (round_idx - 1);
-        let round_start = Instant::now();
+        let round_start = ctx.clock.now();
         let mut tx_records = Vec::with_capacity(tx_count as usize);
 
         for _tx_slot in 0..tx_count {
@@ -162,7 +165,9 @@ pub(super) async fn run(
             // (out of scope for this commit; reuses the value the run
             // loop in step 3i.2 will plumb through).
             let amount = config.fee_rate.saturating_mul(10);
-            let send_result = mode.send_single(recipient, amount, config.fee_rate).await;
+            let recipient = ctx.recipients.resolve_for(mode, tx_idx)?;
+            tx_idx = tx_idx.saturating_add(1);
+            let send_result = mode.send_single(&recipient, amount, config.fee_rate).await;
             match send_result {
                 Ok(tx_record) => {
                     // Classify by `status` per the universal cell-level
@@ -216,7 +221,7 @@ pub(super) async fn run(
             }
         }
 
-        let round_elapsed = round_start.elapsed();
+        let round_elapsed = ctx.clock.now().duration_since(round_start);
         let t_round_ms = u64::try_from(round_elapsed.as_millis()).unwrap_or(u64::MAX);
         let failure_count =
             u32::try_from(tx_records.iter().filter(|r| r.status != "success").count())
@@ -289,8 +294,14 @@ async fn wait_for_state_change(config: &Config, mode: &mut dyn Mode) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use tari_common_types::tari_address::TariAddress;
+
     use super::*;
+    use crate::clock::RealClock;
     use crate::modes::test_support::{FakeMode, SendOutcome};
+    use crate::scenarios::RecipientStrategy;
+    use crate::seed::redact::RedactionDenylist;
+    use crate::seed::SeedHandle;
     use crate::{gen_seed, seed::derive_address};
 
     fn fake_recipient() -> TariAddress {
@@ -328,7 +339,17 @@ mod tests {
             ..Config::default()
         };
         let recipient = fake_recipient();
-        let outcome = run(&cfg, &mut fake, &recipient, Some(1))
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+        };
+        let outcome = run(&ctx, &mut fake, Some(1))
             .await
             .expect("S1 single-round runs");
 
@@ -377,8 +398,18 @@ mod tests {
             ..Config::default()
         };
         let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+        };
 
-        let outcome = run(&cfg, &mut fake, &recipient, Some(2))
+        let outcome = run(&ctx, &mut fake, Some(2))
             .await
             .expect("S1 two-round runs");
 

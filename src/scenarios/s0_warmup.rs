@@ -35,12 +35,10 @@
 //! the outcome's `t_confirm_ms` carries `None` and `status = "timeout"` —
 //! the cell is recorded raw per AC-30/31/32/33.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tari_common_types::tari_address::TariAddress;
-
-use crate::config::Config;
 use crate::modes::{Mode, TxRecord};
+use crate::scenarios::ScenarioCtx;
 
 /// S0's per-cell payload, matching `RESULT_PROFILE_SCHEMA.md §S0` plus the
 /// derived deltas the run loop reads to determine S0 success (AC-11
@@ -95,17 +93,17 @@ const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run S0 against the given mode.
 ///
-/// `recipient` is the destination address for the funding-style tx. The
-/// caller (the run loop in step 3i.2) supplies the harness-controlled
-/// "second mode-2 seed" address per `DESIGN.md §Scenario state machine §S0`;
-/// the recipient is not derived by S0 itself because the `Mode` trait does
-/// not expose an "own address" method (recorded in
-/// `analysis/API_DRIFT.md §3i.1.b`).
-pub(super) async fn run(
-    config: &Config,
-    mode: &mut dyn Mode,
-    recipient: &TariAddress,
-) -> anyhow::Result<S0Outcome> {
+/// Reads the destination address from `ctx.recipients` via
+/// `resolve_for(mode, 0)` — S0 dispatches exactly one tx so the index is
+/// always 0. The recipient is not derived by S0 itself because the
+/// `Mode` trait does not expose an "own address" method (recorded in
+/// `analysis/API_DRIFT.md §3i.1.b`); production callers wire the
+/// harness-controlled "second mode-2 seed" address via
+/// `RecipientStrategy::Fixed` per `DESIGN.md §Scenario state machine §S0`.
+pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::Result<S0Outcome> {
+    let config = ctx.config;
+    let recipient = ctx.recipients.resolve_for(mode, 0)?;
+
     let pre_balance = mode.get_balance().await?;
     let pre_utxo_count = mode.get_utxo_count().await?;
 
@@ -116,7 +114,9 @@ pub(super) async fn run(
     // amount slightly low, leaving the fee-headroom from `enforce_funding`'s
     // 10% margin intact.
     let amount = config.a_fund / 127;
-    let tx_record = mode.send_single(recipient, amount, config.fee_rate).await?;
+    let tx_record = mode
+        .send_single(&recipient, amount, config.fee_rate)
+        .await?;
 
     // `tokio::select!` confirmation loop. Every sleep inside the select arms
     // is a **deadline** or a **poll interval bound** — not a throttle or
@@ -125,8 +125,9 @@ pub(super) async fn run(
     // `tokio::select! { ... }` bodies before grepping; both the
     // `sleep_until(deadline)` deadline arm and the
     // `sleep(CONFIRMATION_POLL_INTERVAL)` cadence arm live entirely inside
-    // this select block.
-    let confirm_start = Instant::now();
+    // this select block. `confirm_start` reads through `ctx.clock` so the
+    // test suite can drive the confirm-timing measurement deterministically.
+    let confirm_start = ctx.clock.now();
     let deadline =
         tokio::time::Instant::now() + Duration::from_millis(config.per_tx_confirmation_timeout_ms);
 
@@ -142,7 +143,7 @@ pub(super) async fn run(
             _ = tokio::time::sleep(CONFIRMATION_POLL_INTERVAL) => {
                 let observed = mode.get_utxo_count().await?;
                 if observed != pre_utxo_count {
-                    let elapsed = confirm_start.elapsed();
+                    let elapsed = ctx.clock.now().duration_since(confirm_start);
                     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
                     break (observed, Some(elapsed_ms));
                 }
@@ -176,8 +177,15 @@ pub(super) async fn run(
 
 #[cfg(test)]
 mod tests {
+    use tari_common_types::tari_address::TariAddress;
+
     use super::*;
+    use crate::clock::RealClock;
+    use crate::config::Config;
     use crate::modes::test_support::FakeMode;
+    use crate::scenarios::RecipientStrategy;
+    use crate::seed::redact::RedactionDenylist;
+    use crate::seed::SeedHandle;
     use crate::{gen_seed, seed::derive_address};
 
     fn fake_recipient() -> TariAddress {
@@ -218,8 +226,18 @@ mod tests {
             ..Config::default()
         };
         let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+        };
 
-        let outcome = run(&cfg, &mut fake, &recipient)
+        let outcome = run(&ctx, &mut fake)
             .await
             .expect("S0 runs against the canned FakeMode");
 
@@ -276,8 +294,18 @@ mod tests {
             ..Config::default()
         };
         let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+        };
 
-        let outcome = run(&cfg, &mut fake, &recipient)
+        let outcome = run(&ctx, &mut fake)
             .await
             .expect("S0 returns Ok on confirmation timeout (raw recording)");
 
@@ -302,8 +330,18 @@ mod tests {
 
         let cfg = Config::default();
         let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+        };
 
-        let err = run(&cfg, &mut fake, &recipient)
+        let err = run(&ctx, &mut fake)
             .await
             .expect_err("send-side failure must bubble up");
         let msg = format!("{err:#}");

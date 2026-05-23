@@ -210,6 +210,18 @@ impl RedactionDenylist {
         &self.rules
     }
 
+    /// Thin test-only constructor — builds against a freshly-defaulted
+    /// [`Seeds`] with no env vars set. Used by scenario unit tests that
+    /// need a `&RedactionDenylist` to populate
+    /// [`crate::scenarios::ScenarioCtx`] without touching env vars. The
+    /// returned denylist still applies the static regex rules (R1, R3,
+    /// R4, R6, R7, R8) — only the env-derived substring rules degrade
+    /// to never-firing per [`RedactionRule::matches`].
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self::init_from_env(&Seeds::default())
+    }
+
     /// Serialise `profile` to JSON and check every rule against the dump.
     ///
     /// Returns `Ok(())` if no rule matches. On match, bails with the
