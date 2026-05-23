@@ -4,8 +4,9 @@
 //! `analysis/RESULT_PROFILE_SCHEMA.md §S5 scenario (AC-19, AC-20, AC-21)`
 //! lines 200-216, and the 3i.1.g brief: S5 amortises a 100-recipient pool
 //! across two arms so the per-mode `throughput_multiplier` is a meaningful
-//! `batch_tx_per_sec / individual_tx_per_sec` (equivalent under inversion to
-//! schema line 215's `t_individual / t_batch`).
+//! `t_individual / t_batch` (wall-clock ratio; >1.0 means batch finishes
+//! faster overall than the equivalent volume of individual sends) per
+//! schema line 215.
 //!
 //! * **Individual arm** — `s5_m` (default 100) sequential single-recipient
 //!   sends via [`Mode::send_single`]. Runs for every mode (`SeedRole::Old`,
@@ -18,8 +19,9 @@
 //!   skipped"). Gating happens BEFORE invoking `send_batch_one_to_many` so
 //!   the Mode 1 `UnsupportedOperation` error never fires.
 //!
-//! `throughput_multiplier = batch_tx_per_sec / individual_tx_per_sec` when
-//! both arms apply AND both throughputs are `> 0`; `None` otherwise.
+//! `throughput_multiplier = t_individual / t_batch` (wall-clock ratio per
+//! schema line 215) when both arms apply AND both `t_total_ms` are `> 0`;
+//! `None` otherwise.
 //!
 //! Both arms target the same total send-volume (`s5_m` recipients) so the
 //! multiplier compares like-for-like work. The recipient pool itself is
@@ -74,9 +76,11 @@ pub struct S5Outcome {
     /// `applies = true` on Mode 2 / Mode 3.
     pub arms: S5Arms,
     /// `throughput_multiplier` per schema line 215 + AC-19. Computed as
-    /// `batch_tx_per_sec / individual_tx_per_sec` when both arms apply and
-    /// both per-arm throughputs are `Some` and `> 0`; `None` otherwise (so
-    /// Mode 1 always carries `None` here — batch arm did not run).
+    /// `t_individual / t_batch` (wall-clock ratio; >1.0 means batch
+    /// finishes faster overall than the equivalent volume of individual
+    /// sends) when both arms apply and both `t_total_ms` are `> 0`; `None`
+    /// otherwise (so Mode 1 always carries `None` here — batch arm did
+    /// not run).
     pub throughput_multiplier: Option<f64>,
     /// `peak_rss_bytes` — `None` until the 1 Hz sampler lands in step 3j.
     pub peak_rss_bytes: Option<u64>,
@@ -222,14 +226,7 @@ pub(super) async fn run(
         }
     }
 
-    let throughput_multiplier = match (
-        individual.throughput_tx_per_sec,
-        batch.applies,
-        batch.throughput_tx_per_sec,
-    ) {
-        (Some(ind), true, Some(bat)) if ind > 0.0 => Some(bat / ind),
-        _ => None,
-    };
+    let throughput_multiplier = compute_throughput_multiplier(&individual, &batch);
 
     Ok(S5Outcome {
         success_count,
@@ -374,6 +371,24 @@ fn throughput(tx_count: u32, t_total_ms: u64) -> Option<f64> {
         return None;
     }
     Some((tx_count as f64) / (t_total_ms as f64 / 1000.0))
+}
+
+/// `throughput_multiplier = t_individual / t_batch` per
+/// `RESULT_PROFILE_SCHEMA.md` line 215 — wall-clock ratio across the two
+/// arms. >1.0 means batch finishes the equivalent send-volume faster
+/// than individual.
+///
+/// `None` when the batch arm did not run (Mode 1 per AC-20) or either
+/// `t_total_ms` is zero (degenerate fake-mode case; divide-by-zero
+/// protection).
+fn compute_throughput_multiplier(individual: &ArmOutcome, batch: &ArmOutcome) -> Option<f64> {
+    if !batch.applies {
+        return None;
+    }
+    if individual.t_total_ms == 0 || batch.t_total_ms == 0 {
+        return None;
+    }
+    Some(individual.t_total_ms as f64 / batch.t_total_ms as f64)
 }
 
 /// Map a `status` string suffix to a `DetailPhase`. Mirrors the encoding
@@ -682,8 +697,8 @@ mod tests {
         unset_env(&seeds_cfg.payment_processor);
     }
 
-    /// Both arms apply → throughput_multiplier is computed as
-    /// batch_tx_per_sec / individual_tx_per_sec.
+    /// Both arms apply → throughput_multiplier is the wall-clock ratio
+    /// t_individual / t_batch per schema line 215.
     #[tokio::test]
     async fn s5_throughput_multiplier_computed_when_both_arms_apply() {
         let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
@@ -701,28 +716,32 @@ mod tests {
         let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
         let outcome = run(&ctx, &mut fake, SeedRole::Pp).await.expect("S5 run ok");
 
-        // FakeMode returns near-instantly; tiny per-arm wall-clocks may
-        // still produce sub-millisecond t_total_ms → throughput_tx_per_sec
-        // could be None. Skip the multiplier check in that degenerate
-        // case; otherwise assert the exact ratio.
-        if let (Some(ind), Some(bat), Some(mult)) = (
-            outcome.arms.individual.throughput_tx_per_sec,
-            outcome.arms.batch.throughput_tx_per_sec,
-            outcome.throughput_multiplier,
-        ) {
-            let expected = bat / ind;
-            assert!(
-                (mult - expected).abs() < f64::EPSILON * mult.abs().max(1.0),
-                "throughput_multiplier must equal batch_tx_per_sec / individual_tx_per_sec: \
-                 got {mult}, expected {expected}",
-            );
-        } else {
-            // Degenerate-timing path: at least confirm the multiplier is
-            // None whenever either component is None.
-            assert!(
-                outcome.throughput_multiplier.is_none(),
-                "throughput_multiplier must be None whenever either arm's per-sec rate is None",
-            );
+        // FakeMode returns near-instantly; both arms may complete with
+        // sub-millisecond wall-clocks → t_total_ms can round to 0 and the
+        // multiplier returns None (divide-by-zero protection). Assert the
+        // contract: if both arm t_total_ms > 0, multiplier equals their
+        // wall-clock ratio; otherwise multiplier is None.
+        let ind_ms = outcome.arms.individual.t_total_ms;
+        let bat_ms = outcome.arms.batch.t_total_ms;
+        match outcome.throughput_multiplier {
+            Some(mult) => {
+                assert!(
+                    ind_ms > 0 && bat_ms > 0,
+                    "multiplier should only be Some when both t_total_ms > 0",
+                );
+                let expected = ind_ms as f64 / bat_ms as f64;
+                assert!(
+                    (mult - expected).abs() < f64::EPSILON * mult.abs().max(1.0),
+                    "throughput_multiplier must equal t_individual / t_batch per schema line 215: \
+                     got {mult}, expected {expected}",
+                );
+            }
+            None => {
+                assert!(
+                    ind_ms == 0 || bat_ms == 0,
+                    "multiplier should only be None on divide-by-zero (or batch.applies = false)",
+                );
+            }
         }
         unset_env(&seeds_cfg.old);
         unset_env(&seeds_cfg.new);
