@@ -421,4 +421,164 @@ mod tests {
         let send_count = calls.iter().filter(|c| **c == "send_single").count();
         assert_eq!(send_count, 3, "exactly 1+2 sends across two rounds");
     }
+
+    /// Per `RESULT_PROFILE_SCHEMA.md` lines 112-116 (universal cell-level
+    /// error counters), the four counters plus the pre-broadcast subset of
+    /// `details[]` must strictly partition the total attempted txs. Stated:
+    ///
+    /// ```text
+    /// sum_over_rounds(round.tx_count) ==
+    ///     success_count + rejection_count + stall_count + timeout_count
+    ///     + count(details where phase ∈ {Construct, Sign, Broadcast})
+    /// ```
+    ///
+    /// Confirm-phase failures (timeouts) feed `stall_count`, NOT `details[]`,
+    /// per schema line 114. Synthesises an `S1Outcome` directly (no `run`
+    /// invocation) to exercise the invariant against a hand-built 4-round
+    /// distribution that covers every counter and every pre-broadcast
+    /// `DetailPhase` independently.
+    #[test]
+    fn s1_cell_counters_partition_total_attempts() {
+        // Synthetic 4-round distribution (per directive):
+        //   Round 1 (tx_count=1): 1 success
+        //   Round 2 (tx_count=2): 1 success + 1 rejection (DoubleSpend)
+        //   Round 3 (tx_count=4): 2 successes + 1 stall + 1 construct failure
+        //   Round 4 (tx_count=8): 4 successes + 2 rejections + 1 sign failure
+        //                         + 1 stall
+        //
+        // Cell-level expected:
+        //   success_count   = 1 + 1 + 2 + 4 = 8
+        //   rejection_count = 0 + 1 + 0 + 2 = 3
+        //   stall_count     = 0 + 0 + 1 + 1 = 2
+        //   timeout_count   = 0 (S1 has no budget timeout)
+        //   details.len()   = 2  (one Construct, one Sign)
+        //   total attempts  = 1 + 2 + 4 + 8 = 15
+        //   invariant       : 8 + 3 + 2 + 0 + 2 == 15 ✓
+        fn record(status: &str) -> TxRecord {
+            TxRecord {
+                txid: format!("tx-{status}"),
+                t_total_ms: 1,
+                t_broadcast_ms: 1,
+                t_confirm_ms: None,
+                status: status.to_string(),
+                error_string: None,
+                fee_microtari: 0,
+            }
+        }
+        let outcome = S1Outcome {
+            rounds: vec![
+                RoundOutcome {
+                    round_idx: 1,
+                    tx_count: 1,
+                    failure_count: 0,
+                    t_round_ms: 0,
+                    tx_records: vec![record("success")],
+                },
+                RoundOutcome {
+                    round_idx: 2,
+                    tx_count: 2,
+                    failure_count: 1,
+                    t_round_ms: 0,
+                    tx_records: vec![record("success"), record("failure")],
+                },
+                RoundOutcome {
+                    round_idx: 3,
+                    tx_count: 4,
+                    failure_count: 1,
+                    t_round_ms: 0,
+                    tx_records: vec![
+                        record("success"),
+                        record("success"),
+                        record("success"),
+                        record("failure:construct"),
+                    ],
+                },
+                RoundOutcome {
+                    round_idx: 4,
+                    tx_count: 8,
+                    failure_count: 4,
+                    t_round_ms: 0,
+                    tx_records: vec![
+                        record("success"),
+                        record("success"),
+                        record("success"),
+                        record("success"),
+                        record("failure"),
+                        record("failure"),
+                        record("failure:sign"),
+                        record("success"),
+                    ],
+                },
+            ],
+            success_count: 8,
+            rejection_count: 3,
+            stall_count: 2,
+            timeout_count: 0,
+            details: vec![
+                DetailRecord {
+                    txid: None,
+                    error_string: "construct: bad UTXO".to_string(),
+                    phase: DetailPhase::Construct,
+                },
+                DetailRecord {
+                    txid: Some("tx-failure:sign".to_string()),
+                    error_string: "sign: bad signature".to_string(),
+                    phase: DetailPhase::Sign,
+                },
+            ],
+            peak_rss_bytes: None,
+            peak_cpu_pct: None,
+        };
+
+        // Left side of the invariant: sum of per-round tx_count.
+        let lhs: u64 = outcome.rounds.iter().map(|r| u64::from(r.tx_count)).sum();
+        assert_eq!(lhs, 15, "total attempts must equal 1+2+4+8");
+
+        // Right side: cell-level counters + pre-broadcast details.
+        let pre_broadcast_details: u64 = outcome
+            .details
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.phase,
+                    DetailPhase::Construct | DetailPhase::Sign | DetailPhase::Broadcast,
+                )
+            })
+            .count() as u64;
+        let rhs: u64 = outcome.success_count
+            + outcome.rejection_count
+            + outcome.stall_count
+            + outcome.timeout_count
+            + pre_broadcast_details;
+
+        assert_eq!(
+            lhs,
+            rhs,
+            "schema lines 112-116 partition invariant violated: \
+             sum(round.tx_count)={lhs} must equal success_count+rejection_count\
+             +stall_count+timeout_count+pre_broadcast_details \
+             ({}+{}+{}+{}+{}={})",
+            outcome.success_count,
+            outcome.rejection_count,
+            outcome.stall_count,
+            outcome.timeout_count,
+            pre_broadcast_details,
+            rhs,
+        );
+
+        // Sanity: the synthetic distribution matches the directive's
+        // 2 pre-broadcast details (one Construct, one Sign), zero
+        // Broadcast-phase entries, zero Confirm-phase entries (confirm
+        // timeouts feed stall_count, not details[], per schema line 114).
+        assert_eq!(pre_broadcast_details, 2);
+        assert_eq!(
+            outcome
+                .details
+                .iter()
+                .filter(|d| d.phase == DetailPhase::Confirm)
+                .count(),
+            0,
+            "confirm-phase failures must NOT appear in details[] — they feed stall_count",
+        );
+    }
 }
