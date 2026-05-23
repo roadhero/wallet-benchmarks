@@ -211,6 +211,18 @@ impl SeedHandle {
         }
     }
 
+    /// Resolve the mnemonic for a role at call time, mirroring
+    /// [`Self::address_for`]. Used by [`crate::wallet_lifecycle::balance_query::WalletGrpcBalanceQuery`]
+    /// to spawn a transient `console_wallet` keyed by role rather than by a
+    /// hardcoded slot.
+    pub fn mnemonic_for(&self, role: SeedRole) -> anyhow::Result<RedactedString> {
+        match role {
+            SeedRole::Old => self.mnemonic_old(),
+            SeedRole::New => self.mnemonic_new(),
+            SeedRole::Pp => self.mnemonic_payment_processor(),
+        }
+    }
+
     /// Thin test-only constructor — wraps a freshly-defaulted [`Seeds`].
     /// Used by scenario unit tests that need a `&SeedHandle` to populate
     /// [`crate::scenarios::ScenarioCtx`] without touching env vars. The

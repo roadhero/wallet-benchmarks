@@ -8,9 +8,11 @@
 //! See `analysis/DESIGN.md §Mainnet-protection guard`.
 
 use anyhow::bail;
-use tari_common_types::tari_address::TariAddress;
 
-use crate::{config::Config, seed::SeedHandle};
+use crate::{
+    config::Config,
+    seed::{SeedHandle, SeedRole},
+};
 
 const LOG_TARGET: &str = "c::guards";
 
@@ -59,16 +61,23 @@ pub fn enforce_esmeralda(config: &Config) -> anyhow::Result<()> {
 
 /// Funding pre-flight balance query.
 ///
-/// Abstracts the "what is this address's spendable balance?" call so the
-/// runtime can pair with either a live base-node client or a deterministic
-/// fake in tests. The published `minotari_node_wallet_client = "5.3.1"`
-/// `BaseNodeWalletClient` trait does NOT expose a balance method (verified
-/// by reading the trait at `src/client/mod.rs`); the live implementation
-/// will be filled in alongside `wallet_lifecycle` (step 3e) once the
-/// harness has a concrete address-scanning surface to read from. See
-/// `analysis/API_DRIFT.md §Step 3d`.
-pub trait BalanceQuery {
-    fn get_balance(&self, address: &TariAddress) -> anyhow::Result<u64>;
+/// Abstracts the "what is this seed's spendable balance?" call so the
+/// runtime can pair with either a live `console_wallet`-backed implementation
+/// (see [`crate::wallet_lifecycle::balance_query::WalletGrpcBalanceQuery`])
+/// or a deterministic fake in tests. Keyed by [`SeedRole`] rather than by
+/// address because the live implementation spawns a wallet per role anyway;
+/// the address parameter was design-smell (caller derives address from
+/// seed, impl reverse-looks-up). Per `analysis/DESIGN_AMENDMENT.md §7`.
+///
+/// Async because the live implementation spawns a transient `console_wallet`
+/// subprocess for each call; the trait method awaits the wallet's
+/// `wait_ready` poll and the `GetBalance` gRPC roundtrip.
+#[async_trait::async_trait]
+pub trait BalanceQuery: Send + Sync {
+    /// Return the spendable balance, in microTari, for the given role's
+    /// seed. Failure modes (spawn error, gRPC error, etc.) bubble up as
+    /// `Err` so [`enforce_funding`] can wrap them with role context.
+    async fn get_balance(&self, role: SeedRole) -> anyhow::Result<u64>;
 }
 
 /// Funding pre-flight: every harness seed must have a wallet balance ≥
@@ -77,7 +86,7 @@ pub trait BalanceQuery {
 /// [`enforce_esmeralda`] and before any mode runs. Funding-tx fees and
 /// timings are explicitly NOT in the result profile (AC-35) — this is a
 /// guardrail, not a measurement.
-pub fn enforce_funding(
+pub async fn enforce_funding(
     config: &Config,
     seeds: &SeedHandle,
     balance_query: &dyn BalanceQuery,
@@ -86,18 +95,22 @@ pub fn enforce_funding(
     let required =
         config.a_fund.saturating_mul(FUNDING_HEADROOM_NUMERATOR) / FUNDING_HEADROOM_DENOMINATOR;
 
-    let addr_old = seeds.address_old()?;
-    let addr_new = seeds.address_new()?;
-    let addr_pp = seeds.address_payment_processor()?;
+    // Validate seed mnemonics are resolvable before the per-role query loop
+    // — surfaces a missing-env-var error from `enforce_funding` rather than
+    // from a half-spawned wallet.
+    seeds.assert_distinct()?;
 
     let bal_old = balance_query
-        .get_balance(&addr_old)
+        .get_balance(SeedRole::Old)
+        .await
         .map_err(|e| e.context("querying balance for the old-wallet seed"))?;
     let bal_new = balance_query
-        .get_balance(&addr_new)
+        .get_balance(SeedRole::New)
+        .await
         .map_err(|e| e.context("querying balance for the new-wallet seed"))?;
     let bal_pp = balance_query
-        .get_balance(&addr_pp)
+        .get_balance(SeedRole::Pp)
+        .await
         .map_err(|e| e.context("querying balance for the payment-processor seed"))?;
 
     let any_short = bal_old < required || bal_new < required || bal_pp < required;
@@ -215,18 +228,19 @@ mod tests {
 
     // ----- enforce_funding tests -----
 
-    use std::{cell::RefCell, collections::HashMap};
+    use std::collections::HashMap;
 
     use crate::{config::Seeds, gen_seed, seed::SeedHandle};
 
     /// Deterministic [`BalanceQuery`] for tests. Returns the value mapped to
-    /// the address's base58 form; missing entries return the configured
-    /// fallback. A `force_err` flag flips every call into an `Err` so the
-    /// propagation test can exercise the context wrap.
+    /// the role; missing entries return zero. A `force_err` flag flips every
+    /// call into an `Err` so the propagation test can exercise the context
+    /// wrap. Uses `std::sync::Mutex` because `BalanceQuery` is now async and
+    /// requires `Send + Sync` (RefCell is `!Sync`).
     struct FakeBalanceQuery {
-        balances: HashMap<String, u64>,
+        balances: HashMap<SeedRole, u64>,
         force_err: bool,
-        calls: RefCell<Vec<String>>,
+        calls: std::sync::Mutex<Vec<SeedRole>>,
     }
 
     impl FakeBalanceQuery {
@@ -234,21 +248,22 @@ mod tests {
             Self {
                 balances: HashMap::new(),
                 force_err,
-                calls: RefCell::new(Vec::new()),
+                calls: std::sync::Mutex::new(Vec::new()),
             }
         }
-        fn set(&mut self, addr: &TariAddress, balance: u64) {
-            self.balances.insert(addr.to_base58(), balance);
+        fn set(&mut self, role: SeedRole, balance: u64) {
+            self.balances.insert(role, balance);
         }
     }
 
+    #[async_trait::async_trait]
     impl BalanceQuery for FakeBalanceQuery {
-        fn get_balance(&self, address: &TariAddress) -> anyhow::Result<u64> {
-            self.calls.borrow_mut().push(address.to_base58());
+        async fn get_balance(&self, role: SeedRole) -> anyhow::Result<u64> {
+            self.calls.lock().unwrap().push(role);
             if self.force_err {
                 anyhow::bail!("simulated balance query failure");
             }
-            Ok(*self.balances.get(&address.to_base58()).unwrap_or(&0))
+            Ok(*self.balances.get(&role).unwrap_or(&0))
         }
     }
 
@@ -275,59 +290,55 @@ mod tests {
         }
     }
 
-    /// Helper: install three fresh seeds into the per-test env vars, return
-    /// the `SeedHandle` plus the three derived addresses for use as
-    /// `FakeBalanceQuery` keys.
-    fn install_three_seeds(seeds_cfg: &Seeds) -> (SeedHandle, [TariAddress; 3]) {
+    /// Helper: install three fresh seeds into the per-test env vars and
+    /// return the resulting [`SeedHandle`]. Address derivation is no longer
+    /// needed (the trait is keyed by `SeedRole` directly).
+    fn install_three_seeds(seeds_cfg: &Seeds) -> SeedHandle {
         let m_old = gen_seed().expect("gen_seed old");
         let m_new = gen_seed().expect("gen_seed new");
         let m_pp = gen_seed().expect("gen_seed pp");
         set_env(&seeds_cfg.old, &m_old);
         set_env(&seeds_cfg.new, &m_new);
         set_env(&seeds_cfg.payment_processor, &m_pp);
-        let handle = SeedHandle::new(seeds_cfg);
-        let addresses = [
-            handle.address_old().expect("addr old"),
-            handle.address_new().expect("addr new"),
-            handle.address_payment_processor().expect("addr pp"),
-        ];
-        (handle, addresses)
+        SeedHandle::new(seeds_cfg)
     }
 
-    #[test]
-    fn enforce_funding_passes_when_all_balances_meet_required() {
+    #[tokio::test]
+    async fn enforce_funding_passes_when_all_balances_meet_required() {
         let seeds_cfg = unique_seeds("ALL_OK");
-        let (handle, [a_old, a_new, a_pp]) = install_three_seeds(&seeds_cfg);
+        let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
             ..Config::default()
         };
         let required = cfg.a_fund * 11 / 10; // 11_000_000_000
         let mut bq = FakeBalanceQuery::new(false);
-        bq.set(&a_old, required);
-        bq.set(&a_new, required + 1);
-        bq.set(&a_pp, required.saturating_mul(2));
-        let r = enforce_funding(&cfg, &handle, &bq);
+        bq.set(SeedRole::Old, required);
+        bq.set(SeedRole::New, required + 1);
+        bq.set(SeedRole::Pp, required.saturating_mul(2));
+        let r = enforce_funding(&cfg, &handle, &bq).await;
         unset_env(&seeds_cfg.old);
         unset_env(&seeds_cfg.new);
         unset_env(&seeds_cfg.payment_processor);
         r.expect("three sufficient balances must pass");
     }
 
-    #[test]
-    fn enforce_funding_bails_when_one_balance_short() {
+    #[tokio::test]
+    async fn enforce_funding_bails_when_one_balance_short() {
         let seeds_cfg = unique_seeds("ONE_SHORT");
-        let (handle, [a_old, a_new, a_pp]) = install_three_seeds(&seeds_cfg);
+        let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
             ..Config::default()
         };
         let required = cfg.a_fund * 11 / 10;
         let mut bq = FakeBalanceQuery::new(false);
-        bq.set(&a_old, required); // OK
-        bq.set(&a_new, 0); // short by required
-        bq.set(&a_pp, required + 1_000_000); // OK
-        let err = enforce_funding(&cfg, &handle, &bq).expect_err("a short balance must fail");
+        bq.set(SeedRole::Old, required); // OK
+        bq.set(SeedRole::New, 0); // short by required
+        bq.set(SeedRole::Pp, required + 1_000_000); // OK
+        let err = enforce_funding(&cfg, &handle, &bq)
+            .await
+            .expect_err("a short balance must fail");
         unset_env(&seeds_cfg.old);
         unset_env(&seeds_cfg.new);
         unset_env(&seeds_cfg.payment_processor);
@@ -361,16 +372,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enforce_funding_propagates_balance_query_errors() {
+    #[tokio::test]
+    async fn enforce_funding_propagates_balance_query_errors() {
         let seeds_cfg = unique_seeds("ERR_PROPAGATE");
-        let (handle, _addresses) = install_three_seeds(&seeds_cfg);
+        let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
             ..Config::default()
         };
         let bq = FakeBalanceQuery::new(true);
-        let err = enforce_funding(&cfg, &handle, &bq).expect_err("query err propagates");
+        let err = enforce_funding(&cfg, &handle, &bq)
+            .await
+            .expect_err("query err propagates");
         unset_env(&seeds_cfg.old);
         unset_env(&seeds_cfg.new);
         unset_env(&seeds_cfg.payment_processor);
