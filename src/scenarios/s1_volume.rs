@@ -18,20 +18,29 @@
 //!   measurement (AC-30 / AC-31). Enforced statically by
 //!   `tests/c_no_utxo_pre_partition_in_s1.rs`.
 //! * Per-tx confirmation timeout is bounded by
-//!   `config.per_tx_confirmation_timeout_ms`. On timeout, the tx is marked
-//!   `"timeout"` and counted as a stall per AC-33.
+//!   `config.per_tx_confirmation_timeout_ms`. On timeout, the tx is counted
+//!   under cell-level `stall_count` per AC-33.
 //! * If all `2^(k-1)` in a round fail, the round still completes; subsequent
 //!   rounds run.
 //!
-//! Per-round metrics (mirror the user-prompt schema for §3i.1.b's
-//! S1Outcome):
+//! Cell-level metrics (per `RESULT_PROFILE_SCHEMA.md` lines 112-116, the
+//! universal error sub-object that applies to EVERY scenario):
 //!
-//! * `round_idx: u8` — 1..=7.
-//! * `tx_count: u8` — `2^(round_idx - 1)`.
-//! * `successes`, `double_selection_rejections`, `construction_failures`,
-//!   `stalls`.
+//! * `success_count: u64` — successful tx submissions in this scenario.
+//! * `rejection_count: u64` — mempool/validation rejection per base-node
+//!   response. Collapses DoubleSpend, FeeTooLow, ValidationFailed, etc.
+//! * `stall_count: u64` — tx accepted but unconfirmed past timeout (AC-33).
+//! * `timeout_count: u64` — S4 budget timeout / harness-side timeout.
+//!   S1 has no budget timeout — field stays 0 for schema uniformity.
+//! * `details: Vec<DetailRecord>` — one entry per non-success event.
+//!
+//! Per-round metrics (per `RESULT_PROFILE_SCHEMA.md` line 156):
+//!
+//! * `round_idx: u32` — 1..=7.
+//! * `tx_count: u32` — `2^(round_idx - 1)`.
+//! * `failure_count: u32` — `count(tx_records[].status != "success")`.
 //! * `t_round_ms: u64` — start-of-first-construct → last terminal-state.
-//! * `txs: Vec<TxRecord>` per AC-38.
+//! * `tx_records: Vec<TxRecord>` per AC-38.
 //!
 //! Resource-sampler fields (`peak_rss_bytes`, `peak_cpu_pct`) carry `None`
 //! until the 1 Hz sampler lands in step 3j.
@@ -48,6 +57,7 @@ use tari_common_types::tari_address::TariAddress;
 
 use crate::config::Config;
 use crate::modes::{Mode, TxRecord};
+use crate::scenarios::{DetailPhase, DetailRecord};
 
 /// Poll cadence inside the per-tx confirmation loop. Same value as S0 —
 /// not a throttle (AC-32 exempted as it sits inside `tokio::select!`).
@@ -59,41 +69,56 @@ const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const S1_ROUNDS: u8 = 7;
 
 /// One round's worth of per-round aggregates plus the raw `TxRecord`s.
-/// Mirrors the user-prompt schema for §3i.1.b.
+/// Mirrors `RESULT_PROFILE_SCHEMA.md` line 156: `failure_count` is the only
+/// per-round counter — finer-grained partitions (rejection vs. construct
+/// failure vs. stall) roll up to the cell-level [`S1Outcome`] counters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoundOutcome {
     /// 1..=7. Round `k` dispatches `2^(k-1)` txs serially.
-    pub round_idx: u8,
+    pub round_idx: u32,
     /// Target tx count for this round (`2^(round_idx - 1)`).
-    pub tx_count: u8,
-    /// Number of txs whose `TxRecord::status == "success"`.
-    pub successes: u32,
-    /// Number of txs whose rejection reason indicates the wallet selected
-    /// the same UTXO that another concurrent / recent tx already locked.
-    /// Detected by substring matching on `TxRecord::error_string` against
-    /// the upstream `DoubleSpend` / "duplicate input" markers.
-    pub double_selection_rejections: u32,
-    /// Number of txs that failed before broadcast completion (TxRecord
-    /// `status` carrying a `failure:construct` / `failure:sign` /
-    /// `failure:broadcast` suffix).
-    pub construction_failures: u32,
-    /// Number of txs whose confirmation polling timed out
-    /// (`status == "timeout"`).
-    pub stalls: u32,
+    pub tx_count: u32,
+    /// `count(tx_records[].status != "success")` per schema line 156.
+    pub failure_count: u32,
     /// Wall-clock from start-of-first-construct → last terminal-state
     /// event, in milliseconds.
     pub t_round_ms: u64,
     /// Raw `TxRecord` for every tx in this round, in dispatch order.
-    pub txs: Vec<TxRecord>,
+    /// Renamed from `txs` to match schema line 150's `tx_records[]`.
+    pub tx_records: Vec<TxRecord>,
 }
 
 /// S1's per-cell payload. `rounds.len()` is normally `S1_ROUNDS` (7) but
 /// can be shorter when the caller (run loop in step 3i.2) decides to halt
 /// per AC-13 — that decision lives at the cell envelope, not in S1 itself.
+///
+/// Cell-level counter fields are the universal `errors` sub-object from
+/// `RESULT_PROFILE_SCHEMA.md` lines 112-116 — they apply to EVERY scenario,
+/// so the field set here is shared by S0/S2/S3/S4/S5/S6/S7 in shape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct S1Outcome {
     /// Per-round records, in dispatch order (1..=7).
     pub rounds: Vec<RoundOutcome>,
+    /// Successful tx submissions across all rounds in this scenario.
+    /// Schema line 112.
+    pub success_count: u64,
+    /// Mempool/validation rejection per base-node response. Schema line 113.
+    /// Collapses DoubleSpend / FeeTooLow / ValidationFailed / AlreadyMined /
+    /// Orphan / TimeLocked into a single counter; the specific rejection
+    /// reason rides on the corresponding `tx_record.error_string` and the
+    /// `DetailRecord` entry pushed onto `details`.
+    pub rejection_count: u64,
+    /// Tx accepted by base node but unconfirmed past
+    /// `config.per_tx_confirmation_timeout_ms`. Schema line 114, AC-33.
+    pub stall_count: u64,
+    /// S4 budget timeout / harness-side timeout. Schema line 115. S1 has
+    /// no budget timeout — this counter stays 0; field kept for schema
+    /// uniformity across all scenarios.
+    pub timeout_count: u64,
+    /// One entry per non-success event. Schema line 116. Construct- and
+    /// sign-phase failures (which never reach the base node) live here
+    /// only — they do NOT increment `rejection_count`.
+    pub details: Vec<DetailRecord>,
     /// `peak_rss_bytes` — `None` until the 1 Hz sampler lands in step 3j.
     pub peak_rss_bytes: Option<u64>,
     /// `peak_cpu_pct` — `None` until the 1 Hz sampler lands in step 3j.
@@ -118,16 +143,15 @@ pub(super) async fn run(
 ) -> anyhow::Result<S1Outcome> {
     let total_rounds = rounds_override.unwrap_or(S1_ROUNDS);
     let mut rounds = Vec::with_capacity(total_rounds as usize);
+    let mut success_count: u64 = 0;
+    let mut rejection_count: u64 = 0;
+    let mut stall_count: u64 = 0;
+    let mut details: Vec<DetailRecord> = Vec::new();
 
     for round_idx in 1..=total_rounds {
-        let tx_count_u32: u32 = 1u32 << (round_idx - 1);
-        let tx_count = u8::try_from(tx_count_u32).unwrap_or(u8::MAX);
+        let tx_count: u32 = 1u32 << (round_idx - 1);
         let round_start = Instant::now();
-        let mut txs = Vec::with_capacity(tx_count as usize);
-        let mut successes: u32 = 0;
-        let mut stalls: u32 = 0;
-        let mut construction_failures: u32 = 0;
-        let mut double_selection_rejections: u32 = 0;
+        let mut tx_records = Vec::with_capacity(tx_count as usize);
 
         for _tx_slot in 0..tx_count {
             // Construct + submit one tx. The wallet's own UTXO selection
@@ -141,83 +165,96 @@ pub(super) async fn run(
             let send_result = mode.send_single(recipient, amount, config.fee_rate).await;
             match send_result {
                 Ok(tx_record) => {
-                    // Classify by `status`:
-                    if tx_record.status == "success" {
-                        successes += 1;
-                    } else if is_double_selection_rejection(&tx_record) {
-                        double_selection_rejections += 1;
+                    // Classify by `status` per the universal cell-level
+                    // counters in `RESULT_PROFILE_SCHEMA.md` lines 112-116.
+                    let txid_opt = if tx_record.txid.is_empty() {
+                        None
                     } else {
-                        construction_failures += 1;
+                        Some(tx_record.txid.clone())
+                    };
+                    if tx_record.status == "success" {
+                        // Tentative success — confirmation polling below
+                        // may downgrade this to a stall per AC-33.
+                        let confirmed = wait_for_state_change(config, mode).await?;
+                        if confirmed {
+                            success_count += 1;
+                        } else {
+                            // AC-33: accepted but unconfirmed within
+                            // `per_tx_confirmation_timeout_ms` → stall.
+                            // Strict mutual exclusion with success.
+                            stall_count += 1;
+                        }
+                    } else {
+                        // Base-node rejection (DoubleSpend, FeeTooLow, etc.).
+                        // Schema collapses these into rejection_count;
+                        // the specific reason rides on tx_record.error_string.
+                        rejection_count += 1;
+                        details.push(DetailRecord {
+                            txid: txid_opt,
+                            error_string: tx_record.error_string.clone().unwrap_or_default(),
+                            phase: DetailPhase::Broadcast,
+                        });
                     }
-                    // Wait for the tx to reach a terminal state at the
-                    // wallet's reported UTXO-count level before the next
-                    // tx in this round begins (AC-30 serial-within-round
-                    // discipline).
-                    let confirmed = wait_for_state_change(config, mode).await?;
-                    if !confirmed {
-                        stalls += 1;
-                        // The tx_record from a successful send_single
-                        // already says "success"; we don't mutate it. The
-                        // round-level `stalls` counter is what records the
-                        // confirmation-side timeout per AC-33.
-                    }
-                    txs.push(tx_record);
+                    tx_records.push(tx_record);
                 }
                 Err(send_err) => {
                     // Send-side error: record a synthetic TxRecord with
-                    // failure status, fold into construction_failures.
-                    // No retry (AC-30) — move on to the next slot.
-                    construction_failures += 1;
-                    txs.push(synthesize_failure_record(&send_err));
+                    // failure status AND a DetailRecord with phase=Construct
+                    // per schema line 116. NO retry (AC-30) — move on.
+                    // Construct/Sign/Broadcast-phase failures live in
+                    // details[] only — they do NOT increment rejection_count
+                    // (which is reserved for base-node rejections per
+                    // schema line 113).
+                    let error_string = format!("{send_err:#}");
+                    details.push(DetailRecord {
+                        txid: None,
+                        error_string: error_string.clone(),
+                        phase: DetailPhase::Construct,
+                    });
+                    tx_records.push(synthesize_failure_record(&error_string));
                 }
             }
         }
 
         let round_elapsed = round_start.elapsed();
         let t_round_ms = u64::try_from(round_elapsed.as_millis()).unwrap_or(u64::MAX);
+        let failure_count =
+            u32::try_from(tx_records.iter().filter(|r| r.status != "success").count())
+                .unwrap_or(u32::MAX);
         rounds.push(RoundOutcome {
-            round_idx,
+            round_idx: u32::from(round_idx),
             tx_count,
-            successes,
-            double_selection_rejections,
-            construction_failures,
-            stalls,
+            failure_count,
             t_round_ms,
-            txs,
+            tx_records,
         });
     }
 
     Ok(S1Outcome {
         rounds,
+        success_count,
+        rejection_count,
+        stall_count,
+        // S1 has no budget timeout — schema field kept for uniformity.
+        timeout_count: 0,
+        details,
         peak_rss_bytes: None,
         peak_cpu_pct: None,
     })
 }
 
-/// Heuristic for "this tx was rejected because the wallet selected a UTXO
-/// that another concurrent / recent tx already had". Matches against the
-/// upstream `RejectionReason::DoubleSpend` discriminant name, plus the
-/// "duplicate input" substring that some base-node releases use in the raw
-/// rejection text. Surfaced raw per AC-30 — we do NOT retry, we count.
-fn is_double_selection_rejection(rec: &TxRecord) -> bool {
-    let Some(err) = rec.error_string.as_deref() else {
-        return false;
-    };
-    err.contains("DoubleSpend") || err.contains("duplicate input")
-}
-
 /// Construct a synthetic `TxRecord` for a send-side error. Used when
 /// `mode.send_single` returns `Err` rather than an `Ok(record)` carrying a
 /// `failure:*` status — the harness needs a record either way so the
-/// round's `txs[]` count matches its `tx_count` target.
-fn synthesize_failure_record(err: &anyhow::Error) -> TxRecord {
+/// round's `tx_records[]` count matches its `tx_count` target.
+fn synthesize_failure_record(error_string: &str) -> TxRecord {
     TxRecord {
         txid: String::new(),
         t_total_ms: 0,
         t_broadcast_ms: 0,
         t_confirm_ms: None,
         status: "failure:construct".to_string(),
-        error_string: Some(format!("{err:#}")),
+        error_string: Some(error_string.to_string()),
         fee_microtari: 0,
     }
 }
@@ -282,7 +319,8 @@ mod tests {
         // first reads the baseline (= pre-confirmation value) then polls
         // for change. With a tiny timeout, the wait returns `false` on the
         // first sleep — no real wallet state change is needed for the
-        // round-shape assertion.
+        // round-shape assertion. A `false` return downgrades the tentative
+        // success to a stall per AC-33.
         fake.canned_utxo_count = vec![10];
 
         let cfg = Config {
@@ -298,23 +336,37 @@ mod tests {
         let r = &outcome.rounds[0];
         assert_eq!(r.round_idx, 1);
         assert_eq!(r.tx_count, 1, "round 1 dispatches 2^0 = 1 tx");
-        assert_eq!(r.txs.len(), 1, "txs length matches tx_count");
-        assert_eq!(r.successes, 1);
-        assert_eq!(r.construction_failures, 0);
-        assert_eq!(r.double_selection_rejections, 0);
-        // Confirmation polled for the full timeout without a state change
-        // → counted as a stall per AC-33.
-        assert_eq!(r.stalls, 1, "no UTXO change observed within timeout");
+        assert_eq!(r.tx_records.len(), 1, "tx_records length matches tx_count");
+        // Per-tx status was "success" on the wire (TxRecord.status), so the
+        // per-round failure_count remains 0 — failure_count counts
+        // tx_records[].status != "success", and the stall-on-timeout
+        // downgrade lives at the cell level per schema lines 112-116.
+        assert_eq!(r.failure_count, 0);
+        // Cell-level: confirmation polled for the full timeout without a
+        // state change → counted as a stall per AC-33. NOT a success.
+        assert_eq!(outcome.success_count, 0);
+        assert_eq!(
+            outcome.stall_count, 1,
+            "no UTXO change observed within timeout"
+        );
+        assert_eq!(outcome.rejection_count, 0);
+        assert_eq!(outcome.timeout_count, 0, "S1 has no budget timeout");
+        assert!(
+            outcome.details.is_empty(),
+            "wire-success contributes no details[]"
+        );
         assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
     }
 
     #[tokio::test]
     async fn s1_round_with_alternating_send_outcomes_does_not_retry() {
         let mut fake = FakeMode::new();
-        // Round 2: 2 txs. Sequence: success, failure. The failure must NOT
-        // trigger a retry — the round records the failure raw and ends
-        // after exactly 2 tx attempts.
+        // Two rounds: rounds_override=2 → 1 tx in round 1, 2 txs in round 2.
+        // Sequence: 2 successes, then a construct-side Err. The Err must
+        // NOT trigger a retry — round 2 records the failure raw and ends
+        // after exactly 2 tx attempts (3 total send_single calls).
         fake.send_single_sequence = vec![
+            SendOutcome::Ok(success_record()),
             SendOutcome::Ok(success_record()),
             SendOutcome::Err("broadcast rejected".to_string()),
         ];
@@ -326,33 +378,42 @@ mod tests {
         };
         let recipient = fake_recipient();
 
-        // Run two rounds: rounds_override=2 → 1 tx in round 1, 2 txs in
-        // round 2. The 3 total send_single calls consume all three
-        // sequence entries (we add one extra success at the front).
-        fake.send_single_sequence = vec![
-            SendOutcome::Ok(success_record()),
-            SendOutcome::Ok(success_record()),
-            SendOutcome::Err("broadcast rejected".to_string()),
-        ];
         let outcome = run(&cfg, &mut fake, &recipient, Some(2))
             .await
             .expect("S1 two-round runs");
 
         assert_eq!(outcome.rounds.len(), 2);
-        // Round 1: one success.
+        // Round 1: one wire-success.
         assert_eq!(outcome.rounds[0].tx_count, 1);
-        assert_eq!(outcome.rounds[0].successes, 1);
-        assert_eq!(outcome.rounds[0].construction_failures, 0);
-        // Round 2: one success + one construction failure. NO RETRY of
-        // the failure: txs.len() == tx_count.
+        assert_eq!(outcome.rounds[0].failure_count, 0);
+        // Round 2: one wire-success + one construct failure. NO RETRY of
+        // the failure: tx_records.len() == tx_count.
         assert_eq!(outcome.rounds[1].tx_count, 2);
-        assert_eq!(outcome.rounds[1].txs.len(), 2, "no retry on failure");
-        assert_eq!(outcome.rounds[1].successes, 1);
-        assert_eq!(outcome.rounds[1].construction_failures, 1);
+        assert_eq!(outcome.rounds[1].tx_records.len(), 2, "no retry on failure");
+        // failure_count counts tx_records[].status != "success" — the
+        // synthesized construct failure has status "failure:construct".
+        assert_eq!(outcome.rounds[1].failure_count, 1);
         assert!(
-            outcome.rounds[1].txs[1].error_string.is_some(),
+            outcome.rounds[1].tx_records[1].error_string.is_some(),
             "synthesized failure record must carry the send-side error string",
         );
+
+        // Cell-level counters (universal per schema lines 112-116):
+        // - All 3 wire-successes downgrade to stalls (canned_utxo_count
+        //   never advances), so success_count=0, stall_count=2 (for the
+        //   two Ok send outcomes — the third was an Err and never reaches
+        //   the confirmation poll).
+        assert_eq!(outcome.success_count, 0);
+        assert_eq!(outcome.stall_count, 2);
+        assert_eq!(outcome.rejection_count, 0);
+        assert_eq!(outcome.timeout_count, 0);
+        // Exactly one DetailRecord for the construct-side Err, phase=Construct.
+        assert_eq!(outcome.details.len(), 1);
+        assert_eq!(outcome.details[0].phase, DetailPhase::Construct);
+        assert!(outcome.details[0].txid.is_none());
+        assert!(outcome.details[0]
+            .error_string
+            .contains("broadcast rejected"));
 
         // Verify exactly 3 send_single calls were made — no retries on
         // failure (AC-30).

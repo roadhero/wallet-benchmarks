@@ -32,6 +32,53 @@ use tari_common_types::tari_address::TariAddress;
 use crate::config::Config;
 use crate::modes::Mode;
 
+/// One record per non-success event surfaced by a scenario, mirroring
+/// `RESULT_PROFILE_SCHEMA.md §errors sub-object` line 116:
+/// `details: array<object>` with `{ txid, error_string, phase }`. Lives
+/// on `ScenarioOutcome` variants that record cell-level failure detail —
+/// shared across S1..S7 because every scenario folds construct/sign/
+/// broadcast/confirm/scan-phase failures through the same schema slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailRecord {
+    /// Transaction ID when known, `None` for failures that occurred
+    /// before the txid was assigned (construct-phase failures).
+    pub txid: Option<String>,
+    /// Free-form error description; schema §errors.details[] line 116.
+    pub error_string: String,
+    /// Pipeline phase at which the failure was observed.
+    pub phase: DetailPhase,
+}
+
+/// Per `RESULT_PROFILE_SCHEMA.md §errors sub-object` line 116:
+/// `phase ∈ {"construct", "sign", "broadcast", "confirm", "scan"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailPhase {
+    /// `minotari create-unsigned-transaction` subprocess or in-process
+    /// construction failure.
+    Construct,
+    /// `sign_locked_transaction` (Mode 2/3) failure.
+    Sign,
+    /// `Broadcaster::submit_transaction` failure.
+    Broadcast,
+    /// Confirmation-poll failure (NOT timeout — timeouts feed `stall_count`
+    /// per schema line 114).
+    Confirm,
+    /// Wallet scan failure (B0/S2/S3/S6/S7).
+    Scan,
+}
+
+impl std::fmt::Display for DetailPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Construct => "construct",
+            Self::Sign => "sign",
+            Self::Broadcast => "broadcast",
+            Self::Confirm => "confirm",
+            Self::Scan => "scan",
+        })
+    }
+}
+
 /// Per-run context passed to scenarios. Carries the harness configuration
 /// (which scenarios read for `c_min`, `a_fund`, `fee_rate`,
 /// `per_tx_confirmation_timeout_ms`, etc.) plus the harness-controlled
