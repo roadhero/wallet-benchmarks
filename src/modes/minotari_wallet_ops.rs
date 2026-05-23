@@ -465,18 +465,58 @@ fn parse_balance_microtari(stdout: &str) -> anyhow::Result<u64> {
     }
     if let Some(cap) = tari_re.captures(stdout) {
         if let Some(m) = cap.get(1) {
-            let tari: f64 = m
-                .as_str()
-                .parse::<f64>()
-                .with_context(|| format!("parsing T decimal from {:?}", m.as_str()))?;
-            let microtari = (tari * 1_000_000.0).round() as u64;
-            return Ok(microtari);
+            return parse_tari_decimal_to_microtari(m.as_str())
+                .with_context(|| format!("parsing T decimal from {:?}", m.as_str()));
         }
     }
     anyhow::bail!(
         "no balance amount matched (looked for `{{n}} µT` and `{{n.nnnnnn}} T`); \
          stdout was {stdout:?}",
     )
+}
+
+/// Convert a decimal Tari amount string (e.g. `"10.000001"`, `"0.5"`,
+/// `"10000000"`) into microtari (u64) **without f64 intermediate** — f64
+/// loses precision above 2^53 (≈ 9 PT) and rounds awkwardly for amounts
+/// like `10.000001 T` where the fractional `0.000001 * 1_000_000` can
+/// land at `0.9999...` after multiplication.
+///
+/// Strategy: split on `'.'`, parse integer and fractional parts as u64,
+/// scale the fractional part by `10^(6 - len(fractional))`, sum.
+/// Rejects fractional parts longer than 6 digits — precision below 1 µT
+/// isn't representable.
+fn parse_tari_decimal_to_microtari(s: &str) -> anyhow::Result<u64> {
+    const MICROTARI_PER_TARI: u64 = 1_000_000;
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let int_value: u64 = int_part
+        .parse()
+        .with_context(|| format!("parsing integer part {int_part:?}"))?;
+    let int_microtari = int_value.checked_mul(MICROTARI_PER_TARI).ok_or_else(|| {
+        anyhow::anyhow!("integer Tari amount {int_value} overflows u64 microtari")
+    })?;
+    if frac_part.is_empty() {
+        return Ok(int_microtari);
+    }
+    if frac_part.len() > 6 {
+        anyhow::bail!(
+            "fractional part {frac_part:?} exceeds 6 digits — precision below 1 µT \
+             is not representable in MicroMinotari",
+        );
+    }
+    let frac_value: u64 = frac_part
+        .parse()
+        .with_context(|| format!("parsing fractional part {frac_part:?}"))?;
+    // Right-pad: "5" → 500_000; "000001" → 1.
+    let scale = 10u64.pow((6 - frac_part.len()) as u32);
+    let frac_microtari = frac_value
+        .checked_mul(scale)
+        .ok_or_else(|| anyhow::anyhow!("fractional {frac_value} × {scale} overflows u64"))?;
+    int_microtari
+        .checked_add(frac_microtari)
+        .ok_or_else(|| anyhow::anyhow!("int + fractional microtari overflow"))
 }
 
 #[cfg(test)]
@@ -644,5 +684,75 @@ mod tests {
         // instead of "5.000000 T"), the parser should still work.
         let stdout = "Balance at height 100(2026-05-01T00:00:00): 5 T\n";
         assert_eq!(parse_balance_microtari(stdout).expect("parse"), 5_000_000);
+    }
+
+    /// Precision-sensitive edge: `10.000001 T` MUST round-trip to exactly
+    /// `10_000_001 µT`, NOT `10_000_000.999...` from f64 mantissa loss.
+    /// Per gemini-code-assist review on PR #6.
+    #[test]
+    fn parse_balance_microtari_no_precision_loss_for_smallest_fractional() {
+        let stdout = "Balance at height 100(...): 10.000001 T\n";
+        assert_eq!(parse_balance_microtari(stdout).expect("parse"), 10_000_001);
+    }
+
+    /// Large-value edge: `10_000_000 T` (10 million XTM) is past f64's
+    /// safe integer range when multiplied by 1_000_000 (= 10^13, above
+    /// 2^53 ≈ 9.007×10^15 — actually within safe range, but combined
+    /// with any fractional portion the f64 path could drift). Integer
+    /// parser must be exact.
+    #[test]
+    fn parse_balance_microtari_no_precision_loss_for_large_amounts() {
+        let stdout = "Balance at height 100(...): 10000000 T\n";
+        assert_eq!(
+            parse_balance_microtari(stdout).expect("parse"),
+            10_000_000_000_000,
+        );
+    }
+
+    #[test]
+    fn parse_balance_microtari_half_tari_is_500_000_microtari() {
+        let stdout = "Balance at height 100(...): 0.5 T\n";
+        assert_eq!(parse_balance_microtari(stdout).expect("parse"), 500_000);
+    }
+
+    /// Round-trip: format 100 deterministic-but-varied microtari values as
+    /// either µT or T, parse back, assert exact equality. No f64
+    /// involved in the parser path.
+    #[test]
+    fn parse_balance_microtari_round_trip_exact() {
+        // Mix of small (<1T), medium (1T-100T), and large (≥1MT) amounts.
+        let cases: Vec<u64> = (0..100)
+            .map(|i| {
+                // Pseudo-random spread without rand dep: combine i with
+                // bit-twiddling so we hit a variety of bit patterns.
+                let base = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                base % 12_000_000_000_000 // cap at 12 MT
+            })
+            .collect();
+        for &microtari in &cases {
+            let formatted = if microtari < 1_000_000 {
+                format!("{} µT", microtari)
+            } else {
+                // Format as "{int}.{frac:06} T", trim trailing zeros if any.
+                let int_part = microtari / 1_000_000;
+                let frac_part = microtari % 1_000_000;
+                if frac_part == 0 {
+                    format!("{} T", int_part)
+                } else {
+                    format!("{}.{:06} T", int_part, frac_part)
+                }
+            };
+            let stdout = format!("Balance at height 1(2026-05-01): {formatted}\n");
+            let parsed = parse_balance_microtari(&stdout)
+                .unwrap_or_else(|e| panic!("parse {formatted:?}: {e:#}"));
+            assert_eq!(parsed, microtari, "round-trip failed for {formatted:?}");
+        }
+    }
+
+    #[test]
+    fn parse_balance_microtari_rejects_too_much_precision() {
+        // 7 fractional digits → reject (below 1 µT resolution).
+        let stdout = "Balance at height 100(...): 10.0000001 T\n";
+        assert!(parse_balance_microtari(stdout).is_err());
     }
 }
