@@ -126,8 +126,8 @@ pub struct S1Outcome {
 /// Run S1 against the given mode.
 ///
 /// The destination address for each per-tx slot is picked from
-/// `ctx.recipients` via `resolve_for(mode, tx_idx)` — production callers
-/// wire `RecipientStrategy::Fixed` against the harness-controlled
+/// `ctx.recipients` via `resolve_for(ctx.seeds, tx_idx)` — production
+/// callers wire `RecipientStrategy::Fixed` against the harness-controlled
 /// recipient; future S5-style scenarios swap to `RecipientStrategy::Pool`.
 /// The wallet's own UTXO-selection logic decides which UTXOs to consume
 /// per tx — NO pre-partitioning of any kind (AC-30/31).
@@ -165,7 +165,7 @@ pub(super) async fn run(
             // (out of scope for this commit; reuses the value the run
             // loop in step 3i.2 will plumb through).
             let amount = config.fee_rate.saturating_mul(10);
-            let recipient = ctx.recipients.resolve_for(mode, tx_idx)?;
+            let recipient = ctx.recipients.resolve_for(ctx.seeds, tx_idx)?;
             tx_idx = tx_idx.saturating_add(1);
             let send_result = mode.send_single(&recipient, amount, config.fee_rate).await;
             match send_result {

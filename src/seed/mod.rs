@@ -75,6 +75,24 @@ impl std::fmt::Display for RedactedString {
 // listed in `DESIGN.md §Dependency strategy`. The transitive path is the
 // same code that all other tari ecosystem crates rely on.
 
+/// Per-mode seed slot identifier.
+///
+/// Names the three benchmarked wallets' seed slots — `Old` / `New` / `Pp`
+/// — so callers that need to address-derive against a specific mode (e.g.
+/// [`crate::scenarios::RecipientStrategy::SelfAddress`] for the send-to-self
+/// scenarios S4/S6/S7) can name the slot uniformly. Mirrors the wording the
+/// modes layer already uses in its module docs (`SeedRole::New`,
+/// `SeedRole::Pp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeedRole {
+    /// Mode 1 — `old_wallet` seed slot.
+    Old,
+    /// Mode 2 — `new_wallet` seed slot.
+    New,
+    /// Mode 3 — `payment_processor` seed slot.
+    Pp,
+}
+
 /// Runtime accessor for the three seed mnemonics and the wallet passphrase.
 ///
 /// Holds env-var *names*, not values. Every accessor re-reads the env var
@@ -169,6 +187,21 @@ impl SeedHandle {
     pub fn address_payment_processor(&self) -> anyhow::Result<TariAddress> {
         let m = self.mnemonic_payment_processor()?;
         derive_address(m.reveal())
+    }
+
+    /// Wallet address for the named [`SeedRole`] slot.
+    ///
+    /// Thin dispatcher over [`Self::address_old`] / [`Self::address_new`] /
+    /// [`Self::address_payment_processor`] so callers that want the address
+    /// for a *named* slot — notably
+    /// [`crate::scenarios::RecipientStrategy::SelfAddress`] — don't need a
+    /// hand-rolled match at every call site.
+    pub fn address_for(&self, role: SeedRole) -> anyhow::Result<TariAddress> {
+        match role {
+            SeedRole::Old => self.address_old(),
+            SeedRole::New => self.address_new(),
+            SeedRole::Pp => self.address_payment_processor(),
+        }
     }
 
     /// Thin test-only constructor — wraps a freshly-defaulted [`Seeds`].

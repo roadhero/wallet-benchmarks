@@ -33,7 +33,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::modes::Mode;
 use crate::seed::redact::RedactionDenylist;
-use crate::seed::SeedHandle;
+use crate::seed::{SeedHandle, SeedRole};
 
 /// One record per non-success event surfaced by a scenario, mirroring
 /// `RESULT_PROFILE_SCHEMA.md §errors sub-object` line 116:
@@ -116,18 +116,20 @@ pub struct ScenarioCtx<'a> {
 /// Recipient picker for the per-tx send loop. Variants cover the three
 /// patterns scenarios need:
 ///
-/// * `SelfAddress` — scenario sends to the wallet's own address. NOTE:
-///   the current [`Mode`] trait does not expose an own-address accessor;
-///   `resolve_for` returns an error explaining the gap until that method
-///   lands (recorded in `analysis/API_DRIFT.md`). Production callers use
-///   `Fixed` or `Pool`.
+/// * `SelfAddress(SeedRole)` — scenario sends to the wallet's own address,
+///   derived from `ctx.seeds` for the named [`SeedRole`] slot. Used by the
+///   send-to-self scenarios (S4/S6/S7 and any future scenario whose send
+///   path returns funds to the sender wallet).
 /// * `Fixed(&TariAddress)` — every tx in the scenario sends to the same
 ///   recipient. Used by S0/S1 against the harness's "second mode-2 seed".
 /// * `Pool(&[TariAddress])` — round-robin recipient list. Used by S5 to
 ///   amortise the 100-recipient list across the per-tx loop.
 pub enum RecipientStrategy<'a> {
-    /// Send to the wallet's own address.
-    SelfAddress,
+    /// Send to the wallet's own address for the named [`SeedRole`] slot.
+    /// Derived from `ctx.seeds` via [`SeedHandle::address_for`], so the
+    /// derivation path matches the harness's funding pre-flight and the
+    /// `print-address` subcommand.
+    SelfAddress(SeedRole),
     /// Fixed single recipient for the whole scenario.
     Fixed(&'a TariAddress),
     /// Round-robin pool of recipients.
@@ -137,21 +139,18 @@ pub enum RecipientStrategy<'a> {
 impl<'a> RecipientStrategy<'a> {
     /// Resolve the recipient for the `tx_idx`-th tx in the scenario.
     ///
+    /// * `SelfAddress(role)` → [`SeedHandle::address_for(role)`].
     /// * `Fixed(a)` → clones `a`.
     /// * `Pool(p)` → `p[tx_idx % p.len()]`; bails when `p` is empty.
-    /// * `SelfAddress` → currently bails because the [`Mode`] trait
-    ///   does not expose an own-address accessor (per
-    ///   `analysis/API_DRIFT.md`). Reserved for the day that method
-    ///   lands; production callers use `Fixed` or `Pool`.
-    pub fn resolve_for(&self, _mode: &dyn Mode, tx_idx: u32) -> anyhow::Result<TariAddress> {
+    ///
+    /// Takes `&SeedHandle` rather than `&dyn Mode` because the only variant
+    /// that needs derivation reads from the harness's seed material, not
+    /// from the mode's runtime state. Lets the per-scenario send loop pass
+    /// `ctx.seeds` (already in scope) without threading `mode` through
+    /// resolve sites that don't need it.
+    pub fn resolve_for(&self, seeds: &SeedHandle, tx_idx: u32) -> anyhow::Result<TariAddress> {
         match self {
-            RecipientStrategy::SelfAddress => {
-                anyhow::bail!(
-                    "RecipientStrategy::SelfAddress is unsupported: the Mode trait does not \
-                     expose an own-address accessor (see analysis/API_DRIFT.md). Use \
-                     RecipientStrategy::Fixed or RecipientStrategy::Pool.",
-                )
-            }
+            RecipientStrategy::SelfAddress(role) => seeds.address_for(*role),
             RecipientStrategy::Fixed(a) => Ok((*a).clone()),
             RecipientStrategy::Pool([]) => {
                 anyhow::bail!("RecipientStrategy::Pool is empty")
@@ -279,6 +278,8 @@ pub async fn run_scenario(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Seeds;
+    use crate::gen_seed;
 
     #[test]
     fn scenario_id_all_is_canonical_order() {
@@ -296,5 +297,95 @@ mod tests {
         assert_eq!(ScenarioId::B0.to_string(), "b0");
         assert_eq!(ScenarioId::S0.to_string(), "s0");
         assert_eq!(ScenarioId::S7.to_string(), "s7");
+    }
+
+    /// Mutate env via `set_var` / `remove_var`. Both calls are `unsafe` on
+    /// Rust 1.84+; allow `unused_unsafe` for older toolchains. Mirrors the
+    /// helper in `crate::seed::tests`.
+    fn set_env(name: &str, value: &str) {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+    fn unset_env(name: &str) {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    /// Per-test `Seeds` with unique env-var names so parallel test runs
+    /// don't race on the same vars.
+    fn unique_seeds(suffix: &str) -> Seeds {
+        Seeds {
+            old: format!("WALLET_BENCHMARKS_TEST_RECIPIENT_OLD_{suffix}"),
+            new: format!("WALLET_BENCHMARKS_TEST_RECIPIENT_NEW_{suffix}"),
+            payment_processor: format!("WALLET_BENCHMARKS_TEST_RECIPIENT_PP_{suffix}"),
+            wallet_password: format!("WALLET_BENCHMARKS_TEST_RECIPIENT_PW_{suffix}"),
+        }
+    }
+
+    #[test]
+    fn self_address_old_resolves_to_old_wallet_address() {
+        let seeds_cfg = unique_seeds("SELF_OLD");
+        let m = gen_seed().expect("mnemonic");
+        set_env(&seeds_cfg.old, &m);
+        let seeds = SeedHandle::new(&seeds_cfg);
+
+        let strat = RecipientStrategy::SelfAddress(SeedRole::Old);
+        let resolved = strat
+            .resolve_for(&seeds, 0)
+            .expect("resolve SelfAddress(Old)");
+        let oracle = seeds.address_for(SeedRole::Old).expect("oracle address");
+
+        unset_env(&seeds_cfg.old);
+        assert_eq!(
+            resolved.to_base58(),
+            oracle.to_base58(),
+            "SelfAddress(Old) must agree with SeedHandle::address_for(Old)",
+        );
+    }
+
+    #[test]
+    fn self_address_new_resolves_to_new_wallet_address() {
+        let seeds_cfg = unique_seeds("SELF_NEW");
+        let m = gen_seed().expect("mnemonic");
+        set_env(&seeds_cfg.new, &m);
+        let seeds = SeedHandle::new(&seeds_cfg);
+
+        let strat = RecipientStrategy::SelfAddress(SeedRole::New);
+        let resolved = strat
+            .resolve_for(&seeds, 0)
+            .expect("resolve SelfAddress(New)");
+        let oracle = seeds.address_for(SeedRole::New).expect("oracle address");
+
+        unset_env(&seeds_cfg.new);
+        assert_eq!(
+            resolved.to_base58(),
+            oracle.to_base58(),
+            "SelfAddress(New) must agree with SeedHandle::address_for(New)",
+        );
+    }
+
+    #[test]
+    fn self_address_pp_resolves_to_payment_processor_address() {
+        let seeds_cfg = unique_seeds("SELF_PP");
+        let m = gen_seed().expect("mnemonic");
+        set_env(&seeds_cfg.payment_processor, &m);
+        let seeds = SeedHandle::new(&seeds_cfg);
+
+        let strat = RecipientStrategy::SelfAddress(SeedRole::Pp);
+        let resolved = strat
+            .resolve_for(&seeds, 0)
+            .expect("resolve SelfAddress(Pp)");
+        let oracle = seeds.address_for(SeedRole::Pp).expect("oracle address");
+
+        unset_env(&seeds_cfg.payment_processor);
+        assert_eq!(
+            resolved.to_base58(),
+            oracle.to_base58(),
+            "SelfAddress(Pp) must agree with SeedHandle::address_for(Pp)",
+        );
     }
 }

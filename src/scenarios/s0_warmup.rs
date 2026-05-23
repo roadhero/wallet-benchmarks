@@ -94,15 +94,15 @@ const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Run S0 against the given mode.
 ///
 /// Reads the destination address from `ctx.recipients` via
-/// `resolve_for(mode, 0)` — S0 dispatches exactly one tx so the index is
-/// always 0. The recipient is not derived by S0 itself because the
-/// `Mode` trait does not expose an "own address" method (recorded in
-/// `analysis/API_DRIFT.md §3i.1.b`); production callers wire the
-/// harness-controlled "second mode-2 seed" address via
-/// `RecipientStrategy::Fixed` per `DESIGN.md §Scenario state machine §S0`.
+/// `resolve_for(ctx.seeds, 0)` — S0 dispatches exactly one tx so the index
+/// is always 0. Production callers wire the harness-controlled
+/// "second mode-2 seed" address via `RecipientStrategy::Fixed` per
+/// `DESIGN.md §Scenario state machine §S0`; the parametrized
+/// `RecipientStrategy::SelfAddress(SeedRole)` variant is reserved for the
+/// send-to-self scenarios (S4/S6/S7).
 pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::Result<S0Outcome> {
     let config = ctx.config;
-    let recipient = ctx.recipients.resolve_for(mode, 0)?;
+    let recipient = ctx.recipients.resolve_for(ctx.seeds, 0)?;
 
     let pre_balance = mode.get_balance().await?;
     let pre_utxo_count = mode.get_utxo_count().await?;
