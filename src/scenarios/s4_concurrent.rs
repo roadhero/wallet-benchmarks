@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 
 use crate::broadcast::RejectionReason;
 use crate::modes::{Mode, TxRecord};
-use crate::scenarios::ScenarioCtx;
+use crate::scenarios::{DetailPhase, DetailRecord, ScenarioCtx};
 use crate::seed::redact::RedactionDenylist;
 
 /// S4's per-cell payload, matching `RESULT_PROFILE_SCHEMA.md §S4` (lines
@@ -75,14 +75,24 @@ pub struct S4Outcome {
     pub success_count: u64,
     /// Sum of `rejection_count` over all sub-blocks (line 113).
     pub rejection_count: u64,
-    /// Sum of `stall_count` over all sub-blocks (line 114). For S4 a
-    /// "stall" means a task whose `dispatch` returned a `TxRecord` whose
-    /// `status != "success"` AND was NOT a rejection (i.e. broadcast
-    /// returned an `Err` before the base node ruled on the tx).
+    /// Sum of `stall_count` over all sub-blocks (line 114). Per
+    /// `RESULT_PROFILE_SCHEMA.md` line 114, "stall" means "tx accepted but
+    /// unconfirmed past `per_tx_confirmation_timeout_ms` (AC-33)" — strictly
+    /// a confirmation-phase event. S4 does NOT yet run confirmation polling
+    /// (see module docs); the per-task `t_confirm_ms` is always `None`.
+    /// Until step 3k wires confirmation polling and populates
+    /// `t_confirm_ms`, `stall_count` is structurally 0. Tracked in
+    /// `analysis/API_DRIFT.md §3i.1.g`.
     pub stall_count: u64,
     /// Sum of `timeout_count` over all sub-blocks (line 115). For S4 this
     /// is the count of tasks aborted by the per-sub-block budget arm.
     pub timeout_count: u64,
+    /// Universal `details[]` per `RESULT_PROFILE_SCHEMA.md` line 116 — one
+    /// entry per non-success non-rejection event. S4 records broadcast-
+    /// phase failures (dispatcher `Err` and non-cancelled `JoinError`) here
+    /// with `phase = Broadcast`. Aborted-by-budget tasks feed `timeout_count`,
+    /// NOT `details[]`. Rejections feed `rejection_count`, NOT `details[]`.
+    pub details: Vec<DetailRecord>,
 }
 
 /// Per-N (sub-block) measurement, matching
@@ -195,8 +205,8 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
     let mut sub_blocks: Vec<SubBlockOutcome> = Vec::with_capacity(sub_block_sizes.len());
     let mut success_count: u64 = 0;
     let mut rejection_count: u64 = 0;
-    let mut stall_count: u64 = 0;
     let mut timeout_count: u64 = 0;
+    let mut details: Vec<DetailRecord> = Vec::new();
 
     for &n in &sub_block_sizes {
         let outcome = run_one_sub_block(
@@ -215,14 +225,33 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         rejection_count = rejection_count.saturating_add(count_outcome(&outcome, |t| {
             matches!(t.broadcast_outcome, BroadcastOutcome::Rejected)
         }));
-        stall_count = stall_count.saturating_add(count_outcome(&outcome, |t| {
-            matches!(t.broadcast_outcome, BroadcastOutcome::Error)
-        }));
         timeout_count = timeout_count.saturating_add(count_outcome(&outcome, |t| {
             matches!(t.broadcast_outcome, BroadcastOutcome::Aborted)
         }));
+        // BroadcastOutcome::Error → schema line 116 `details[]` with
+        // phase = Broadcast (the dispatcher is the broadcast layer for S4).
+        // Per `RESULT_PROFILE_SCHEMA.md` line 114, stall_count is reserved
+        // for confirmation-phase timeouts; broadcast errors are NOT stalls.
+        for task in &outcome.tx_records {
+            if matches!(task.broadcast_outcome, BroadcastOutcome::Error) {
+                details.push(DetailRecord {
+                    txid: if task.txid.is_empty() {
+                        None
+                    } else {
+                        Some(task.txid.clone())
+                    },
+                    error_string: task.error_string.clone().unwrap_or_default(),
+                    phase: DetailPhase::Broadcast,
+                });
+            }
+        }
         sub_blocks.push(outcome);
     }
+
+    // stall_count is structurally 0 until 3k wires confirmation polling
+    // and populates `t_confirm_ms`. See S4Outcome::stall_count doc-comment
+    // and `analysis/API_DRIFT.md §3i.1.g`.
+    let stall_count: u64 = 0;
 
     Ok(S4Outcome {
         sub_blocks,
@@ -230,6 +259,7 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         rejection_count,
         stall_count,
         timeout_count,
+        details,
     })
 }
 
@@ -630,6 +660,7 @@ mod tests {
         assert_eq!(outcome.rejection_count, 0);
         assert_eq!(outcome.stall_count, 0);
         assert_eq!(outcome.timeout_count, 0);
+        assert!(outcome.details.is_empty(), "no errors → no details[]");
         unset_env(&seeds_cfg.new);
     }
 
@@ -658,6 +689,16 @@ mod tests {
         );
         assert_eq!(outcome.success_count, 1);
         assert_eq!(outcome.rejection_count, 1);
+        assert_eq!(outcome.stall_count, 0);
+        assert_eq!(outcome.timeout_count, 0);
+        // Rejections feed `rejection_count`, NOT `details[]` — per
+        // schema line 116 details[] is reserved for non-success
+        // non-rejection events (broadcast / construct / sign / confirm
+        // / scan errors).
+        assert!(
+            outcome.details.is_empty(),
+            "rejection-only outcome must not push details[]",
+        );
         unset_env(&seeds_cfg.new);
     }
 
@@ -759,10 +800,227 @@ mod tests {
         );
         assert_eq!(outcome.success_count, 0);
         assert_eq!(outcome.rejection_count, 0);
+        assert_eq!(outcome.stall_count, 0);
+        // Aborted tasks feed `timeout_count`, NOT `details[]` — per the
+        // S4Outcome::details doc-comment.
+        assert!(
+            outcome.details.is_empty(),
+            "aborted-by-budget tasks must not push details[]",
+        );
         for r in &sb.tx_records {
             assert_eq!(r.broadcast_outcome, BroadcastOutcome::Aborted);
             assert!(r.t_construct_complete_ms.is_none());
         }
         unset_env(&seeds_cfg.new);
+    }
+
+    /// N=2, one Ok + one dispatcher-side Err. The Err MUST land in
+    /// `details[]` with phase=Broadcast, NOT in `stall_count`. Schema
+    /// line 114 reserves stall_count for confirmation-phase events, which
+    /// S4 does not yet run (deferred to 3k per API_DRIFT.md §3i.1.f).
+    #[tokio::test]
+    async fn s4_n2_one_broadcast_error_lands_in_details_not_stall() {
+        let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
+            "N2_BERR",
+            vec![2],
+            60_000,
+            vec![
+                SendOutcome::Ok(ok_record("a")),
+                SendOutcome::Err("simulated broadcast bail".to_string()),
+            ],
+        );
+        let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+        let outcome = run(&ctx, &mut fake).await.expect("run ok");
+
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(outcome.rejection_count, 0);
+        assert_eq!(
+            outcome.stall_count, 0,
+            "broadcast errors must NOT feed stall_count (schema line 114)",
+        );
+        assert_eq!(outcome.timeout_count, 0);
+        assert_eq!(
+            outcome.details.len(),
+            1,
+            "exactly one BroadcastOutcome::Error → one details[] entry",
+        );
+        assert_eq!(outcome.details[0].phase, DetailPhase::Broadcast);
+        assert!(
+            outcome.details[0]
+                .error_string
+                .contains("simulated broadcast bail"),
+            "details[0].error_string must carry the injected message; got {}",
+            outcome.details[0].error_string,
+        );
+        unset_env(&seeds_cfg.new);
+    }
+
+    /// Cell-level partition invariant per `RESULT_PROFILE_SCHEMA.md`
+    /// lines 112-116:
+    ///
+    /// ```text
+    /// sum_over_sub_blocks(n_concurrent) ==
+    ///     success_count + rejection_count + stall_count + timeout_count
+    ///     + count(details where phase ∈ {Construct, Sign, Broadcast})
+    /// ```
+    ///
+    /// Runs the 4 hand-built scenarios and asserts the invariant on each.
+    #[tokio::test]
+    async fn s4_cell_counters_partition_total_attempts() {
+        async fn invariant(outcome: S4Outcome) {
+            let total: u64 = outcome
+                .sub_blocks
+                .iter()
+                .map(|sb| u64::from(sb.n_concurrent))
+                .sum();
+            let pre_broadcast_details: u64 = outcome
+                .details
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d.phase,
+                        DetailPhase::Construct | DetailPhase::Sign | DetailPhase::Broadcast,
+                    )
+                })
+                .count() as u64;
+            let partition = outcome.success_count
+                + outcome.rejection_count
+                + outcome.stall_count
+                + outcome.timeout_count
+                + pre_broadcast_details;
+            assert_eq!(
+                total,
+                partition,
+                "schema lines 112-116 partition invariant violated: \
+                 sum(n_concurrent)={total} must equal success({})+rejection({})\
+                 +stall({})+timeout({})+pre_broadcast_details({})={partition}",
+                outcome.success_count,
+                outcome.rejection_count,
+                outcome.stall_count,
+                outcome.timeout_count,
+                pre_broadcast_details,
+            );
+        }
+
+        // Case 1 — all succeed: 2 + 0 + 0 + 0 + 0 == 2.
+        {
+            let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
+                "INV_OK",
+                vec![2],
+                60_000,
+                vec![
+                    SendOutcome::Ok(ok_record("a")),
+                    SendOutcome::Ok(ok_record("b")),
+                ],
+            );
+            let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+            let outcome = run(&ctx, &mut fake).await.expect("run ok");
+            invariant(outcome).await;
+            unset_env(&seeds_cfg.new);
+        }
+        // Case 2 — one double-spend rejection: 1 + 1 + 0 + 0 + 0 == 2.
+        {
+            let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
+                "INV_DS",
+                vec![2],
+                60_000,
+                vec![
+                    SendOutcome::Ok(ok_record("a")),
+                    SendOutcome::Ok(rejected_record("b", "DoubleSpend")),
+                ],
+            );
+            let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+            let outcome = run(&ctx, &mut fake).await.expect("run ok");
+            invariant(outcome).await;
+            unset_env(&seeds_cfg.new);
+        }
+        // Case 3 — one broadcast error: 1 + 0 + 0 + 0 + 1 == 2.
+        {
+            let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
+                "INV_BERR",
+                vec![2],
+                60_000,
+                vec![
+                    SendOutcome::Ok(ok_record("a")),
+                    SendOutcome::Err("inv: broadcast bail".to_string()),
+                ],
+            );
+            let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+            let outcome = run(&ctx, &mut fake).await.expect("run ok");
+            invariant(outcome).await;
+            unset_env(&seeds_cfg.new);
+        }
+        // Case 4 — budget arm fires for both tasks: 0 + 0 + 0 + 2 + 0 == 2.
+        // Same SleepyDispatcher setup as s4_n2_budget_arm_fires; the
+        // invariant arithmetic is the load-bearing assertion here.
+        {
+            use crate::modes::S4Dispatcher;
+            use std::sync::Arc;
+            use std::time::Duration as StdDuration;
+            use tari_common_types::tari_address::TariAddress;
+
+            struct SleepyDispatcher;
+
+            #[async_trait::async_trait]
+            impl S4Dispatcher for SleepyDispatcher {
+                async fn dispatch(
+                    &self,
+                    _recipient: TariAddress,
+                    _amount_microtari: u64,
+                    _fee_rate: u64,
+                ) -> anyhow::Result<TxRecord> {
+                    tokio::time::sleep(StdDuration::from_millis(100)).await;
+                    Ok(ok_record("sleepy"))
+                }
+            }
+            struct ModeStubWithSleepyDispatcher;
+            #[async_trait::async_trait]
+            impl crate::modes::Mode for ModeStubWithSleepyDispatcher {
+                fn name(&self) -> &'static str {
+                    "sleepy_stub"
+                }
+                async fn send_single(
+                    &mut self,
+                    _r: &TariAddress,
+                    _a: u64,
+                    _f: u64,
+                ) -> anyhow::Result<TxRecord> {
+                    unreachable!()
+                }
+                async fn send_batch_one_to_many(
+                    &mut self,
+                    _r: &[(TariAddress, u64)],
+                    _f: u64,
+                ) -> anyhow::Result<TxRecord> {
+                    unreachable!()
+                }
+                async fn scan_from_birthday(
+                    &mut self,
+                    _b: u16,
+                ) -> anyhow::Result<crate::modes::ScanOutcome> {
+                    unreachable!()
+                }
+                async fn get_balance(&mut self) -> anyhow::Result<u64> {
+                    unreachable!()
+                }
+                async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
+                    unreachable!()
+                }
+                async fn wipe_and_reimport(&mut self, _b: u16) -> anyhow::Result<()> {
+                    unreachable!()
+                }
+                fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
+                    Arc::new(SleepyDispatcher)
+                }
+            }
+
+            let (_unused_fake, seeds_cfg, cfg, seeds, redaction, clock) =
+                build_ctx("INV_BUDGET", vec![2], 10, vec![]);
+            let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+            let mut mode = ModeStubWithSleepyDispatcher;
+            let outcome = run(&ctx, &mut mode).await.expect("run ok");
+            invariant(outcome).await;
+            unset_env(&seeds_cfg.new);
+        }
     }
 }
