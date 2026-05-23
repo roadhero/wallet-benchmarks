@@ -22,10 +22,12 @@
 mod b0_baseline;
 mod s0_warmup;
 mod s1_volume;
+mod s2_full_rescan;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
 pub use s1_volume::{RoundOutcome, S1Outcome};
+pub use s2_full_rescan::S2Outcome;
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -160,6 +162,27 @@ impl<'a> RecipientStrategy<'a> {
     }
 }
 
+/// Per-scenario inputs threaded into the [`run_scenario`] dispatch.
+///
+/// Most scenarios consume only `ScenarioCtx`; a few need additional inputs
+/// derived from the prior scenarios in the run order (e.g. S2's
+/// `expected_outputs` comes from S1's final UTXO count; S3's `h_birth`
+/// comes from S0). Rather than expand [`ScenarioCtx`] with `Option<…>`
+/// fields that are populated for two of nine scenarios and ignored for
+/// the rest, the run loop (step 3i.2) carries this shape and supplies it
+/// per dispatch.
+///
+/// Fields are added in lockstep with the scenarios that consume them.
+/// S2 lands `expected_outputs_s2`; S3 will add `h_birth_s3`; S4/S5/S6/S7
+/// follow as those scenarios come online.
+#[derive(Debug, Clone, Default)]
+pub struct ScenarioInput {
+    /// AC-15 verification target: the count of outputs S2's rescan is
+    /// expected to rediscover. `None` for non-S2 dispatches; the S2 arm
+    /// bails with a clear error if `None`.
+    pub expected_outputs_s2: Option<u64>,
+}
+
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
 /// in the 27-cell matrix. `Display` matches the scenario names used as keys
 /// under `results.<mode>.<scenario>` in `RESULT_PROFILE_SCHEMA.md §4`.
@@ -242,8 +265,10 @@ pub enum ScenarioOutcome {
     S0(S0Outcome),
     /// S1 — UTXO multiplication across 7 doubling rounds (AC-12/13/14).
     S1(S1Outcome),
+    /// S2 — wipe + birthday=0 + full-history rescan (AC-15/AC-24/AC-34).
+    S2(S2Outcome),
     // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   …      → S2..S7
+    //   …      → S3..S7
 }
 
 /// Run the named scenario against the given mode.
@@ -251,11 +276,18 @@ pub enum ScenarioOutcome {
 /// Dispatches to per-scenario impl based on `id`. No registry, no factory —
 /// scenarios are added one at a time as the workspace fills out per
 /// `DESIGN.md §swe-impl execution order`. B0 lands in step 3i.1.a.3; S0
-/// lands in step 3i.1.b; S1..S7 follow.
+/// lands in step 3i.1.b; S1 in step 3i.1.c; S2 in step 3i.1.d/e; S3..S7
+/// follow.
+///
+/// `input` carries per-scenario inputs that the run loop derives from
+/// prior scenarios — e.g. S2's `expected_outputs_s2`. Scenarios that
+/// don't need extra inputs ignore the field; the relevant arm bails with
+/// a clear error if a required input is missing.
 pub async fn run_scenario(
     id: ScenarioId,
     ctx: &ScenarioCtx<'_>,
     mode: &mut dyn Mode,
+    input: &ScenarioInput,
 ) -> anyhow::Result<ScenarioOutcome> {
     match id {
         ScenarioId::B0 => b0_baseline::run(mode).await.map(ScenarioOutcome::B0),
@@ -263,15 +295,23 @@ pub async fn run_scenario(
         ScenarioId::S1 => s1_volume::run(ctx, mode, None)
             .await
             .map(ScenarioOutcome::S1),
-        ScenarioId::S2
-        | ScenarioId::S3
-        | ScenarioId::S4
-        | ScenarioId::S5
-        | ScenarioId::S6
-        | ScenarioId::S7 => anyhow::bail!(
-            "scenario {id} not yet implemented (step 3i.1.c lands S1; \
+        ScenarioId::S2 => {
+            let expected = input.expected_outputs_s2.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S2 requires ScenarioInput::expected_outputs_s2 \
+                     (AC-15 verification target)"
+                )
+            })?;
+            s2_full_rescan::run(mode, expected)
+                .await
+                .map(ScenarioOutcome::S2)
+        }
+        ScenarioId::S3 | ScenarioId::S4 | ScenarioId::S5 | ScenarioId::S6 | ScenarioId::S7 => {
+            anyhow::bail!(
+                "scenario {id} not yet implemented (step 3i.1.d/e lands S2; \
              subsequent scenarios follow in DESIGN.md swe-impl execution order)"
-        ),
+            )
+        }
     }
 }
 
