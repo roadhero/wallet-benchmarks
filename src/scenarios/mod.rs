@@ -27,6 +27,7 @@ mod s3_birthday_rescan;
 mod s4_concurrent;
 mod s5_throughput;
 mod s6_full_rescan_after;
+mod s7_birthday_rescan_after;
 
 pub use b0_baseline::B0Outcome;
 pub use s0_warmup::S0Outcome;
@@ -36,6 +37,7 @@ pub use s3_birthday_rescan::S3Outcome;
 pub use s4_concurrent::{BroadcastOutcome, S4Outcome, SubBlockOutcome, TaskOutcome};
 pub use s5_throughput::{ArmOutcome, S5Arms, S5Outcome};
 pub use s6_full_rescan_after::S6Outcome;
+pub use s7_birthday_rescan_after::S7Outcome;
 
 use tari_common_types::tari_address::TariAddress;
 
@@ -214,6 +216,20 @@ pub struct ScenarioInput {
     /// preference. `None` for dispatches that don't need it; the S6 arm
     /// bails with a clear error if `None`.
     pub s6_expected_outputs: Option<u64>,
+    /// AC-16-mirror verification target for S7: same value as
+    /// `s6_expected_outputs` (S1 net + S5 net — chain state is
+    /// unchanged between S6 and S7). Kept as a separate slot per the
+    /// duplicate-with-purpose preference (S7 runs after S6, but
+    /// conceptually verifies the same target as S6 with a different
+    /// scan window). `None` for dispatches that don't need it; the
+    /// S7 arm bails with a clear error if `None`.
+    pub s7_expected_outputs: Option<u64>,
+    /// AC-16-mirror birthday target for S7: same shape as `h_birth_s3`
+    /// (S0's funding height encoded as days-since-2022-01-01, `u16`).
+    /// Kept as a separate slot per duplicate-with-purpose. `None` for
+    /// dispatches that don't need it; the S7 arm bails with a clear
+    /// error if `None`.
+    pub s7_h_birth: Option<u16>,
 }
 
 /// Canonical ordering of the 9 scenario IDs that make up each mode's column
@@ -309,8 +325,9 @@ pub enum ScenarioOutcome {
     S5(S5Outcome),
     /// S6 — wipe + birthday=0 + full-history rescan after S5.
     S6(S6Outcome),
-    // Subsequent variants land per `DESIGN.md §swe-impl execution order`:
-    //   …      → S7
+    /// S7 — wipe + birthday=`h_birth` + post-funding-height rescan
+    /// after S5.
+    S7(S7Outcome),
 }
 
 /// Run the named scenario against the given mode.
@@ -389,10 +406,21 @@ pub async fn run_scenario(
                 .map(ScenarioOutcome::S6)
         }
         ScenarioId::S7 => {
-            anyhow::bail!(
-                "scenario {id} not yet implemented (step 3i.1.h lands S6; \
-             S7 follows in DESIGN.md swe-impl execution order)"
-            )
+            let expected = input.s7_expected_outputs.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S7 requires ScenarioInput::s7_expected_outputs \
+                     (S1 net + S5 net; AC-16-mirror verification target)"
+                )
+            })?;
+            let h_birth = input.s7_h_birth.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ScenarioId::S7 requires ScenarioInput::s7_h_birth \
+                     (S0's funding height, u16 days-since-2022-01-01)"
+                )
+            })?;
+            s7_birthday_rescan_after::run(mode, expected, h_birth)
+                .await
+                .map(ScenarioOutcome::S7)
         }
     }
 }
