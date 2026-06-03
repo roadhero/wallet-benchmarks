@@ -1,0 +1,4 @@
+[submodule "vendor/minotari_payment_processor"]
+	path = vendor/minotari_payment_processor
+	url = https://github.com/tari-project/minotari_payment_processor.git
+	branch = main
