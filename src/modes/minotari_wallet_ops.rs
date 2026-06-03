@@ -52,6 +52,7 @@ use tari_common_types::seeds::{
     mnemonic::{Mnemonic, MnemonicLanguage},
     seed_words::SeedWords,
 };
+use tari_transaction_components::tari_amount::MicroMinotari;
 use tokio::process::Command;
 
 use crate::{config::Config, wallet_lifecycle::HarnessDataDir};
@@ -438,85 +439,37 @@ pub(super) async fn run_balance_subprocess(cfg: &Config, data_dir: &Path) -> any
 /// * `"{n.nnnnnn} T"` — `Minotari::Display` (delegated by MicroMinotari when
 ///   total ≥ 1 T), 6 decimal places.
 ///
-/// The parser tries µT first (lossless u64), then falls back to T (parse
-/// decimal, multiply by 1_000_000). Anchor strategy (a) per
-/// `analysis/DESIGN_AMENDMENT.md §8.3` — robust to label renames as long as
-/// the unit sentinel survives.
+/// Both forms parse cleanly through the upstream
+/// [`MicroMinotari::from_str`] impl in `tari_transaction_components` 5.3.1
+/// (see `tari_amount.rs:184-210`): the impl strips whitespace + lowercases,
+/// then dispatches to either a lossless `u64` parse (µT branch) or a
+/// `Decimal::from_str → Minotari::try_from` chain (T branch, which
+/// inherently rejects fractional precision > 6 digits). Per @SWvheerden's
+/// 2026-05-29 12:56 review on PR #6: "it should be on the type and from
+/// string." Anchor strategy (a) preserved per `analysis/DESIGN_AMENDMENT.md
+/// §8.3` — the regex extracts the unit-sentinel substring; from_str handles
+/// the rest.
 fn parse_balance_microtari(stdout: &str) -> anyhow::Result<u64> {
-    static MICROTARI_RE: OnceLock<Regex> = OnceLock::new();
-    static TARI_RE: OnceLock<Regex> = OnceLock::new();
-    let micro_re = MICROTARI_RE.get_or_init(|| {
-        // Match `{n} µT` — the unit sentinel for MicroMinotari < 1 T.
-        Regex::new(r"(\d+)\s*µT").expect("microtari regex compiles")
+    static BALANCE_RE: OnceLock<Regex> = OnceLock::new();
+    // µT MUST come before bare T in the alternation — otherwise
+    // `"500000 µT"` matches the T branch and is parsed as
+    // `"500000 T" = 500_000_000_000 µT`.
+    let re = BALANCE_RE.get_or_init(|| {
+        Regex::new(r"(\d+(?:\.\d+)?\s*(?:µT|T))\b").expect("balance regex compiles")
     });
-    let tari_re = TARI_RE.get_or_init(|| {
-        // Match `{n.nnnnnn} T` — the unit sentinel for Minotari ≥ 1 T.
-        // The decimal portion is optional so future formatter precision changes
-        // (e.g. zero precision printing `12 T`) still parse.
-        Regex::new(r"(\d+(?:\.\d+)?)\s*T(?:\b|$)").expect("tari regex compiles")
-    });
-    if let Some(cap) = micro_re.captures(stdout) {
-        if let Some(m) = cap.get(1) {
-            return m
-                .as_str()
-                .parse::<u64>()
-                .with_context(|| format!("parsing µT number from {:?}", m.as_str()));
-        }
-    }
-    if let Some(cap) = tari_re.captures(stdout) {
-        if let Some(m) = cap.get(1) {
-            return parse_tari_decimal_to_microtari(m.as_str())
-                .with_context(|| format!("parsing T decimal from {:?}", m.as_str()));
-        }
-    }
-    anyhow::bail!(
-        "no balance amount matched (looked for `{{n}} µT` and `{{n.nnnnnn}} T`); \
-         stdout was {stdout:?}",
-    )
-}
-
-/// Convert a decimal Tari amount string (e.g. `"10.000001"`, `"0.5"`,
-/// `"10000000"`) into microtari (u64) **without f64 intermediate** — f64
-/// loses precision above 2^53 (≈ 9 PT) and rounds awkwardly for amounts
-/// like `10.000001 T` where the fractional `0.000001 * 1_000_000` can
-/// land at `0.9999...` after multiplication.
-///
-/// Strategy: split on `'.'`, parse integer and fractional parts as u64,
-/// scale the fractional part by `10^(6 - len(fractional))`, sum.
-/// Rejects fractional parts longer than 6 digits — precision below 1 µT
-/// isn't representable.
-fn parse_tari_decimal_to_microtari(s: &str) -> anyhow::Result<u64> {
-    const MICROTARI_PER_TARI: u64 = 1_000_000;
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    let int_value: u64 = int_part
-        .parse()
-        .with_context(|| format!("parsing integer part {int_part:?}"))?;
-    let int_microtari = int_value.checked_mul(MICROTARI_PER_TARI).ok_or_else(|| {
-        anyhow::anyhow!("integer Tari amount {int_value} overflows u64 microtari")
+    let cap = re.captures(stdout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no balance amount matched (looked for `{{n}} µT` or `{{n.nnnnnn}} T`); \
+             stdout was {stdout:?}",
+        )
     })?;
-    if frac_part.is_empty() {
-        return Ok(int_microtari);
-    }
-    if frac_part.len() > 6 {
-        anyhow::bail!(
-            "fractional part {frac_part:?} exceeds 6 digits — precision below 1 µT \
-             is not representable in MicroMinotari",
-        );
-    }
-    let frac_value: u64 = frac_part
-        .parse()
-        .with_context(|| format!("parsing fractional part {frac_part:?}"))?;
-    // Right-pad: "5" → 500_000; "000001" → 1.
-    let scale = 10u64.pow((6 - frac_part.len()) as u32);
-    let frac_microtari = frac_value
-        .checked_mul(scale)
-        .ok_or_else(|| anyhow::anyhow!("fractional {frac_value} × {scale} overflows u64"))?;
-    int_microtari
-        .checked_add(frac_microtari)
-        .ok_or_else(|| anyhow::anyhow!("int + fractional microtari overflow"))
+    let amount_str = cap
+        .get(1)
+        .ok_or_else(|| anyhow::anyhow!("balance regex matched but group 1 missing"))?
+        .as_str();
+    let amount = MicroMinotari::from_str(amount_str)
+        .map_err(|e| anyhow::anyhow!("MicroMinotari::from_str({amount_str:?}): {e}"))?;
+    Ok(amount.as_u64())
 }
 
 #[cfg(test)]
