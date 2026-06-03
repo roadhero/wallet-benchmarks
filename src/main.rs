@@ -28,6 +28,7 @@ use wallet_benchmarks::{
     gen_seed, guards,
     modes::{
         new_wallet::NewWallet, old_wallet::OldWallet, payment_processor::PaymentProcessor, Mode,
+        UnsupportedOperation,
     },
     print_address,
     result_profile::{self, CellResult, Matrix},
@@ -147,7 +148,20 @@ async fn run_harness_async(
     let mut matrix = Matrix::new();
     for mode_role in [SeedRole::Old, SeedRole::New, SeedRole::Pp] {
         log::info!(target: LOG_TARGET, "running scenarios for mode {mode_role:?}");
-        let mut mode = construct_mode(mode_role, &config, &seeds)?;
+        // Build the mode. Mode 3 returns a concretely-typed PaymentProcessor
+        // (carried inside a generic ModeHandle) so the run loop can call
+        // start_external_services + shutdown without downcasting through
+        // the Mode trait object.
+        let mut mode_handle = construct_mode(mode_role, &config, &seeds)?;
+        // Mode 3 needs the PR + PP child processes spawned before the
+        // scenario loop runs. PaymentProcessor::start_external_services
+        // boots both lifecycles and waits for their HTTP readiness probes
+        // per analysis/specs/MODE_3_REWORK_SPEC.md §2 step 4.
+        if let ModeHandle::Mode3(pp) = &mut mode_handle {
+            pp.start_external_services()
+                .await
+                .context("Mode 3 start_external_services")?;
+        }
         let mut scenario_input = ScenarioInput {
             s5_seed_role_for_mode: Some(mode_role),
             ..ScenarioInput::default()
@@ -188,8 +202,13 @@ async fn run_harness_async(
                 sampler_factory: Some(&sampler_factory),
             };
             let t0 = Instant::now();
-            let outcome =
-                scenarios::run_scenario(scenario_id, &ctx, mode.as_mut(), &scenario_input).await;
+            let outcome = scenarios::run_scenario(
+                scenario_id,
+                &ctx,
+                mode_handle.as_mode_mut(),
+                &scenario_input,
+            )
+            .await;
             let wall_clock_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
 
             let (tip_end, tip_query_note_end) = if needs_outer_tip {
@@ -215,11 +234,26 @@ async fn run_harness_async(
                     (CellResult::Outcome(Box::new(o)), fees)
                 }
                 Err(e) => {
-                    log::warn!(
-                        target: LOG_TARGET,
-                        "{scenario_id} for {mode_role:?} returned Err: {e:#}",
-                    );
-                    (CellResult::Error(e), 0)
+                    // Mode 3's scan-shaped methods return UnsupportedOperation
+                    // (see analysis/specs/MODE_3_REWORK_SPEC.md §7); the
+                    // runner records the cell as NotRun rather than Error so
+                    // the result-profile emits null (not a failure) for the
+                    // skipped scenario. Mode 1's S5-batch-arm uses the same
+                    // precedent via arms.batch.applies = false.
+                    if let Some(uo) = e.downcast_ref::<UnsupportedOperation>() {
+                        log::info!(
+                            target: LOG_TARGET,
+                            "{scenario_id} for {mode_role:?} skipped: {} (op={}, mode={})",
+                            uo.reason, uo.op, uo.mode,
+                        );
+                        (CellResult::NotRun, 0)
+                    } else {
+                        log::warn!(
+                            target: LOG_TARGET,
+                            "{scenario_id} for {mode_role:?} returned Err: {e:#}",
+                        );
+                        (CellResult::Error(e), 0)
+                    }
                 }
             };
             matrix.record(
@@ -232,6 +266,16 @@ async fn run_harness_async(
                 tip_query_note,
                 fees,
             );
+        }
+        // Mode 3 shutdown: poll terminal state, SIGTERM the children, then
+        // proceed. Best-effort — see analysis/specs/MODE_3_REWORK_SPEC.md §9.
+        if let ModeHandle::Mode3(mut pp) = mode_handle {
+            if let Err(e) = pp.shutdown().await {
+                log::warn!(
+                    target: LOG_TARGET,
+                    "Mode 3 shutdown returned an error: {e:#} (proceeding)",
+                );
+            }
         }
     }
 
@@ -248,21 +292,53 @@ async fn run_harness_async(
     Ok(())
 }
 
-/// Construct the [`Mode`] for a given role.
+/// Owning wrapper for the per-mode handle the run loop holds.
+///
+/// Mode 1/2 are pure trait-object wrappers — the per-mode lifecycle is
+/// either internal to the boxed Mode (Mode 1's `ConsoleWalletLifecycle`)
+/// or absent (Mode 2 is stateless). Mode 3 owns two child processes that
+/// must be explicitly spawned before the scenario loop and torn down
+/// after; the run loop calls
+/// [`PaymentProcessor::start_external_services`] +
+/// [`PaymentProcessor::shutdown`] through this enum's `Mode3` arm without
+/// downcasting through the `Mode` trait object.
+enum ModeHandle {
+    Mode1(Box<OldWallet>),
+    Mode2(Box<NewWallet>),
+    Mode3(Box<PaymentProcessor>),
+}
+
+impl ModeHandle {
+    /// Borrow as a `&mut dyn Mode` for `scenarios::run_scenario`.
+    fn as_mode_mut(&mut self) -> &mut dyn Mode {
+        match self {
+            Self::Mode1(m) => m.as_mut(),
+            Self::Mode2(m) => m.as_mut(),
+            Self::Mode3(m) => m.as_mut(),
+        }
+    }
+}
+
+/// Construct the per-mode handle for a given role.
 ///
 /// Mode 1 (Old) wraps a [`ConsoleWalletLifecycle`] — spawn happens lazily
 /// inside the lifecycle's `WalletLifecycle::spawn` trait method, invoked
 /// by the scenarios as needed. Drop on the returned trait object tears
 /// the lifecycle down (SIGTERM grace + SIGKILL).
 ///
-/// Mode 2/3 (New / Pp) are stateless subprocess invokers — each
+/// Mode 2 (New) is a stateless subprocess invoker — each
 /// `send_*` / `scan_*` call spawns its own `minotari` subprocess via
 /// `create_sign_and_submit`.
+///
+/// Mode 3 (Pp) spawns two child processes (PR + PP) that the run loop
+/// brings up via `PaymentProcessor::start_external_services` after this
+/// function returns and tears down via `PaymentProcessor::shutdown` after
+/// the scenario loop completes.
 fn construct_mode(
     role: SeedRole,
     config: &Arc<Config>,
     seeds: &Arc<SeedHandle>,
-) -> anyhow::Result<Box<dyn Mode>> {
+) -> anyhow::Result<ModeHandle> {
     let run_id = format!(
         "{}_{}",
         std::process::id(),
@@ -278,23 +354,30 @@ fn construct_mode(
     };
     let data_dir = HarnessDataDir::new(&run_id, mode_name)?;
 
-    let mode: Box<dyn Mode> = match role {
+    let handle = match role {
         SeedRole::Old => {
             let lifecycle = ConsoleWalletLifecycle::new(config, seeds, data_dir)?;
-            Box::new(OldWallet::new(lifecycle))
+            ModeHandle::Mode1(Box::new(OldWallet::new(lifecycle)))
         }
-        SeedRole::New => Box::new(NewWallet::new(
+        SeedRole::New => ModeHandle::Mode2(Box::new(NewWallet::new(
             (**config).clone(),
             (**seeds).clone(),
             data_dir,
-        )),
-        SeedRole::Pp => Box::new(PaymentProcessor::new(
-            (**config).clone(),
-            (**seeds).clone(),
-            data_dir,
-        )),
+        ))),
+        SeedRole::Pp => {
+            // Mode 3 needs a second data dir for the PR daemon's view-key
+            // wallet — distinct from PP's so sqlite locks cannot collide
+            // (spec §14 failure mode #6).
+            let pr_data_dir = HarnessDataDir::new(&run_id, "payment_processor_pr")?;
+            ModeHandle::Mode3(Box::new(PaymentProcessor::new(
+                (**config).clone(),
+                (**seeds).clone(),
+                data_dir,
+                pr_data_dir,
+            )?))
+        }
     };
-    Ok(mode)
+    Ok(handle)
 }
 
 /// Best-effort version probe. Failures degrade to

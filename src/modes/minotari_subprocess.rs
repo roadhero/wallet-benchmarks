@@ -97,7 +97,15 @@ pub(super) enum SeedRole {
     Old,
     /// New-wallet mode seed (`SeedHandle::mnemonic_new`) — Mode 2.
     New,
-    /// Payment-processor seed (`SeedHandle::mnemonic_payment_processor`) — Mode 3.
+    /// Payment-processor seed (`SeedHandle::mnemonic_payment_processor`).
+    /// Per `analysis/specs/MODE_3_REWORK_SPEC.md §15`, this variant is
+    /// re-purposed for the PP signer wallet PP shells out to via
+    /// `CONSOLE_WALLET_PATH`. The harness reaches the slot via
+    /// `SeedHandle::mnemonic_payment_processor` from PP's CONSOLE_WALLET_*
+    /// env matrix — the old Mode 3 shim that ran the offline-sign pipeline
+    /// against this seed is gone, but the slot remains as the source of
+    /// truth for the PP signer's seed.
+    #[allow(dead_code)]
     Pp,
 }
 
