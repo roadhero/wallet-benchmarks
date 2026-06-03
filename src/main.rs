@@ -104,10 +104,14 @@ async fn run_harness_async(
     output_path: PathBuf,
     skip_funding_preflight: bool,
 ) -> anyhow::Result<()> {
-    // 1. Load config + run mainnet-protection guard.
+    // 1. Load config + run mainnet-protection guard + cross-field validation.
     let config_owned: Config = wallet_benchmarks::config::load::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
     guards::enforce_esmeralda(&config_owned).context("enforce_esmeralda pre-flight")?;
+    // Mode 3 binary paths + bench-account env vars are validated here so a
+    // misconfiguration surfaces before the per-mode loop spawns anything.
+    // See analysis/specs/MODE_3_REWORK_SPEC.md §12 startup-validation list.
+    config_owned.validate().context("Config::validate")?;
     let config = Arc::new(config_owned);
 
     // 2. Build SeedHandle + assert the three seeds are distinct.

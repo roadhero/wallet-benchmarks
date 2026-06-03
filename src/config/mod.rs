@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -331,6 +332,17 @@ impl Config {
     fn default_s1_amount_per_tx_microtari() -> u64 {
         defaults::S1_AMOUNT_PER_TX_MICROTARI
     }
+
+    /// Validate cross-field invariants after deserialization. Currently
+    /// runs [`Mode3Config::validate`] when Mode 3 config is present —
+    /// hard-fails on missing binary paths or unset bench-account env
+    /// vars per `analysis/specs/MODE_3_REWORK_SPEC.md §12`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(m) = self.mode_3.as_ref() {
+            m.validate().context("validating mode_3 config")?;
+        }
+        Ok(())
+    }
 }
 
 impl Mode3Config {
@@ -343,6 +355,56 @@ impl Mode3Config {
     fn default_terminal_poll_timeout() -> u64 {
         60
     }
+
+    /// Startup validation per `analysis/specs/MODE_3_REWORK_SPEC.md §12`.
+    ///
+    /// Bails when:
+    /// * `pp_binary_path` does not exist or is not a regular file.
+    /// * `minotari_binary_path` does not exist or is not a regular file.
+    /// * either bench-account env var (view key or public spend key) is
+    ///   unset at validation time.
+    ///
+    /// Failure mode #1 + #10 per spec §14. Called by [`Config::validate`]
+    /// when [`Config::mode_3`] is `Some` so a missing path / env var
+    /// surfaces before any subprocess is spawned.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure_executable(&self.pp_binary_path, "mode_3.pp_binary_path")?;
+        ensure_executable(&self.minotari_binary_path, "mode_3.minotari_binary_path")?;
+        let view_key_env = &self.accounts.bench.view_key_env;
+        std::env::var(view_key_env).map_err(|e| {
+            anyhow::anyhow!(
+                "mode_3.accounts.bench.view_key_env=${view_key_env} unset ({e}); set the hex \
+                 view key in the env var before running Mode 3 (see \
+                 analysis/specs/MODE_3_REWORK_SPEC.md §12)"
+            )
+        })?;
+        let spend_key_env = &self.accounts.bench.public_spend_key_env;
+        std::env::var(spend_key_env).map_err(|e| {
+            anyhow::anyhow!(
+                "mode_3.accounts.bench.public_spend_key_env=${spend_key_env} unset ({e}); set \
+                 the hex public spend key in the env var before running Mode 3"
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn ensure_executable(path: &std::path::Path, key: &str) -> anyhow::Result<()> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{key}={} not found or not accessible: {e:#} (see analysis/specs/MODE_3_REWORK_SPEC.md \
+             §14 failure mode #1 / Phase 0 setup)",
+            path.display(),
+        )
+    })?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "{key}={} exists but is not a regular file (got file_type {:?}); set it to the binary \
+         path",
+        path.display(),
+        meta.file_type(),
+    );
+    Ok(())
 }
 
 impl Mode3Account {

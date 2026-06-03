@@ -1,0 +1,45 @@
+# wallet-benchmarks harness configuration — example.
+#
+# Copy to `harness.toml` and adjust per host. Every field is optional;
+# omitted fields fall back to the documented defaults (see
+# `analysis/RESULT_PROFILE_SCHEMA.md §1` and `src/config/mod.rs`). The
+# `[mode_3]` block is required only when the operator runs Mode 3
+# (`payment_processor`) scenarios end-to-end; the loop validates
+# Config::mode_3 is Some at startup before spawning either child.
+#
+# Secrets (seed mnemonics, wallet password, hex view / spend keys) live
+# in environment variables; only the env var *names* live here, per
+# analysis/DESIGN.md §Secret handling and analysis/specs/MODE_3_REWORK_SPEC.md
+# §12. Set the named env vars before invoking `wallet-benchmarks run`.
+
+network = "esmeralda"
+base_node_url = "https://rpc.esmeralda.tari.com"
+
+# Mode 1 (old_wallet) and Mode 2 (new_wallet) binaries. When unset the
+# harness resolves them via $PATH.
+# minotari_console_wallet_path = "/usr/local/bin/minotari_console_wallet"
+# minotari_path = "/usr/local/bin/minotari"
+
+# Mode 3 (payment_processor) — required when running Mode 3.
+[mode_3]
+pp_binary_path = "/tmp/tari-pp-build/pp/target/release/minotari_payment_processor"
+minotari_binary_path = "/usr/local/bin/minotari"
+api_port = 9145
+pr_port = 9146
+terminal_state_poll_timeout_secs = 60
+
+# Per-worker sleep overrides (seconds). Each `null` lets PP keep its
+# hardcoded default; the bench values below drive PP as fast as it goes.
+[mode_3.worker_sleep_overrides]
+batch_creator = 1
+unsigned_tx_creator = 1
+transaction_signer = 1
+broadcaster = 1
+confirmation_checker = 5
+
+# Single PP account. Multi-account is out of scope for v1 per
+# MODE_3_REWORK_SPEC.md §15. The two `*_env` fields name env vars
+# holding the hex view key and the hex public spend key.
+[mode_3.accounts.bench]
+view_key_env = "TARI_BENCH_VIEW_KEY"
+public_spend_key_env = "TARI_BENCH_SPEND_KEY"
