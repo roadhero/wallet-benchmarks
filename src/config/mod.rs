@@ -148,6 +148,119 @@ pub struct Config {
     /// operator can point each at the local build location.
     #[serde(default)]
     pub minotari_path: Option<PathBuf>,
+
+    /// Mode 3 (`payment_processor`) configuration. Required when running
+    /// Mode 3 scenarios — the run loop bails at startup if this is absent and
+    /// Mode 3 is in the scenario list. See
+    /// `analysis/specs/MODE_3_REWORK_SPEC.md §12` for the field-by-field
+    /// rationale and default-value provenance.
+    #[serde(default)]
+    pub mode_3: Option<Mode3Config>,
+}
+
+/// Mode 3 — `payment_processor` — configuration.
+///
+/// Per `MODE_3_REWORK_SPEC.md §12`, Mode 3 spawns a `minotari_payment_processor`
+/// (PP) daemon and a `minotari daemon` (PR) child process. Both binaries are
+/// pre-built by the operator (Phase 0); the harness only references their
+/// paths and reads the per-account view-key + spend-public-key hex pair from
+/// the env var names recorded under [`Mode3Config::accounts`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Mode3Config {
+    /// Absolute path to the `minotari_payment_processor` binary. Required;
+    /// `Config::load` (or per-Mode validation at startup) refuses to proceed
+    /// when this points at a non-existent file.
+    pub pp_binary_path: PathBuf,
+
+    /// Absolute path to the `minotari` (minotari-cli) binary used to spawn
+    /// the PR daemon (`minotari daemon ...`) and run the one-shot
+    /// `minotari import-view-key` step. Distinct from
+    /// [`Mode3Config::pp_binary_path`]: PR ships in `tari-project/minotari-cli`,
+    /// PP ships in `tari-project/minotari_payment_processor`. Most installs
+    /// will set this to the same path the existing Mode 2 harness already
+    /// uses via [`Config::minotari_path`], but Mode 3 keeps the override
+    /// separate so the operator can co-locate independent builds.
+    pub minotari_binary_path: PathBuf,
+
+    /// PP HTTP listen port. Default 9145.
+    #[serde(default = "Mode3Config::default_api_port")]
+    pub api_port: u16,
+
+    /// PR daemon HTTP listen port. Default 9146. NOTE: `minotari daemon`
+    /// binds `0.0.0.0:<pr_port>` (no `--listen-ip` flag); on a shared host
+    /// the operator must local-firewall this port. The harness cannot
+    /// enforce binding to loopback.
+    #[serde(default = "Mode3Config::default_pr_port")]
+    pub pr_port: u16,
+
+    /// Per-payment terminal-state poll timeout at shutdown (seconds).
+    /// After all S4/S5 sends, the run loop polls each submitted payment
+    /// for [`crate::pp_http_client::PaymentStatus::is_terminal`]; the
+    /// shutdown logs a warn and proceeds once this deadline elapses.
+    #[serde(default = "Mode3Config::default_terminal_poll_timeout")]
+    pub terminal_state_poll_timeout_secs: u64,
+
+    /// PP worker sleep overrides. Defaults to bench values
+    /// (1/1/1/1/5 seconds for batch_creator / unsigned_tx_creator /
+    /// transaction_signer / broadcaster / confirmation_checker) per
+    /// `MODE_3_REWORK_SPEC.md §8`.
+    #[serde(default)]
+    pub worker_sleep_overrides: WorkerSleepOverrides,
+
+    /// PP account map. v1 hard-codes a single `bench` account; multi-account
+    /// support is an out-of-scope extension.
+    #[serde(default)]
+    pub accounts: Mode3Accounts,
+}
+
+/// PP account map carried under [`Mode3Config::accounts`]. v1 ships a single
+/// `bench` account; the struct exists so future multi-account expansion is a
+/// non-breaking field addition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Mode3Accounts {
+    /// The bench account PP and the PR daemon both watch.
+    #[serde(default)]
+    pub bench: Mode3Account,
+}
+
+/// Names of the env vars holding the hex view key and public spend key for a
+/// single PP account.
+///
+/// Per `MODE_3_REWORK_SPEC.md §12`, view keys are secret-adjacent (a view key
+/// reveals all incoming amounts/addresses for the account) so the values
+/// themselves never live in TOML — only the env var names do, mirroring the
+/// existing [`Seeds`] convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Mode3Account {
+    /// Env var name holding the hex view key.
+    #[serde(default = "Mode3Account::default_view_key_env")]
+    pub view_key_env: String,
+    /// Env var name holding the hex public spend key.
+    #[serde(default = "Mode3Account::default_spend_key_env")]
+    pub public_spend_key_env: String,
+}
+
+/// Per-worker sleep overrides for the PP daemon. Each `Option<u64>` is the
+/// number of seconds the named worker sleeps between iterations; `None` lets
+/// PP fall back to its hardcoded default. Defaults here match the bench's
+/// "drive PP as fast as it'll go" posture per `MODE_3_REWORK_SPEC.md §8`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSleepOverrides {
+    /// `BATCH_CREATOR_SLEEP_SECS`. Default 1 (PP's default is 600).
+    #[serde(default = "WorkerSleepOverrides::default_batch_creator")]
+    pub batch_creator: Option<u64>,
+    /// `UNSIGNED_TX_CREATOR_SLEEP_SECS`. Default 1 (PP's default is 15).
+    #[serde(default = "WorkerSleepOverrides::default_unsigned_tx_creator")]
+    pub unsigned_tx_creator: Option<u64>,
+    /// `TRANSACTION_SIGNER_SLEEP_SECS`. Default 1 (PP's default is 10).
+    #[serde(default = "WorkerSleepOverrides::default_transaction_signer")]
+    pub transaction_signer: Option<u64>,
+    /// `BROADCASTER_SLEEP_SECS`. Default 1 (PP's default is 15).
+    #[serde(default = "WorkerSleepOverrides::default_broadcaster")]
+    pub broadcaster: Option<u64>,
+    /// `CONFIRMATION_CHECKER_SLEEP_SECS`. Default 5 (PP's default is 60).
+    #[serde(default = "WorkerSleepOverrides::default_confirmation_checker")]
+    pub confirmation_checker: Option<u64>,
 }
 
 /// Names of the environment variables holding seed mnemonics and the wallet
@@ -220,6 +333,66 @@ impl Config {
     }
 }
 
+impl Mode3Config {
+    fn default_api_port() -> u16 {
+        9145
+    }
+    fn default_pr_port() -> u16 {
+        9146
+    }
+    fn default_terminal_poll_timeout() -> u64 {
+        60
+    }
+}
+
+impl Mode3Account {
+    fn default_view_key_env() -> String {
+        "TARI_BENCH_VIEW_KEY".to_string()
+    }
+    fn default_spend_key_env() -> String {
+        "TARI_BENCH_SPEND_KEY".to_string()
+    }
+}
+
+impl Default for Mode3Account {
+    fn default() -> Self {
+        Self {
+            view_key_env: Self::default_view_key_env(),
+            public_spend_key_env: Self::default_spend_key_env(),
+        }
+    }
+}
+
+impl WorkerSleepOverrides {
+    fn default_batch_creator() -> Option<u64> {
+        Some(1)
+    }
+    fn default_unsigned_tx_creator() -> Option<u64> {
+        Some(1)
+    }
+    fn default_transaction_signer() -> Option<u64> {
+        Some(1)
+    }
+    fn default_broadcaster() -> Option<u64> {
+        Some(1)
+    }
+    fn default_confirmation_checker() -> Option<u64> {
+        Some(5)
+    }
+}
+
+impl Default for WorkerSleepOverrides {
+    fn default() -> Self {
+        Self {
+            batch_creator: Self::default_batch_creator(),
+            unsigned_tx_creator: Self::default_unsigned_tx_creator(),
+            transaction_signer: Self::default_transaction_signer(),
+            broadcaster: Self::default_broadcaster(),
+            confirmation_checker: Self::default_confirmation_checker(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -241,6 +414,7 @@ impl Default for Config {
             seeds: Seeds::default(),
             minotari_console_wallet_path: None,
             minotari_path: None,
+            mode_3: None,
         }
     }
 }
@@ -302,6 +476,7 @@ mod tests {
         assert_eq!(cfg.seeds.wallet_password, "HARNESS_WALLET_PW");
         assert_eq!(cfg.minotari_console_wallet_path, None);
         assert_eq!(cfg.minotari_path, None);
+        assert!(cfg.mode_3.is_none());
     }
 
     #[test]
@@ -350,6 +525,7 @@ mod tests {
                 "/opt/tari/bin/minotari_console_wallet",
             )),
             minotari_path: Some(PathBuf::from("/opt/tari/bin/minotari")),
+            mode_3: None,
         };
         let serialized = toml::to_string(&original).expect("serialize");
         let reloaded: Config = toml::from_str(&serialized).expect("round-trip");
