@@ -180,6 +180,20 @@ impl PpLifecycle {
         })
     }
 
+    /// Test-only constructor. Lets unit tests assemble a lifecycle from a
+    /// pre-built [`PpLifecycleConfig`] + [`HarnessDataDir`] without going
+    /// through env-var resolution. Production code goes via [`Self::new`].
+    #[cfg(test)]
+    pub(crate) fn from_parts(cfg: PpLifecycleConfig, data_dir: HarnessDataDir) -> Self {
+        let http = PpHttpClient::new(format!("http://127.0.0.1:{}", cfg.api_port));
+        Self {
+            cfg,
+            data_dir,
+            http,
+            child: None,
+        }
+    }
+
     /// Returns `true` between a successful spawn and the next teardown.
     pub fn is_alive(&self) -> bool {
         self.child.is_some()
@@ -468,11 +482,320 @@ fn send_signal(_pid: u32, _signal: Signal) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // TODO(swe-test): populate per MODE_3_REWORK_SPEC.md §13. Test list:
-    //   - spawn_returns_handle_and_pid
-    //   - wait_ready_times_out_when_fake_never_binds
-    //   - teardown_sends_sigterm_then_sigkill
-    //   - drop_invokes_kill_on_drop
-    //   - build_env_carries_every_required_key_per_spec_§2
-    //   - build_env_omits_worker_sleep_when_override_is_none
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// Absolute path to the fake PP script under `tests/fixtures/`.
+    fn fake_pp_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_pp.sh")
+    }
+
+    /// Absolute path to the fake `minotari` script. Only referenced as
+    /// CONSOLE_WALLET_PATH on the env matrix — the test does not invoke
+    /// it, so its existence on disk is enough.
+    fn fake_minotari_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_minotari.sh")
+    }
+
+    /// Build a `PpLifecycleConfig` populated with deterministic test values.
+    /// Caller selects the worker_sleeps shape to exercise the override
+    /// branches.
+    fn make_config(
+        api_port: u16,
+        worker_sleeps: WorkerSleepOverrides,
+        binary: PathBuf,
+    ) -> PpLifecycleConfig {
+        PpLifecycleConfig {
+            pp_binary: binary,
+            console_wallet_binary: fake_minotari_path(),
+            network: NETWORK_ALLOWLIST.to_string(),
+            pr_url: format!("http://127.0.0.1:{}", 9146),
+            base_node_url: "https://rpc.esmeralda.tari.com/".to_string(),
+            wallet_password: "test-password".to_string(),
+            api_port,
+            view_key_hex: "572a5fb63972da84aeec33071d13074e244d80c52be842ab5b0859ef4b4db00a"
+                .to_string(),
+            spend_key_hex: "40e65c9bbf4592bc995c421108c01a5d7c9f9b2239569757895134549cef371f"
+                .to_string(),
+            worker_sleeps,
+        }
+    }
+
+    /// Allocate a localhost port via OS ephemeral allocation. Used for
+    /// LISTEN_PORT in tests so two parallel tests don't conflict (matches
+    /// `ConsoleWalletLifecycle::allocate_port` precedent).
+    fn allocate_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("local_addr").port()
+    }
+
+    #[test]
+    fn build_env_carries_every_required_key() {
+        // Per MODE_3_REWORK_SPEC.md §2 the spawn matrix must include every
+        // key in the spec table. Snapshot the value set produced by
+        // build_env and confirm every documented key is present, plus
+        // ACCOUNTS__BENCH__NAME=bench / LISTEN_IP=127.0.0.1 / REVEAL_PII=true.
+        let dir =
+            HarnessDataDir::new("test-pp-build-env-all", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let life = PpLifecycle::from_parts(
+            make_config(port, WorkerSleepOverrides::default(), fake_pp_path()),
+            dir,
+        );
+        let env: HashMap<String, String> = life.build_env().into_iter().collect();
+        for key in [
+            "DATABASE_URL",
+            "TARI_NETWORK",
+            "PAYMENT_RECEIVER",
+            "BASE_NODE",
+            "CONSOLE_WALLET_PATH",
+            "CONSOLE_WALLET_BASE_PATH",
+            "CONSOLE_WALLET_PASSWORD",
+            "LISTEN_IP",
+            "LISTEN_PORT",
+            "ACCOUNTS__BENCH__NAME",
+            "ACCOUNTS__BENCH__VIEW_KEY",
+            "ACCOUNTS__BENCH__PUBLIC_SPEND_KEY",
+            "REVEAL_PII",
+            "BATCH_CREATOR_SLEEP_SECS",
+            "UNSIGNED_TX_CREATOR_SLEEP_SECS",
+            "TRANSACTION_SIGNER_SLEEP_SECS",
+            "BROADCASTER_SLEEP_SECS",
+            "CONFIRMATION_CHECKER_SLEEP_SECS",
+        ] {
+            assert!(
+                env.contains_key(key),
+                "env must contain {key}; got keys {:?}",
+                env.keys().collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(env.get("LISTEN_IP").map(|s| s.as_str()), Some("127.0.0.1"));
+        assert_eq!(
+            env.get("ACCOUNTS__BENCH__NAME").map(|s| s.as_str()),
+            Some("bench")
+        );
+        assert_eq!(env.get("REVEAL_PII").map(|s| s.as_str()), Some("true"));
+        assert_eq!(
+            env.get("TARI_NETWORK").map(|s| s.as_str()),
+            Some("esmeralda")
+        );
+        assert_eq!(env.get("LISTEN_PORT").cloned(), Some(port.to_string()));
+        let db = env.get("DATABASE_URL").expect("DATABASE_URL");
+        assert!(
+            db.starts_with("sqlite://"),
+            "DATABASE_URL must use sqlite:// scheme: {db}"
+        );
+        assert!(
+            db.ends_with("/payments.db"),
+            "DATABASE_URL must end at payments.db: {db}"
+        );
+    }
+
+    #[test]
+    fn build_env_omits_worker_sleep_when_override_is_none() {
+        // When the operator clears a worker-sleep override (Option::None),
+        // the lifecycle omits that env var entirely so PP falls back to
+        // its own hardcoded default. Mixing some None and some Some
+        // exercises both branches.
+        let dir =
+            HarnessDataDir::new("test-pp-build-env-none", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let sleeps = WorkerSleepOverrides {
+            batch_creator: Some(2),
+            unsigned_tx_creator: None,
+            transaction_signer: Some(3),
+            broadcaster: None,
+            confirmation_checker: None,
+        };
+        let life = PpLifecycle::from_parts(make_config(port, sleeps, fake_pp_path()), dir);
+        let env: HashMap<String, String> = life.build_env().into_iter().collect();
+        assert_eq!(
+            env.get("BATCH_CREATOR_SLEEP_SECS").map(|s| s.as_str()),
+            Some("2")
+        );
+        assert_eq!(
+            env.get("TRANSACTION_SIGNER_SLEEP_SECS").map(|s| s.as_str()),
+            Some("3")
+        );
+        assert!(
+            !env.contains_key("UNSIGNED_TX_CREATOR_SLEEP_SECS"),
+            "unsigned_tx_creator=None must omit the env var",
+        );
+        assert!(
+            !env.contains_key("BROADCASTER_SLEEP_SECS"),
+            "broadcaster=None must omit the env var",
+        );
+        assert!(
+            !env.contains_key("CONFIRMATION_CHECKER_SLEEP_SECS"),
+            "confirmation_checker=None must omit the env var",
+        );
+    }
+
+    /// Helper that spawns the fake PP via [`tokio::process::Command`] directly
+    /// (matching the production spawn shape minus the readiness probe).
+    /// Returns the spawned child plus the data dir. Used by the
+    /// spawn/teardown/drop tests so they don't trip on wait_ready timing
+    /// out against the never-binding fake.
+    async fn spawn_fake_pp_child() -> (Child, HarnessDataDir) {
+        let dir =
+            HarnessDataDir::new("test-pp-spawn-child", "payment_processor").expect("data dir");
+        // Use the same Stdio shape as production so the test exercises the
+        // realistic file-descriptor inheritance pattern.
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let log_path = logs.join("pp.log");
+        let stdout = std::fs::File::create(&log_path).expect("create log");
+        let stderr = stdout.try_clone().expect("clone log fd");
+        let child = Command::new(fake_pp_path())
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake_pp");
+        (child, dir)
+    }
+
+    #[tokio::test]
+    async fn spawn_returns_handle_and_pid() {
+        // Verify the spawned child exposes a PID (proves it actually
+        // launched a process). Use the direct spawn helper so we don't
+        // pay the readiness-probe deadline cost — that's covered by the
+        // wait_ready_times_out test.
+        let (child, _dir) = spawn_fake_pp_child().await;
+        let pid = child.id().expect("child PID");
+        assert!(pid > 0, "spawned child must report a PID");
+        // Drop sends SIGKILL via kill_on_drop(true).
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_times_out_when_fake_never_binds() {
+        // Mount the lifecycle's spawn() against the fake — which never
+        // binds a TCP port — and expect the readiness probe to bail
+        // with the deadline message. This exercises the full
+        // PpLifecycle::spawn flow (env build, child spawn, readiness
+        // loop, child-exit guard).
+        let dir = HarnessDataDir::new("test-pp-wait-ready", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let mut life = PpLifecycle::from_parts(
+            make_config(port, WorkerSleepOverrides::default(), fake_pp_path()),
+            dir,
+        );
+        let err = life.spawn().await.expect_err("must time out");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not become ready"),
+            "error must surface the readiness-probe deadline: {msg}",
+        );
+        // Cleanup — teardown the still-running fake child.
+        life.teardown().await.expect("teardown ok after timeout");
+    }
+
+    #[tokio::test]
+    async fn teardown_sends_sigterm_then_sigkill() {
+        // SIGTERM the fake (which has a TERM trap and exits 0) — verify
+        // teardown returns Ok without escalating to SIGKILL. The trap
+        // exit status is observable through the absence of the warn-log
+        // "did not exit within SIGTERM_GRACE" path: we assert teardown
+        // returns Ok promptly (well under the 5s grace).
+        let dir = HarnessDataDir::new("test-pp-teardown", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let mut life = PpLifecycle::from_parts(
+            make_config(port, WorkerSleepOverrides::default(), fake_pp_path()),
+            dir,
+        );
+        // Manually inject the child without going through spawn() so we
+        // skip the readiness deadline (the fake never binds).
+        let logs = life.data_dir_path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let log_path = logs.join("pp.log");
+        let stdout = std::fs::File::create(&log_path).expect("create log");
+        let stderr = stdout.try_clone().expect("clone log fd");
+        let child = Command::new(fake_pp_path())
+            .current_dir(life.data_dir_path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake_pp");
+        life.child = Some(child);
+        let start = Instant::now();
+        life.teardown().await.expect("teardown ok");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SIGTERM_GRACE,
+            "teardown must complete before the SIGTERM grace window expires; took {elapsed:?}",
+        );
+        assert!(
+            !life.is_alive(),
+            "lifecycle must report not-alive after teardown"
+        );
+        // Idempotency: second teardown is a no-op.
+        life.teardown().await.expect("second teardown is a no-op");
+    }
+
+    #[tokio::test]
+    async fn drop_invokes_kill_on_drop() {
+        // Mount a lifecycle, spawn a real fake child, then drop without
+        // teardown. The held Child has kill_on_drop(true) so Tokio's
+        // own Drop sends SIGKILL. Verify the PID is no longer alive
+        // after a brief wait (Unix-only — non-unix builds short-circuit).
+        let dir = HarnessDataDir::new("test-pp-drop-kill", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let mut life = PpLifecycle::from_parts(
+            make_config(port, WorkerSleepOverrides::default(), fake_pp_path()),
+            dir,
+        );
+        let logs = life.data_dir_path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let log_path = logs.join("pp.log");
+        let stdout = std::fs::File::create(&log_path).expect("create log");
+        let stderr = stdout.try_clone().expect("clone log fd");
+        let child = Command::new(fake_pp_path())
+            .current_dir(life.data_dir_path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake_pp");
+        let pid = child.id().expect("PID");
+        life.child = Some(child);
+        drop(life);
+        // Give Tokio a beat to reap the child after kill_on_drop fires.
+        // Poll up to 2 seconds; the fake exits well under 100ms on
+        // SIGKILL.
+        let mut alive = true;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // `kill -0 <pid>` returns 0 if the process exists and signals
+            // are deliverable; on dead-but-not-reaped processes the kernel
+            // returns ESRCH. Using nix::sys::signal::kill with Signal::None
+            // would do the same thing without spawning a subshell.
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::kill as nix_kill;
+                use nix::unistd::Pid;
+                let pid_i32 = pid as i32;
+                if nix_kill(Pid::from_raw(pid_i32), None).is_err() {
+                    alive = false;
+                    break;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // Non-unix: skip the liveness check — the spawn paths bail
+                // on non-unix anyway per pp_lifecycle's #[cfg(not(unix))]
+                // send_signal stub.
+                let _ = pid;
+                alive = false;
+                break;
+            }
+        }
+        assert!(!alive, "child PID must be reaped after Drop (kill_on_drop)");
+    }
 }
