@@ -215,6 +215,7 @@ mod tests {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 100,
+            sub_segments_ms: None,
         }
     }
 

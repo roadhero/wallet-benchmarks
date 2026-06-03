@@ -453,6 +453,7 @@ fn synthesize_failure_record(error_string: &str, phase: &str) -> TxRecord {
         status: format!("failure:{phase}"),
         error_string: Some(error_string.to_string()),
         fee_microtari: 0,
+        sub_segments_ms: None,
     }
 }
 
@@ -498,6 +499,7 @@ mod tests {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 0,
+            sub_segments_ms: None,
         }
     }
 
