@@ -17,9 +17,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use wallet_benchmarks::{
-    config::{
-        Config, Mode3Account, Mode3Accounts, Mode3Config, Seeds, WorkerSleepOverrides,
-    },
+    config::{Config, Mode3Account, Mode3Accounts, Mode3Config, Seeds, WorkerSleepOverrides},
     gen_seed,
     seed::SeedHandle,
     wallet_lifecycle::{pp_lifecycle::PpLifecycle, HarnessDataDir},
@@ -196,7 +194,10 @@ async fn pp_lifecycle_spawn_against_fake_times_out_then_teardown_is_clean() {
         "teardown must succeed inside the 5s SIGTERM grace; took {:?}",
         start.elapsed(),
     );
-    assert!(!life.is_alive(), "lifecycle must not be alive after teardown");
+    assert!(
+        !life.is_alive(),
+        "lifecycle must not be alive after teardown"
+    );
     // Idempotency: second teardown is a no-op.
     life.teardown().await.expect("idempotent teardown");
     teardown(&envs);

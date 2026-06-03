@@ -17,9 +17,7 @@
 use std::path::PathBuf;
 
 use wallet_benchmarks::{
-    config::{
-        Config, Mode3Account, Mode3Accounts, Mode3Config, Seeds, WorkerSleepOverrides,
-    },
+    config::{Config, Mode3Account, Mode3Accounts, Mode3Config, Seeds, WorkerSleepOverrides},
     gen_seed,
     modes::{payment_processor::PaymentProcessor, Mode, UnsupportedOperation},
     seed::SeedHandle,

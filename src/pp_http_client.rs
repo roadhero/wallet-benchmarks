@@ -495,9 +495,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/health/version"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "version": "1.2.3" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1.2.3" })))
             .mount(&server)
             .await;
         let client = PpHttpClient::new(server.uri());
@@ -585,7 +583,10 @@ mod tests {
             amount: 1000,
             payment_id: None,
         }];
-        let resp = client.submit_batch("bench", items).await.expect("submit ok");
+        let resp = client
+            .submit_batch("bench", items)
+            .await
+            .expect("submit ok");
         assert_eq!(resp.batch_id, "batch-1");
         assert_eq!(resp.payments.len(), 1);
     }
@@ -706,8 +707,11 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/payments/pay-abc"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(payment_response_json("pay-abc", "CONFIRMED", "c-abc")),
+                ResponseTemplate::new(200).set_body_json(payment_response_json(
+                    "pay-abc",
+                    "CONFIRMED",
+                    "c-abc",
+                )),
             )
             .mount(&server)
             .await;
