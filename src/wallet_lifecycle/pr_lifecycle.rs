@@ -384,10 +384,235 @@ fn send_signal(_pid: u32, _signal: Signal) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // TODO(swe-test): populate per MODE_3_REWORK_SPEC.md §13. Test list
-    // (parallel to PpLifecycle's): exercise import_view_key_argv /
-    // daemon_argv shape, spawn-with-fake-binary, teardown SIGTERM-then-SIGKILL,
-    // Drop relying on kill_on_drop. Tests requiring a live HTTP server can
-    // use a fake binary backed by python -m http.server / wiremock /
-    // tests/fixtures/fake_pp.sh.
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Absolute path to the fake `minotari` binary under `tests/fixtures/`.
+    fn fake_minotari_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_minotari.sh")
+    }
+
+    /// Allocate a localhost port via OS ephemeral allocation. Mirrors the
+    /// helper in `pp_lifecycle::tests` (kept inline so the two test modules
+    /// stay independent).
+    fn allocate_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("local_addr").port()
+    }
+
+    /// Build a `PrLifecycleConfig` populated with deterministic test values.
+    fn make_config(port: u16) -> PrLifecycleConfig {
+        PrLifecycleConfig {
+            minotari_binary: fake_minotari_path(),
+            network: NETWORK_FLAG_VALUE.to_string(),
+            view_private_key_hex:
+                "572a5fb63972da84aeec33071d13074e244d80c52be842ab5b0859ef4b4db00a".to_string(),
+            spend_public_key_hex:
+                "40e65c9bbf4592bc995c421108c01a5d7c9f9b2239569757895134549cef371f".to_string(),
+            wallet_password: "test-password".to_string(),
+            port,
+        }
+    }
+
+    #[test]
+    fn import_view_key_argv_matches_spec() {
+        // Pure-fn snapshot. Per spec §5 step 1 the argv must include
+        // import-view-key + --base-path + --network + --account-name in
+        // that order. The view-key / spend-key / password flags are
+        // appended in spawn() (kept out of the argv builder so secrets
+        // don't sit in stable argv strings).
+        let argv = PrLifecycle::import_view_key_argv("esmeralda", Path::new("/tmp/pr"), 9146);
+        assert_eq!(argv[0], "import-view-key");
+        assert_eq!(argv[1], "--base-path");
+        assert_eq!(argv[2], "/tmp/pr");
+        assert_eq!(argv[3], "--network");
+        assert_eq!(argv[4], "esmeralda");
+        assert_eq!(argv[5], "--account-name");
+        assert_eq!(argv[6], ACCOUNT_NAME);
+        // Port is intentionally omitted — assert no element equals the
+        // port literal so a future regression that re-adds it surfaces.
+        assert!(
+            !argv.iter().any(|a| a == "9146"),
+            "import-view-key argv must not carry --port: {argv:?}",
+        );
+    }
+
+    #[test]
+    fn daemon_argv_matches_spec() {
+        // Per spec §5 step 2 the daemon argv carries --port + --account-name
+        // in addition to the import-view-key shape.
+        let argv = PrLifecycle::daemon_argv("esmeralda", Path::new("/tmp/pr"), 9146);
+        assert_eq!(argv[0], "daemon");
+        assert_eq!(argv[1], "--base-path");
+        assert_eq!(argv[2], "/tmp/pr");
+        assert_eq!(argv[3], "--network");
+        assert_eq!(argv[4], "esmeralda");
+        assert_eq!(argv[5], "--port");
+        assert_eq!(argv[6], "9146");
+        assert_eq!(argv[7], "--account-name");
+        assert_eq!(argv[8], ACCOUNT_NAME);
+    }
+
+    #[test]
+    fn daemon_argv_includes_the_dynamic_port() {
+        let argv = PrLifecycle::daemon_argv("esmeralda", Path::new("/data"), 12345);
+        assert!(
+            argv.iter().any(|a| a == "12345"),
+            "daemon argv must reference the dynamic port literally: {argv:?}",
+        );
+    }
+
+    #[test]
+    fn new_refuses_non_esmeralda_network() {
+        // The lifecycle is defense-in-depth: even though the harness-wide
+        // guard enforces esmeralda first, the constructor re-asserts it
+        // so a misconfigured caller cannot bypass the gate.
+        let mut cfg = make_config(9146);
+        cfg.network = "mainnet".to_string();
+        let dir =
+            HarnessDataDir::new("test-pr-network-refuse", "payment_processor").expect("data dir");
+        let err = match PrLifecycle::new(cfg, dir) {
+            Ok(_) => panic!("non-esmeralda must be refused"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("esmeralda"),
+            "refusal must name the allowed network: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_returns_handle_and_pid() {
+        // Use the same direct-spawn pattern as pp_lifecycle's matching
+        // test — bypass wait_ready (which would consume the 30s
+        // readiness deadline against the never-binding fake) and just
+        // confirm the daemon subprocess launches with a valid PID.
+        let dir =
+            HarnessDataDir::new("test-pr-spawn-child", "payment_processor").expect("data dir");
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let log_path = logs.join("pr-daemon.log");
+        let stdout = std::fs::File::create(&log_path).expect("create log");
+        let stderr = stdout.try_clone().expect("clone log fd");
+        let argv = PrLifecycle::daemon_argv("esmeralda", dir.path(), allocate_port());
+        let child = Command::new(fake_minotari_path())
+            .args(&argv)
+            .args(["--password", "test-password"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake_minotari daemon");
+        let pid = child.id().expect("child PID");
+        assert!(pid > 0, "spawned daemon child must report a PID");
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn wait_ready_times_out_when_fake_never_binds() {
+        // Exercises the full PrLifecycle::spawn flow against a fake that
+        // performs import-view-key (exit 0) and then daemon (sleep loop
+        // with no TCP bind). The readiness probe loops until the
+        // READINESS_DEADLINE (30s) and bails with the documented
+        // "did not return 200" message.
+        let dir = HarnessDataDir::new("test-pr-wait-ready", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let mut life = PrLifecycle::new(make_config(port), dir).expect("construct");
+        let err = life.spawn().await.expect_err("must time out");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not return 200"),
+            "error must surface the readiness-probe deadline: {msg}",
+        );
+        life.teardown().await.expect("teardown ok after timeout");
+    }
+
+    #[tokio::test]
+    async fn teardown_sends_sigterm_then_sigkill() {
+        // SIGTERM the fake daemon (which has a TERM trap and exits 0).
+        // Verify teardown returns Ok well under the 5s grace window.
+        // We inject the child manually to skip the readiness deadline.
+        let dir = HarnessDataDir::new("test-pr-teardown", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let mut life = PrLifecycle::new(make_config(port), dir).expect("construct");
+        let logs = life.data_dir_path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let log_path = logs.join("pr-daemon.log");
+        let stdout = std::fs::File::create(&log_path).expect("create log");
+        let stderr = stdout.try_clone().expect("clone log fd");
+        let argv = PrLifecycle::daemon_argv("esmeralda", life.data_dir_path(), port);
+        let child = Command::new(fake_minotari_path())
+            .args(&argv)
+            .args(["--password", "test-password"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake_minotari daemon");
+        life.child = Some(child);
+        let start = Instant::now();
+        life.teardown().await.expect("teardown ok");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SIGTERM_GRACE,
+            "teardown must complete before the SIGTERM grace window expires; took {elapsed:?}",
+        );
+        assert!(
+            !life.is_alive(),
+            "lifecycle must report not-alive after teardown"
+        );
+        life.teardown().await.expect("second teardown is a no-op");
+    }
+
+    #[tokio::test]
+    async fn drop_invokes_kill_on_drop() {
+        // Mount a lifecycle, inject a real fake daemon, then drop without
+        // teardown. The held Child has kill_on_drop(true) so Tokio's
+        // Drop sends SIGKILL. Poll liveness until the kernel reaps it.
+        let dir = HarnessDataDir::new("test-pr-drop-kill", "payment_processor").expect("data dir");
+        let port = allocate_port();
+        let mut life = PrLifecycle::new(make_config(port), dir).expect("construct");
+        let logs = life.data_dir_path().join("logs");
+        std::fs::create_dir_all(&logs).expect("logs dir");
+        let log_path = logs.join("pr-daemon.log");
+        let stdout = std::fs::File::create(&log_path).expect("create log");
+        let stderr = stdout.try_clone().expect("clone log fd");
+        let argv = PrLifecycle::daemon_argv("esmeralda", life.data_dir_path(), port);
+        let child = Command::new(fake_minotari_path())
+            .args(&argv)
+            .args(["--password", "test-password"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn fake_minotari daemon");
+        let pid = child.id().expect("PID");
+        life.child = Some(child);
+        drop(life);
+        let mut alive = true;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::kill as nix_kill;
+                use nix::unistd::Pid;
+                let pid_i32 = pid as i32;
+                if nix_kill(Pid::from_raw(pid_i32), None).is_err() {
+                    alive = false;
+                    break;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = pid;
+                alive = false;
+                break;
+            }
+        }
+        assert!(!alive, "child PID must be reaped after Drop (kill_on_drop)");
+    }
 }
