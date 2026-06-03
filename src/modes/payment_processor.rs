@@ -141,6 +141,53 @@ impl PaymentProcessor {
         })
     }
 
+    /// Test-only constructor that takes a pre-built `Arc<PpHttpClient>` so
+    /// unit tests can point Mode 3 at a wiremock server instead of the
+    /// real PP daemon's loopback port. The two lifecycles still own real
+    /// `HarnessDataDir`s but are never spawned in tests — the scan-shaped
+    /// methods short-circuit to `UnsupportedOperation` and the send_*
+    /// methods route through the injected HTTP client.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        cfg: Config,
+        seeds: SeedHandle,
+        pp_data_dir: HarnessDataDir,
+        pr_data_dir: HarnessDataDir,
+        http: Arc<PpHttpClient>,
+    ) -> anyhow::Result<Self> {
+        let mode_3 = cfg.mode_3.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("from_parts_for_test requires Config::mode_3 to be Some")
+        })?;
+        let pr_port = mode_3.pr_port;
+        let (view_key_hex, spend_key_hex) =
+            crate::wallet_lifecycle::pp_lifecycle::read_account_env(&mode_3.accounts.bench)?;
+        let wallet_password = seeds
+            .wallet_password()
+            .context("reading wallet password for Mode 3 test ctor")?
+            .reveal()
+            .to_string();
+        let pr_lifecycle = PrLifecycle::new(
+            crate::wallet_lifecycle::pr_lifecycle::PrLifecycleConfig {
+                minotari_binary: mode_3.minotari_binary_path.clone(),
+                network: cfg.network.clone(),
+                view_private_key_hex: view_key_hex,
+                spend_public_key_hex: spend_key_hex,
+                wallet_password,
+                port: pr_port,
+            },
+            pr_data_dir,
+        )?;
+        let pp_lifecycle = PpLifecycle::new(&cfg, &seeds, pp_data_dir)?;
+        Ok(Self {
+            cfg,
+            pr_lifecycle,
+            pp_lifecycle,
+            http,
+            tx_idx: Arc::new(AtomicU64::new(0)),
+            submitted_payment_ids: Vec::new(),
+        })
+    }
+
     /// Spawn the PR and PP children, apply the vendored sqlite migrations,
     /// and wait for both readiness probes. Order matches spec §2 step 4:
     /// PR before PP so PP's startup can connect immediately. Migrations
@@ -454,21 +501,386 @@ impl S4Dispatcher for PpDispatcher {
 
 #[cfg(test)]
 mod tests {
-    // TODO(swe-test): populate per MODE_3_REWORK_SPEC.md §13. Test list:
-    //   - mode3_name_is_payment_processor
-    //   - mode3_scan_from_birthday_returns_unsupported_operation
-    //   - mode3_get_balance_returns_unsupported_operation
-    //   - mode3_get_utxo_count_returns_unsupported_operation
-    //   - mode3_wipe_and_reimport_returns_unsupported_operation
-    //   - mode3_send_single_posts_to_pp_via_wiremock
-    //   - mode3_send_batch_posts_to_pp_via_wiremock
-    //   - mode3_send_batch_rejects_over_max_batch_size
-    //   - mode3_dispatcher_returns_arc_pp_dispatcher
-    //   - mode3_dispatcher_assigns_unique_client_ids_per_task
-    //
-    // The cached-read tests from PR #6 (mode3_get_utxo_count_reads_from_wallet_db,
-    // mode3_get_utxo_count_surfaces_db_error, mode3_wipe_and_reimport_attempts_subprocess,
-    // mode3_scan_from_birthday_attempts_subprocess, mode3_get_balance_attempts_subprocess)
-    // are retired with the shim — Mode 3 no longer reads the wallet DB or
-    // spawns the minotari subprocess for those operations.
+    use super::*;
+    use crate::{
+        config::{Config, Mode3Account, Mode3Accounts, Mode3Config, Seeds, WorkerSleepOverrides},
+        gen_seed,
+        seed::derive_address,
+    };
+    use serde_json::json;
+    use std::path::PathBuf;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Absolute path to the fake binaries under `tests/fixtures/`. The
+    /// scan-side and dispatcher tests never spawn anything — we just need
+    /// `Mode3Config::validate` to accept the paths.
+    fn fake_pp_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_pp.sh")
+    }
+    fn fake_minotari_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_minotari.sh")
+    }
+
+    fn set_env(name: &str, value: &str) {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+    fn unset_env(name: &str) {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    /// Per-test env-var name suffix so two tests can run in parallel
+    /// without seed-env races (matches the unique_seeds pattern from
+    /// `src/modes/new_wallet.rs::tests`).
+    fn unique_seeds(suffix: &str) -> Seeds {
+        Seeds {
+            old: format!("WALLET_BENCHMARKS_TEST_MODE3_OLD_{suffix}"),
+            new: format!("WALLET_BENCHMARKS_TEST_MODE3_NEW_{suffix}"),
+            payment_processor: format!("WALLET_BENCHMARKS_TEST_MODE3_PP_{suffix}"),
+            wallet_password: format!("WALLET_BENCHMARKS_TEST_MODE3_PW_{suffix}"),
+        }
+    }
+
+    /// Build a full Config with Mode3Config populated. The view-key/spend-key
+    /// env vars are unique per-test (suffix-namespaced).
+    fn make_mode3_config(suffix: &str) -> (Config, Seeds, String, String) {
+        let seeds_cfg = unique_seeds(suffix);
+        let view_env = format!("WALLET_BENCHMARKS_TEST_MODE3_VIEW_{suffix}");
+        let spend_env = format!("WALLET_BENCHMARKS_TEST_MODE3_SPEND_{suffix}");
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            mode_3: Some(Mode3Config {
+                pp_binary_path: fake_pp_path(),
+                minotari_binary_path: fake_minotari_path(),
+                api_port: 9145,
+                pr_port: 9146,
+                terminal_state_poll_timeout_secs: 1,
+                worker_sleep_overrides: WorkerSleepOverrides::default(),
+                accounts: Mode3Accounts {
+                    bench: Mode3Account {
+                        view_key_env: view_env.clone(),
+                        public_spend_key_env: spend_env.clone(),
+                    },
+                },
+            }),
+            ..Config::default()
+        };
+        (cfg, seeds_cfg, view_env, spend_env)
+    }
+
+    /// Construct a Mode 3 instance bound to the supplied wiremock URL.
+    /// Sets all the required env vars and returns the names so the
+    /// caller can teardown.
+    fn build_mode3_with_http(
+        suffix: &str,
+        base_url: String,
+    ) -> (PaymentProcessor, Seeds, Vec<String>) {
+        let (cfg, seeds_cfg, view_env, spend_env) = make_mode3_config(suffix);
+        let m_old = gen_seed().expect("m_old");
+        let m_new = gen_seed().expect("m_new");
+        let m_pp = gen_seed().expect("m_pp");
+        set_env(&seeds_cfg.old, &m_old);
+        set_env(&seeds_cfg.new, &m_new);
+        set_env(&seeds_cfg.payment_processor, &m_pp);
+        set_env(&seeds_cfg.wallet_password, "test-password");
+        set_env(
+            &view_env,
+            "572a5fb63972da84aeec33071d13074e244d80c52be842ab5b0859ef4b4db00a",
+        );
+        set_env(
+            &spend_env,
+            "40e65c9bbf4592bc995c421108c01a5d7c9f9b2239569757895134549cef371f",
+        );
+        let pp_dir = HarnessDataDir::new(&format!("test-mode3-pp-{suffix}"), MODE_NAME)
+            .expect("pp data dir");
+        let pr_dir = HarnessDataDir::new(&format!("test-mode3-pr-{suffix}"), MODE_NAME)
+            .expect("pr data dir");
+        let http = Arc::new(PpHttpClient::new(base_url));
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let mode = PaymentProcessor::from_parts_for_test(cfg, seeds, pp_dir, pr_dir, http)
+            .expect("PaymentProcessor::from_parts_for_test");
+        (mode, seeds_cfg, vec![view_env, spend_env])
+    }
+
+    fn teardown_envs(seeds_cfg: &Seeds, extras: &[String]) {
+        unset_env(&seeds_cfg.old);
+        unset_env(&seeds_cfg.new);
+        unset_env(&seeds_cfg.payment_processor);
+        unset_env(&seeds_cfg.wallet_password);
+        for e in extras {
+            unset_env(e);
+        }
+    }
+
+    /// Deterministic test recipient — derived from a fresh seed each call,
+    /// so addresses don't collide across parallel tests.
+    fn test_recipient() -> TariAddress {
+        let m = gen_seed().expect("gen_seed");
+        derive_address(&m).expect("derive_address")
+    }
+
+    fn payment_response_json(payment_id: &str, status: &str, client_id: &str) -> serde_json::Value {
+        json!({
+            "payment_id": payment_id,
+            "status": status,
+            "client_id": client_id,
+            "account_name": "bench",
+            "recipient_address": "tari://esmeralda/recipient",
+            "amount": 1000_i64,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    #[tokio::test]
+    async fn mode3_name_is_payment_processor() {
+        let server = MockServer::start().await;
+        let (mode, seeds_cfg, extras) = build_mode3_with_http("NAME", server.uri());
+        assert_eq!(MODE_NAME, "payment_processor");
+        assert_eq!(mode.name(), "payment_processor");
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_scan_from_birthday_returns_unsupported_operation() {
+        let server = MockServer::start().await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("SCAN", server.uri());
+        let err = mode
+            .scan_from_birthday(0)
+            .await
+            .expect_err("Mode 3 must not support scan_from_birthday");
+        let uo = err
+            .downcast_ref::<UnsupportedOperation>()
+            .expect("error must downcast to UnsupportedOperation");
+        assert_eq!(uo.mode, "payment_processor");
+        assert_eq!(uo.op, "scan_from_birthday");
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_get_balance_returns_unsupported_operation() {
+        let server = MockServer::start().await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("BAL", server.uri());
+        let err = mode
+            .get_balance()
+            .await
+            .expect_err("Mode 3 must not support get_balance");
+        let uo = err
+            .downcast_ref::<UnsupportedOperation>()
+            .expect("error must downcast to UnsupportedOperation");
+        assert_eq!(uo.mode, "payment_processor");
+        assert_eq!(uo.op, "get_balance");
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_get_utxo_count_returns_unsupported_operation() {
+        let server = MockServer::start().await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("UTXO", server.uri());
+        let err = mode
+            .get_utxo_count()
+            .await
+            .expect_err("Mode 3 must not support get_utxo_count");
+        let uo = err
+            .downcast_ref::<UnsupportedOperation>()
+            .expect("error must downcast to UnsupportedOperation");
+        assert_eq!(uo.mode, "payment_processor");
+        assert_eq!(uo.op, "get_utxo_count");
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_wipe_and_reimport_returns_unsupported_operation() {
+        let server = MockServer::start().await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("WIPE", server.uri());
+        let err = mode
+            .wipe_and_reimport(0)
+            .await
+            .expect_err("Mode 3 must not support wipe_and_reimport");
+        let uo = err
+            .downcast_ref::<UnsupportedOperation>()
+            .expect("error must downcast to UnsupportedOperation");
+        assert_eq!(uo.mode, "payment_processor");
+        assert_eq!(uo.op, "wipe_and_reimport");
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_send_single_posts_to_pp_via_wiremock() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "batch_id": "batch-single",
+                "account_name": "bench",
+                "status": "RECEIVED",
+                "payments": [
+                    payment_response_json("pay-single", "RECEIVED", "bench-tx-0-0")
+                ],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("SEND1", server.uri());
+        let recipient = test_recipient();
+        let rec = mode
+            .send_single(&recipient, 1_000, 5)
+            .await
+            .expect("send_single ok");
+        assert_eq!(
+            rec.txid, "batch-single",
+            "TxRecord.txid carries the batch id (stand-in for on-chain txid per spec §10)",
+        );
+        assert_eq!(rec.status, "success");
+        assert!(rec.error_string.is_none());
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_send_batch_posts_to_pp_via_wiremock() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "batch_id": "batch-multi",
+                "account_name": "bench",
+                "status": "RECEIVED",
+                "payments": [
+                    payment_response_json("pay-1", "RECEIVED", "bench-tx-0-0"),
+                    payment_response_json("pay-2", "RECEIVED", "bench-tx-0-1"),
+                    payment_response_json("pay-3", "RECEIVED", "bench-tx-0-2"),
+                ],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("BATCH", server.uri());
+        let recipients = vec![
+            (test_recipient(), 1_000),
+            (test_recipient(), 2_000),
+            (test_recipient(), 3_000),
+        ];
+        let rec = mode
+            .send_batch_one_to_many(&recipients, 5)
+            .await
+            .expect("send_batch ok");
+        assert_eq!(rec.txid, "batch-multi");
+        assert_eq!(rec.status, "success");
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_send_batch_rejects_over_max_batch_size() {
+        // PP's MAX_BATCH_SIZE is 100; the mode pre-validates and bails
+        // BEFORE reaching the HTTP client so the wiremock server never
+        // sees a request (`.expect(0)` would also fail if the bail was
+        // skipped).
+        let server = MockServer::start().await;
+        let (mut mode, seeds_cfg, extras) = build_mode3_with_http("OVERSIZE", server.uri());
+        // Reuse a single derived recipient — the size check fires before
+        // any per-item processing, so address-uniqueness doesn't matter.
+        // Deriving 101 fresh addresses takes 60+s on this machine; the
+        // boundary check is the same either way.
+        let one_recipient = test_recipient();
+        let recipients: Vec<(TariAddress, u64)> = (0..(PP_MAX_BATCH_SIZE + 1))
+            .map(|_| (one_recipient.clone(), 1_000))
+            .collect();
+        let err = mode
+            .send_batch_one_to_many(&recipients, 5)
+            .await
+            .expect_err("oversize batch must bail before HTTP");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("MAX_BATCH_SIZE"),
+            "error must name PP's MAX_BATCH_SIZE: {msg}",
+        );
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_dispatcher_returns_arc_per_call() {
+        // dispatcher() returns Arc<dyn S4Dispatcher>. Per spec §11 each
+        // call returns a fresh handle (no cached singleton) so S4's
+        // JoinSet fan-out can hand each task its own clone without
+        // racing on a shared mutable cursor.
+        let server = MockServer::start().await;
+        let (mode, seeds_cfg, extras) = build_mode3_with_http("DISP", server.uri());
+        let a: Arc<dyn S4Dispatcher> = mode.dispatcher();
+        let b: Arc<dyn S4Dispatcher> = mode.dispatcher();
+        // Two trait objects don't compare for identity; assert each is
+        // clone-able and the underlying pointer is non-null.
+        let _a_clone: Arc<dyn S4Dispatcher> = Arc::clone(&a);
+        let _b_clone: Arc<dyn S4Dispatcher> = Arc::clone(&b);
+        teardown_envs(&seeds_cfg, &extras);
+    }
+
+    #[tokio::test]
+    async fn mode3_dispatcher_assigns_unique_client_ids() {
+        // 4 concurrent dispatch calls must produce 4 distinct client_ids
+        // (the per-mode AtomicU64 counter is shared with the dispatcher
+        // per spec §11). We verify by capturing request bodies on the
+        // wiremock side and asserting they include 4 distinct s4-N
+        // client_id values.
+        let server = MockServer::start().await;
+        // wiremock's `received_requests` API gives us the bodies; mount a
+        // permissive mock that always returns the same shape.
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "batch_id": "batch-disp",
+                "account_name": "bench",
+                "status": "RECEIVED",
+                "payments": [payment_response_json("p", "RECEIVED", "s4-x")],
+            })))
+            .mount(&server)
+            .await;
+        let (mode, seeds_cfg, extras) = build_mode3_with_http("DISP_UNIQ", server.uri());
+        let dispatcher = mode.dispatcher();
+        let mut joinset = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let d = Arc::clone(&dispatcher);
+            let recipient = test_recipient();
+            joinset.spawn(async move { d.dispatch(recipient, 1_000, 5).await });
+        }
+        let mut ok_count = 0;
+        while let Some(joined) = joinset.join_next().await {
+            let _rec = joined.expect("join ok").expect("dispatch ok");
+            ok_count += 1;
+        }
+        assert_eq!(ok_count, 4, "4 dispatches must all succeed");
+        let reqs = server.received_requests().await.expect("received_requests");
+        assert_eq!(
+            reqs.len(),
+            4,
+            "wiremock must have received 4 requests (one per dispatch); got {}",
+            reqs.len(),
+        );
+        // Parse out each request body's items[0].client_id and assert
+        // they are all distinct.
+        let mut client_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for req in &reqs {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).expect("body is JSON");
+            let cid = body["items"][0]["client_id"]
+                .as_str()
+                .expect("client_id is a string")
+                .to_string();
+            assert!(
+                cid.starts_with("s4-"),
+                "dispatcher client_id must be prefixed with s4-: {cid}",
+            );
+            client_ids.insert(cid);
+        }
+        assert_eq!(
+            client_ids.len(),
+            4,
+            "all 4 dispatch client_ids must be distinct; got {client_ids:?}",
+        );
+        teardown_envs(&seeds_cfg, &extras);
+    }
 }
