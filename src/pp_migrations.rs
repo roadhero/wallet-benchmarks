@@ -123,8 +123,80 @@ pub fn apply_migrations(data_dir: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // TODO(swe-test): populate per MODE_3_REWORK_SPEC.md §13. Test list:
-    //   - apply_migrations_creates_payments_table
-    //   - apply_migrations_creates_all_required_tables
-    //   - apply_migrations_is_idempotent_when_re_run
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Returns a (tempdir, db_path) pair. The tempdir is returned so the
+    /// caller keeps it alive for the duration of the test — dropping it
+    /// removes the directory and the sqlite file.
+    fn fresh_data_dir() -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("payments.db");
+        (dir, db_path)
+    }
+
+    #[test]
+    fn apply_migrations_creates_payments_table() {
+        let (dir, db_path) = fresh_data_dir();
+        apply_migrations(dir.path()).expect("apply_migrations succeeds");
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='payments'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count payments table");
+        assert_eq!(n, 1, "payments table must be present after migrations");
+    }
+
+    #[test]
+    fn apply_migrations_creates_all_required_tables() {
+        let (dir, db_path) = fresh_data_dir();
+        apply_migrations(dir.path()).expect("apply_migrations succeeds");
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .expect("prepare");
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        for required in REQUIRED_TABLES {
+            assert!(
+                names.iter().any(|n| n == required),
+                "post-migration schema must contain {required}; got {names:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn apply_migrations_is_idempotent_when_re_run() {
+        // Per spec §13: "second call against the same DB doesn't error
+        // (rusqlite will error on duplicate CREATE; spec calls for the
+        // harness to wipe + re-create, so this test verifies wipe-first
+        // behaviour)." Wipe first, then re-apply, then assert success
+        // and the required tables are still present.
+        let (dir, db_path) = fresh_data_dir();
+        apply_migrations(dir.path()).expect("first apply");
+        // Wipe the database file (mirrors the harness's wipe-then-apply
+        // contract documented on apply_migrations' rustdoc).
+        std::fs::remove_file(&db_path).expect("remove payments.db");
+        apply_migrations(dir.path()).expect("second apply after wipe");
+        let conn = rusqlite::Connection::open(&db_path).expect("re-open db");
+        for required in REQUIRED_TABLES {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [required],
+                    |row| row.get(0),
+                )
+                .expect("count required table");
+            assert_eq!(
+                n, 1,
+                "{required} must still be present after wipe + re-apply",
+            );
+        }
+    }
 }
