@@ -16,6 +16,7 @@ pub mod sampler;
 pub mod scenarios;
 pub mod seed;
 pub mod versions;
+pub mod wallet_db;
 pub mod wallet_lifecycle;
 
 use anyhow::Context;

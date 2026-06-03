@@ -27,9 +27,9 @@
 //! shared orchestration lives in
 //! [`crate::modes::minotari_wallet_ops`] — Mode 2 and Mode 3 both route
 //! through it, differing only in seed slot (`mnemonic_new` here,
-//! `mnemonic_payment_processor` in Mode 3). `get_utxo_count` reads from
-//! the cached [`ScanOutcome`] (step 4 of the amendment); the CLI exposes
-//! no UTXO-count subcommand.
+//! `mnemonic_payment_processor` in Mode 3). UTXO discovery counts come from
+//! the wallet's sqlite3 DB via [`crate::wallet_db`] (PR #6 review threads
+//! 4.1 + 4.3, `analysis/specs/THREADS_4_1_4_3_SPEC.md`).
 
 use anyhow::Context;
 use tari_common_types::tari_address::TariAddress;
@@ -48,6 +48,7 @@ use crate::{
         Mode, S4Dispatcher, ScanOutcome, TxRecord,
     },
     seed::SeedHandle,
+    wallet_db::{LiveWalletDb, WalletDbArc},
     wallet_lifecycle::HarnessDataDir,
 };
 
@@ -68,12 +69,10 @@ pub struct NewWallet {
     broadcaster: Broadcaster,
     data_dir: HarnessDataDir,
     tx_idx: u64,
-    /// Cached [`ScanOutcome`] from the most recent successful
-    /// [`Mode::scan_from_birthday`] call. [`Mode::get_utxo_count`] reads
-    /// `outputs_found` from here per `analysis/DESIGN_AMENDMENT.md §8.3`
-    /// step 4 — the CLI exposes no separate UTXO-count subcommand, so the
-    /// scan's own discovery count is the canonical source.
-    last_scan: Option<ScanOutcome>,
+    /// Read-only sqlite3 query surface for `outputs_found` /
+    /// `utxo_count`. Production wires [`LiveWalletDb`]; tests inject a
+    /// `FakeWalletDb` via [`NewWallet::new_with_wallet_db`].
+    wallet_db: WalletDbArc,
 }
 
 impl NewWallet {
@@ -83,6 +82,18 @@ impl NewWallet {
     /// The [`Broadcaster`] is built once here from `cfg.base_node_url` so the
     /// underlying `reqwest` connection pool is reused across calls.
     pub fn new(cfg: Config, seeds: SeedHandle, data_dir: HarnessDataDir) -> Self {
+        Self::new_with_wallet_db(cfg, seeds, data_dir, Arc::new(LiveWalletDb))
+    }
+
+    /// Test-only constructor — accepts an arbitrary [`WalletDbArc`]. Used by
+    /// the per-mode unit tests to swap in a `FakeWalletDb` that returns
+    /// canned counts without touching the filesystem.
+    pub(crate) fn new_with_wallet_db(
+        cfg: Config,
+        seeds: SeedHandle,
+        data_dir: HarnessDataDir,
+        wallet_db: WalletDbArc,
+    ) -> Self {
         let broadcaster = Broadcaster::new(&cfg.base_node_url);
         Self {
             cfg,
@@ -90,8 +101,12 @@ impl NewWallet {
             broadcaster,
             data_dir,
             tx_idx: 0,
-            last_scan: None,
+            wallet_db,
         }
+    }
+
+    fn wallet_db_path(&self) -> PathBuf {
+        self.data_dir.path().join("wallet.sqlite3")
     }
 
     fn next_tx_idx(&mut self) -> u64 {
@@ -159,17 +174,16 @@ impl Mode for NewWallet {
     }
 
     async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
-        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 1:
-        //   wipe_and_reimport(birthday) -> run minotari Scan -> return ScanOutcome.
-        // Fields the scenarios layer fills in (tip queries, balance,
-        // peak RSS/CPU) follow Mode 1's `OldWallet::scan_from_birthday`
-        // precedent of returning 0 — scenarios call `get_balance` and base-node
-        // tip queries to backfill before folding into the per-cell envelope.
+        // Per PR #6 review threads 4.1 + 4.3 (analysis/specs/THREADS_4_1_4_3_SPEC.md):
+        //   wipe_and_reimport(birthday) -> run minotari Scan -> read counts
+        //   from the wallet's sqlite3 DB (NOT the rejected stderr parse).
+        // `outputs_found` is the total non-burn, non-deleted output count;
+        // `utxo_count` is the spendable subset (status = 'UNSPENT').
         let started = Instant::now();
         self.wipe_and_reimport(birthday)
             .await
             .context("Mode 2 wipe_and_reimport prerequisite to scan")?;
-        let parsed = run_scan_subprocess(
+        let _parsed = run_scan_subprocess(
             &self.cfg,
             self.data_dir.path(),
             self.seeds
@@ -181,7 +195,15 @@ impl Mode for NewWallet {
         .await
         .context("Mode 2 run_scan_subprocess")?;
         let t_scan_ms = started.elapsed().as_millis() as u64;
-        let outputs_found = parsed.outputs_found.unwrap_or(0);
+        let db_path = self.wallet_db_path();
+        let outputs_found = self
+            .wallet_db
+            .count_outputs(&db_path)
+            .context("Mode 2 post-scan count_outputs from wallet DB")?;
+        let utxo_count = self
+            .wallet_db
+            .count_spendable_utxos(&db_path)
+            .context("Mode 2 post-scan count_spendable_utxos from wallet DB")?;
         let outcome = ScanOutcome {
             t_scan_ms,
             // h_tip_start / h_tip_end: scenarios layer fills these from
@@ -190,21 +212,14 @@ impl Mode for NewWallet {
             h_tip_start: 0,
             h_tip_end: 0,
             outputs_found,
-            // utxo_count: per `analysis/DESIGN_AMENDMENT.md §8.3` step 4 the
-            // CLI exposes no UTXO-count subcommand. The scan's own
-            // discovery count is the canonical source (an output is by
-            // construction a UTXO at discovery time).
-            utxo_count: outputs_found,
+            utxo_count,
             // balance_microtari: scenarios layer composes a `get_balance` call
-            // after `scan_from_birthday`; the post-scan balance subprocess is
-            // independent of the scan's outputs_found and lands in a later
-            // commit.
+            // after `scan_from_birthday`.
             balance_microtari: 0,
         };
-        self.last_scan = Some(outcome.clone());
         log::info!(
             target: LOG_TARGET,
-            "Mode 2 scan_from_birthday complete (birthday={birthday}, outputs_found={outputs_found}, t_scan_ms={t_scan_ms})",
+            "Mode 2 scan_from_birthday complete (birthday={birthday}, outputs_found={outputs_found}, utxo_count={utxo_count}, t_scan_ms={t_scan_ms})",
         );
         Ok(outcome)
     }
@@ -218,21 +233,13 @@ impl Mode for NewWallet {
     }
 
     async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
-        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 4: the new CLI has no
-        // utxo-count subcommand. The canonical source is the most recent
-        // `scan_from_birthday` outcome's `outputs_found`. Bail if no scan has
-        // run yet — that's a programming error in the scenario layer (every
-        // scenario that needs a count runs a scan first per
-        // `analysis/DESIGN.md §Scenario state machine` B0/S2/S3/S6/S7).
-        match &self.last_scan {
-            Some(o) => Ok(o.utxo_count),
-            None => anyhow::bail!(
-                "Mode 2 get_utxo_count: no scan has been run yet — call \
-                 scan_from_birthday first. The new minotari CLI has no \
-                 utxo-count subcommand; the scan's outputs_found is the \
-                 canonical source (see analysis/DESIGN_AMENDMENT.md §8.3 step 4).",
-            ),
-        }
+        // Per PR #6 review threads 4.1 + 4.3: the canonical source is a
+        // sqlite3 read of `outputs WHERE deleted_at IS NULL AND is_burn = 0
+        // AND status = 'UNSPENT'` — no subprocess and no cached state.
+        let db_path = self.wallet_db_path();
+        self.wallet_db
+            .count_spendable_utxos(&db_path)
+            .context("Mode 2 get_utxo_count via wallet DB")
     }
 
     fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
@@ -402,49 +409,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode2_get_utxo_count_bails_when_no_scan_cached() {
-        // Per `analysis/DESIGN_AMENDMENT.md §8.3` step 4: `get_utxo_count`
-        // reads from the cached `last_scan` only. With no scan run yet, the
-        // method must bail with a clear "call scan_from_birthday first"
-        // message — and crucially must NOT spawn any subprocess.
-        let (mut m, seeds) = build_mode2("UTXO");
+    async fn mode2_get_utxo_count_reads_from_wallet_db() {
+        // Per PR #6 threads 4.1 + 4.3 (analysis/specs/THREADS_4_1_4_3_SPEC.md):
+        // `get_utxo_count` queries the wallet sqlite3 DB directly via the
+        // injected `WalletDb`. With a fake returning 7, the method must
+        // return 7 — and crucially must NOT spawn any subprocess.
+        let seeds_cfg = unique_seeds("UTXO_DB");
+        let m_old = gen_seed().expect("m_old");
+        let m_new = gen_seed().expect("m_new");
+        let m_pp = gen_seed().expect("m_pp");
+        set_env(&seeds_cfg.old, &m_old);
+        set_env(&seeds_cfg.new, &m_new);
+        set_env(&seeds_cfg.payment_processor, &m_pp);
+        set_env(&seeds_cfg.wallet_password, "pw");
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            ..Config::default()
+        };
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let data_dir = HarnessDataDir::new("test-mode2-UTXO_DB", MODE_NAME).expect("data dir");
+        let fake = Arc::new(crate::wallet_db::FakeWalletDb::ok(99, 7));
+        let mut m = NewWallet::new_with_wallet_db(cfg, seeds, data_dir, fake);
+        let n = m
+            .get_utxo_count()
+            .await
+            .expect("DB-backed get_utxo_count returns Ok");
+        assert_eq!(n, 7);
+        teardown_seeds(&seeds_cfg);
+    }
+
+    #[tokio::test]
+    async fn mode2_get_utxo_count_surfaces_db_error() {
+        // A fake WalletDb that errors on count_spendable_utxos must propagate
+        // through Mode 2's context wrapper (PR #6 threads 4.1 + 4.3 require
+        // DB errors to surface, not be silently masked into 0).
+        let seeds_cfg = unique_seeds("UTXO_DB_ERR");
+        let m_old = gen_seed().expect("m_old");
+        let m_new = gen_seed().expect("m_new");
+        let m_pp = gen_seed().expect("m_pp");
+        set_env(&seeds_cfg.old, &m_old);
+        set_env(&seeds_cfg.new, &m_new);
+        set_env(&seeds_cfg.payment_processor, &m_pp);
+        set_env(&seeds_cfg.wallet_password, "pw");
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            ..Config::default()
+        };
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let data_dir = HarnessDataDir::new("test-mode2-UTXO_DB_ERR", MODE_NAME).expect("data dir");
+        let fake = Arc::new(crate::wallet_db::FakeWalletDb {
+            canned_count_outputs: Ok(0),
+            canned_count_spendable: Err("simulated DB failure".to_string()),
+        });
+        let mut m = NewWallet::new_with_wallet_db(cfg, seeds, data_dir, fake);
         let err = m
             .get_utxo_count()
             .await
-            .expect_err("get_utxo_count without prior scan must bail");
+            .expect_err("DB error must propagate");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("no scan has been run yet") && msg.contains("scan_from_birthday"),
-            "error must name the contract: {msg}",
+            msg.contains("Mode 2 get_utxo_count") && msg.contains("simulated DB failure"),
+            "error must include Mode 2 context + the inner cause: {msg}",
         );
-        teardown_seeds(&seeds);
-    }
-
-    #[test]
-    fn mode2_get_utxo_count_returns_cached_outputs_found() {
-        // Synthetic ScanOutcome — confirms the cached-read contract without
-        // spawning any subprocess. AC-trace: `analysis/DESIGN_AMENDMENT.md §8.3`
-        // step 4 "get_utxo_count returns outputs_found from the cached report".
-        let (mut m, seeds) = build_mode2("UTXO_CACHED");
-        m.last_scan = Some(ScanOutcome {
-            t_scan_ms: 1234,
-            h_tip_start: 0,
-            h_tip_end: 0,
-            outputs_found: 42,
-            utxo_count: 42,
-            balance_microtari: 0,
-        });
-        // Drive through the trait method via a tokio runtime — `get_utxo_count`
-        // is async by trait shape but contains no .await on the cached-hit path.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let n = rt
-            .block_on(m.get_utxo_count())
-            .expect("cached hit returns Ok");
-        assert_eq!(n, 42);
-        teardown_seeds(&seeds);
+        teardown_seeds(&seeds_cfg);
     }
 
     #[tokio::test]

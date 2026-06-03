@@ -24,9 +24,10 @@
 //!
 //! * **Scan** (one-shot scan up to `--max-blocks-to-scan` blocks):
 //!   `--password <pw> --database-path <db> --account-name default --max-blocks-to-scan <N>`.
-//!   Emits the result as `info!(event_count = events.len(); "Scan complete")` —
-//!   `log` crate, lands on stderr under env_logger. There is no
-//!   machine-readable `--output-format json` flag (DESIGN_AMENDMENT.md §8.1).
+//!   The subprocess emits human-readable progress on stderr; the harness
+//!   ignores it. Output-discovery counts are read from the wallet sqlite3
+//!   DB post-scan via [`crate::wallet_db`] (see PR #6 review threads
+//!   4.1 + 4.3 and `analysis/specs/THREADS_4_1_4_3_SPEC.md`).
 //!
 //! * **Balance** (reads the wallet DB; **takes no `--password`**):
 //!   `--database-path <db> --account-name default`. Stdout format is the literal
@@ -281,18 +282,14 @@ pub(super) async fn wipe_and_reimport_via_create(
     Ok(())
 }
 
-/// Result of [`run_scan_subprocess`] — the parsed shape of `minotari Scan`'s
-/// observable output. `outputs_found` comes from the stderr `event_count=N`
-/// emission (log-crate's key-value formatting); `blocks_scanned` is taken from
-/// `max_blocks_to_scan` because the CLI does not emit the actual processed
-/// count separately (DESIGN_AMENDMENT.md §8 / API_DRIFT.md Step 3i).
+/// Result of [`run_scan_subprocess`]. The scan subprocess only signals
+/// success-or-failure; UTXO discovery counts are read post-scan from the
+/// wallet sqlite3 DB via [`crate::wallet_db`] (PR #6 review threads
+/// 4.1 + 4.3, `analysis/specs/THREADS_4_1_4_3_SPEC.md`). `max_blocks_to_scan`
+/// is preserved on the result purely for log/telemetry symmetry — scenarios
+/// compare against base-node tip deltas, not against this value directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ScanStdoutParsed {
-    /// Wallet outputs discovered by the scan. Parsed from
-    /// `info!(event_count = events.len(); "Scan complete")` on the subprocess's
-    /// stderr. `None` when the line was absent (subprocess exited successfully
-    /// but emitted no `event_count` token — e.g. log level filtered it out).
-    pub outputs_found: Option<u64>,
     /// Upper bound on the number of blocks scanned this invocation. The CLI
     /// does not emit a precise post-hoc count; the harness records what it
     /// asked for so scenarios can compare against base-node tip deltas.
@@ -300,13 +297,12 @@ pub(super) struct ScanStdoutParsed {
     pub max_blocks_to_scan: u64,
 }
 
-/// Spawn `minotari Scan` and capture its parsed result.
+/// Spawn `minotari Scan` and wait for it to complete.
 ///
-/// `RUST_LOG=info` is forced into the subprocess environment so the
-/// `info!(event_count = ...)` line is emitted at all. The parser is anchored
-/// on `event_count=N` (regex `event_count=(\d+)`); if the subprocess exits
-/// successfully but the line is absent, `outputs_found` is `None` and the
-/// caller decides whether that is a soft signal or a failure.
+/// `RUST_LOG=info` is forced into the subprocess environment for visibility
+/// in captured logs — the harness ignores stderr beyond using it to enrich
+/// error messages on non-zero exit. UTXO counts are queried separately from
+/// the wallet DB (see [`crate::wallet_db`]).
 pub(super) async fn run_scan_subprocess(
     cfg: &Config,
     data_dir: &Path,
@@ -333,9 +329,8 @@ pub(super) async fn run_scan_subprocess(
         .env("HOME", &harness_home)
         .env("PATH", &path_env)
         .env("TARI_NETWORK", NETWORK_FLAG_VALUE)
-        // The CLI emits its scan-complete summary via the `log` crate at
-        // `info`. Without RUST_LOG=info the env_logger default ("error") drops
-        // the only token the harness can parse — force it explicitly.
+        // Force `info` so captured stderr is useful for diagnosing failures;
+        // the harness no longer parses any stderr token.
         .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -353,29 +348,11 @@ pub(super) async fn run_scan_subprocess(
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         anyhow::bail!("minotari scan exit {:?}; stderr={}", output.status, stderr,);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let outputs_found = parse_event_count(&stderr);
     log::info!(
         target: LOG_TARGET,
-        "minotari scan succeeded (outputs_found={outputs_found:?}, max_blocks_to_scan={max_blocks_to_scan})",
+        "minotari scan succeeded (max_blocks_to_scan={max_blocks_to_scan})",
     );
-    Ok(ScanStdoutParsed {
-        outputs_found,
-        max_blocks_to_scan,
-    })
-}
-
-/// Parse the `event_count=N` token from `Scan`'s stderr.
-///
-/// Anchor is structural (the literal key-value name emitted by the `log`
-/// crate's `info!(event_count = events.len(); ...)` macro form). Returns
-/// `None` if the token is absent (e.g. log level filtered it out).
-fn parse_event_count(stderr: &str) -> Option<u64> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        RE.get_or_init(|| Regex::new(r"event_count=(\d+)").expect("event_count regex compiles"));
-    let cap = re.captures(stderr)?;
-    cap.get(1).and_then(|m| m.as_str().parse::<u64>().ok())
+    Ok(ScanStdoutParsed { max_blocks_to_scan })
 }
 
 /// Spawn `minotari Balance` and return the parsed microTari u64 total.
@@ -559,24 +536,6 @@ mod tests {
         assert_eq!(argv[11], "--max-blocks-to-scan");
         assert_eq!(argv[12], "12345");
         assert_eq!(argv.len(), 13);
-    }
-
-    #[test]
-    fn parse_event_count_extracts_number() {
-        let stderr = "[2026-05-22T12:00:00 INFO minotari] event_count=42 Scan complete\n";
-        assert_eq!(parse_event_count(stderr), Some(42));
-    }
-
-    #[test]
-    fn parse_event_count_returns_none_when_absent() {
-        assert_eq!(parse_event_count("Scan complete\n"), None);
-        assert_eq!(parse_event_count(""), None);
-    }
-
-    #[test]
-    fn parse_event_count_extracts_zero() {
-        let stderr = "info: event_count=0 Scan complete";
-        assert_eq!(parse_event_count(stderr), Some(0));
     }
 
     #[test]

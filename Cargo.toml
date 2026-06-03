@@ -45,6 +45,7 @@ tari_utilities              = "0.8"
 # Trait objects with async fn — matches the maintainer-idiom used by
 # minotari_node_wallet_client and the tari ecosystem broadly.
 async-trait = "0.1"
+rusqlite = { version = "0.40.0", features = ["bundled"] }
 
 # POSIX signal delivery for ConsoleWalletLifecycle teardown (SIGTERM grace +
 # SIGKILL escalation per analysis/DESIGN.md §Mode 1 step 4).
