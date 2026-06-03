@@ -441,18 +441,317 @@ impl PpHttpClient {
 
 #[cfg(test)]
 mod tests {
-    // TODO(swe-test): populate per MODE_3_REWORK_SPEC.md §13 — wiremock-backed
-    // request/response coverage for the seven endpoints. Test list (verbatim
-    // from spec):
-    //   - health_version_200_returns_parsed_version
-    //   - wait_ready_retries_on_connection_refused_then_succeeds_on_200
-    //   - wait_ready_fails_on_total_timeout
-    //   - wait_ready_fails_on_dns_error_immediately
-    //   - submit_batch_serializes_request_correctly
-    //   - submit_batch_parses_202_response
-    //   - submit_batch_returns_error_on_400_batch_too_large
-    //   - submit_batch_returns_error_on_503
-    //   - poll_payment_404_returns_typed_error
-    //   - poll_payment_200_parses_status_enum
-    //   - stream_events_with_filters_builds_correct_query_string
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// JSON skeleton for a `PaymentResponse`. Matches the upstream shape
+    /// citing `vendor/.../api/payments.rs:54-78`. Variable bits supplied by
+    /// the caller; the timestamp fields use a fixed RFC3339 string so the
+    /// fixture is deterministic.
+    fn payment_response_json(payment_id: &str, status: &str, client_id: &str) -> serde_json::Value {
+        json!({
+            "payment_id": payment_id,
+            "status": status,
+            "client_id": client_id,
+            "account_name": "bench",
+            "recipient_address": "tari://esmeralda/recipient_addr",
+            "amount": 1000_i64,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    #[tokio::test]
+    async fn health_version_200_returns_parsed_version() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "version": "1.2.3",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let v = client.health_version().await.expect("health_version ok");
+        assert_eq!(v.version, "1.2.3");
+    }
+
+    #[tokio::test]
+    async fn wait_ready_retries_on_connection_refused_then_succeeds_on_200() {
+        // Two-stage scenario: first scope a Mock that returns 503 a
+        // bounded number of times, then a second Mock that returns 200.
+        // wiremock keeps the most-recent matching mount in priority order,
+        // so the 200 mount supersedes the 503 once both are installed.
+        let server = MockServer::start().await;
+        // First: 503 a few times (simulating worker init), then 200.
+        Mock::given(method("GET"))
+            .and(path("/health/version"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/health/version"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "version": "1.2.3" })),
+            )
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let v = client
+            .wait_ready(Duration::from_secs(5))
+            .await
+            .expect("wait_ready ok after retries");
+        assert_eq!(v.version, "1.2.3");
+    }
+
+    #[tokio::test]
+    async fn wait_ready_fails_on_total_timeout() {
+        // The server is bound but every probe returns 500, which the loop
+        // treats as "PP up but workers initialising" — it keeps polling
+        // until the deadline. A short deadline (300ms) guarantees the
+        // loop exits with the deadline-exceeded bail, not a transport
+        // error.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health/version"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let err = client
+            .wait_ready(Duration::from_millis(300))
+            .await
+            .expect_err("must time out");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("did not return 200"),
+            "error must name the deadline-exceeded bail: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_ready_fails_on_dns_error_immediately() {
+        // RFC 2606 reserves `.invalid` for guaranteed-fail DNS — `reqwest`
+        // surfaces this as a transport error with `is_connect() == false`
+        // and `is_timeout() == false`, hitting the wait_ready "Other reqwest
+        // error" branch that fails fast.
+        let client = PpHttpClient::new("http://nonexistent.invalid".to_string());
+        let err = client
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect_err("DNS-fail must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unexpected error polling") || msg.contains("nonexistent.invalid"),
+            "error must surface the DNS/transport failure: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_batch_serializes_request_correctly() {
+        let server = MockServer::start().await;
+        let expected_body = json!({
+            "account_name": "bench",
+            "items": [
+                {
+                    "client_id": "bench-tx-0-0",
+                    "recipient_address": "tari://esmeralda/recipient_addr",
+                    "amount": 1000_i64,
+                    "payment_id": null,
+                }
+            ],
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "batch_id": "batch-1",
+                "account_name": "bench",
+                "status": "RECEIVED",
+                "payments": [payment_response_json("pay-1", "RECEIVED", "bench-tx-0-0")],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let items = vec![BulkPaymentItem {
+            client_id: "bench-tx-0-0".to_string(),
+            recipient_address: "tari://esmeralda/recipient_addr".to_string(),
+            amount: 1000,
+            payment_id: None,
+        }];
+        let resp = client.submit_batch("bench", items).await.expect("submit ok");
+        assert_eq!(resp.batch_id, "batch-1");
+        assert_eq!(resp.payments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_batch_parses_202_response() {
+        // Upstream may answer 202 Accepted while it stages the batch; the
+        // client treats every 2xx as success and parses the body.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "batch_id": "batch-202",
+                "account_name": "bench",
+                "status": "RECEIVED",
+                "payments": [payment_response_json("pay-202", "RECEIVED", "c1")],
+            })))
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let resp = client
+            .submit_batch(
+                "bench",
+                vec![BulkPaymentItem {
+                    client_id: "c1".to_string(),
+                    recipient_address: "addr".to_string(),
+                    amount: 1,
+                    payment_id: None,
+                }],
+            )
+            .await
+            .expect("202 must parse");
+        assert_eq!(resp.batch_id, "batch-202");
+        assert_eq!(resp.payments[0].status, PaymentStatus::Received);
+    }
+
+    #[tokio::test]
+    async fn submit_batch_returns_error_on_400_batch_too_large() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("batch size 101 exceeds MAX_BATCH_SIZE"),
+            )
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let err = client
+            .submit_batch(
+                "bench",
+                vec![BulkPaymentItem {
+                    client_id: "c1".to_string(),
+                    recipient_address: "addr".to_string(),
+                    amount: 1,
+                    payment_id: None,
+                }],
+            )
+            .await
+            .expect_err("400 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("400") && msg.contains("MAX_BATCH_SIZE"),
+            "error must carry the upstream body and status: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_batch_returns_error_on_503() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/payment-batches"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("service unavailable"))
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let err = client
+            .submit_batch(
+                "bench",
+                vec![BulkPaymentItem {
+                    client_id: "c1".to_string(),
+                    recipient_address: "addr".to_string(),
+                    amount: 1,
+                    payment_id: None,
+                }],
+            )
+            .await
+            .expect_err("503 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("503"),
+            "error must carry the HTTP 503 status: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_payment_404_returns_typed_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/payments/missing-id"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let err = client
+            .poll_payment("missing-id")
+            .await
+            .expect_err("404 must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("404"),
+            "error must carry the HTTP 404 status: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_payment_200_parses_status_enum() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/payments/pay-abc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(payment_response_json("pay-abc", "CONFIRMED", "c-abc")),
+            )
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let resp = client.poll_payment("pay-abc").await.expect("200 parses");
+        assert_eq!(resp.payment_id, "pay-abc");
+        assert_eq!(resp.status, PaymentStatus::Confirmed);
+        assert!(resp.status.is_terminal(), "Confirmed is a terminal state");
+    }
+
+    #[tokio::test]
+    async fn stream_events_with_filters_builds_correct_query_string() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/events"))
+            .and(query_param("account_name", "bench"))
+            .and(query_param("payment_id", "pay-1"))
+            .and(query_param("batch_id", "batch-1"))
+            .and(query_param("event_type", "PaymentReceived"))
+            .and(query_param("limit", "25"))
+            .and(query_param("offset", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "events": [],
+                "total_count": 0,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = PpHttpClient::new(server.uri());
+        let filters = EventFilters {
+            account_name: Some("bench".to_string()),
+            payment_id: Some("pay-1".to_string()),
+            batch_id: Some("batch-1".to_string()),
+            event_type: Some("PaymentReceived".to_string()),
+            from: None,
+            to: None,
+            limit: Some(25),
+            offset: Some(5),
+        };
+        let resp = client
+            .stream_events(filters)
+            .await
+            .expect("filtered events ok");
+        assert_eq!(resp.total_count, 0);
+        assert!(resp.events.is_empty());
+    }
 }
