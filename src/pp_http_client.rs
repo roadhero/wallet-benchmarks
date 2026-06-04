@@ -62,8 +62,10 @@ pub struct BulkPaymentItem {
 /// `MAX_BATCH_SIZE` items (PP enforces 100 per `vendor/.../src/lib.rs`).
 #[derive(Debug, Clone, Serialize)]
 pub struct BulkPaymentRequest {
-    /// PP account name as configured under `[mode_3.accounts]`. v1 always
-    /// uses the literal `"bench"`.
+    /// PP account name as configured under `[mode_3.accounts]`. Currently
+    /// the literal `"default"` — matches the wallet name hardcoded by
+    /// minotari-cli's `init_wallet.rs:121` (`friendly_name.unwrap_or("default")`),
+    /// which import-view-key does not override.
     pub account_name: String,
     /// Items in this batch.
     pub items: Vec<BulkPaymentItem>,
