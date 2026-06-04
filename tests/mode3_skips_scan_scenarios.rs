@@ -1,18 +1,20 @@
-//! Mode 3 — scan-shaped methods skip with `UnsupportedOperation`.
+//! Mode 3 — scan-shaped methods skip with `UnsupportedOperation`; balance
+//! and UTXO probes return `Ok(0)`.
 //!
 //! Per `analysis/specs/MODE_3_REWORK_SPEC.md §7` and `§13` integration list:
-//! Mode 3 does not own a scanning wallet, so the four scan-shaped methods
-//! (`scan_from_birthday`, `get_balance`, `get_utxo_count`,
-//! `wipe_and_reimport`) must return `UnsupportedOperation` rather than
-//! attempt any subprocess or HTTP call. The runner in `main.rs` downcasts
-//! the error and records the cell as `CellResult::NotRun` rather than
-//! `CellResult::Error` (see `src/main.rs:247`).
+//! Mode 3 does not own a scanning wallet, so `scan_from_birthday` and
+//! `wipe_and_reimport` return `UnsupportedOperation` (runner records the
+//! cell as `CellResult::NotRun` per `src/main.rs:247`). `get_balance` and
+//! `get_utxo_count` return `Ok(0)` instead (swe-review B1) — PP doesn't
+//! own the view-key wallet, but reporting zero rather than erroring lets
+//! S0 progress past its opening probes into its actual
+//! `POST /v1/payment-batches` measurement.
 //!
 //! This integration test constructs a real `PaymentProcessor` instance via
-//! the public `Mode` trait surface and asserts each of the four methods
-//! returns `UnsupportedOperation`. No daemon is spawned and no
-//! `start_external_services` call happens — the methods short-circuit
-//! before reaching the HTTP client or any subprocess.
+//! the public `Mode` trait surface and asserts the four methods'
+//! contracts. No daemon is spawned and no `start_external_services` call
+//! happens — the methods short-circuit before reaching the HTTP client or
+//! any subprocess.
 
 use std::path::PathBuf;
 
@@ -194,26 +196,35 @@ async fn mode3_scan_from_birthday_s7_returns_unsupported() {
 }
 
 #[tokio::test]
-async fn mode3_get_balance_returns_unsupported() {
-    // The scan scenarios also call get_balance / get_utxo_count to record
-    // pre/post counts. Mode 3 routes both into UnsupportedOperation.
+async fn mode3_get_balance_returns_zero() {
+    // Per swe-review B1: PP doesn't own a wallet-side balance surface so
+    // get_balance returns Ok(0) rather than UnsupportedOperation. This
+    // lets S0's opening probe pass and progress into the actual
+    // POST /v1/payment-batches work.
     let (mut mode, envs) = build_mode3("GET_BAL");
-    let err = mode
+    let balance = mode
         .get_balance()
         .await
-        .expect_err("get_balance must be skipped");
-    assert_unsupported(err, "get_balance");
+        .expect("get_balance must return Ok(0), not UnsupportedOperation (B1)");
+    assert_eq!(
+        balance, 0,
+        "Mode 3 reports zero spendable balance — PP doesn't own the view-key wallet",
+    );
     teardown(&envs);
 }
 
 #[tokio::test]
-async fn mode3_get_utxo_count_returns_unsupported() {
+async fn mode3_get_utxo_count_returns_zero() {
+    // Same B1 rationale as get_balance — PP doesn't own UTXOs.
     let (mut mode, envs) = build_mode3("GET_UTXO");
-    let err = mode
+    let count = mode
         .get_utxo_count()
         .await
-        .expect_err("get_utxo_count must be skipped");
-    assert_unsupported(err, "get_utxo_count");
+        .expect("get_utxo_count must return Ok(0), not UnsupportedOperation (B1)");
+    assert_eq!(
+        count, 0,
+        "Mode 3 reports zero UTXOs — PP doesn't own the view-key wallet",
+    );
     teardown(&envs);
 }
 
@@ -229,43 +240,32 @@ async fn mode3_wipe_and_reimport_returns_unsupported() {
 }
 
 #[tokio::test]
-async fn mode3_unsupported_reason_is_consistent_across_methods() {
-    // Per spec §7 every Mode 3 skip surfaces the same UNSUPPORTED_REASON
-    // string (no scanning wallet ... view-keys only). Verify the four
-    // scan-shaped methods all carry that exact reason.
+async fn mode3_scan_methods_skip_reasons_explain_no_scanning_wallet() {
+    // Per swe-review B1 + C5: only scan_from_birthday and
+    // wipe_and_reimport return UnsupportedOperation after the B1 fix
+    // (get_balance / get_utxo_count return Ok(0)). Their per-method
+    // reason strings each name the no-scanning-wallet rationale so the
+    // S2/S3/S6/S7 cell logs explain the skip observably.
     let (mut mode, envs) = build_mode3("REASON");
-    let mut reasons: Vec<&'static str> = Vec::new();
-    let e1 = mode.scan_from_birthday(0).await.expect_err("scan");
-    reasons.push(
-        e1.downcast_ref::<UnsupportedOperation>()
-            .expect("downcast")
-            .reason,
-    );
-    let e2 = mode.get_balance().await.expect_err("balance");
-    reasons.push(
-        e2.downcast_ref::<UnsupportedOperation>()
-            .expect("downcast")
-            .reason,
-    );
-    let e3 = mode.get_utxo_count().await.expect_err("utxo");
-    reasons.push(
-        e3.downcast_ref::<UnsupportedOperation>()
-            .expect("downcast")
-            .reason,
-    );
-    let e4 = mode.wipe_and_reimport(0).await.expect_err("wipe");
-    reasons.push(
-        e4.downcast_ref::<UnsupportedOperation>()
-            .expect("downcast")
-            .reason,
-    );
-    let first = reasons[0];
-    for r in &reasons[1..] {
-        assert_eq!(*r, first, "all skip reasons must be identical");
-    }
+    let e_scan = mode.scan_from_birthday(0).await.expect_err("scan");
+    let scan_reason = e_scan
+        .downcast_ref::<UnsupportedOperation>()
+        .expect("scan downcast")
+        .reason;
+    let e_wipe = mode.wipe_and_reimport(0).await.expect_err("wipe");
+    let wipe_reason = e_wipe
+        .downcast_ref::<UnsupportedOperation>()
+        .expect("wipe downcast")
+        .reason;
     assert!(
-        first.contains("scanning wallet"),
-        "reason must explain the no-scanning-wallet rationale: {first}",
+        scan_reason.contains("scanning wallet"),
+        "scan_from_birthday reason must explain the no-scanning-wallet rationale: \
+         {scan_reason}",
+    );
+    assert!(
+        wipe_reason.contains("re-importable wallet") || wipe_reason.contains("view-key"),
+        "wipe_and_reimport reason must explain the no-re-importable-wallet rationale: \
+         {wipe_reason}",
     );
     teardown(&envs);
 }

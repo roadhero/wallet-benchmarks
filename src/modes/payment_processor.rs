@@ -419,22 +419,24 @@ impl Mode for PaymentProcessor {
         .into())
     }
 
+    /// Mode 3's PP daemon does NOT own a wallet-side balance surface — the
+    /// view-key balance lives with the PR daemon, not with PP — so PP "as
+    /// far as Mode 3 is concerned" has zero spendable balance. Returning
+    /// `Ok(0)` (rather than `UnsupportedOperation`) lets S0 progress past
+    /// its opening `get_balance()` / `get_utxo_count()` calls into the
+    /// actual `POST /v1/payment-batches` work that S0 measures. Without
+    /// this, S0 would error-propagate via `?` and be recorded as `NotRun`
+    /// before the batch submission ever fires (swe-review B1).
     async fn get_balance(&mut self) -> anyhow::Result<u64> {
-        Err(UnsupportedOperation {
-            mode: MODE_NAME,
-            op: "get_balance",
-            reason: UNSUPPORTED_REASON,
-        }
-        .into())
+        Ok(0)
     }
 
+    /// See [`Self::get_balance`] — same rationale. PP doesn't own UTXOs;
+    /// the view-key UTXO set lives with the PR daemon. Reporting zero
+    /// keeps S0 progressing instead of erroring out before its
+    /// batch-POST work runs.
     async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
-        Err(UnsupportedOperation {
-            mode: MODE_NAME,
-            op: "get_utxo_count",
-            reason: UNSUPPORTED_REASON,
-        }
-        .into())
+        Ok(0)
     }
 
     async fn wipe_and_reimport(&mut self, _birthday: u16) -> anyhow::Result<()> {
@@ -674,34 +676,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mode3_get_balance_returns_unsupported_operation() {
+    async fn mode3_get_balance_returns_zero() {
+        // Per swe-review B1: PP doesn't own a wallet-side balance surface
+        // (view-key balance lives on the PR daemon). Returning Ok(0) lets
+        // S0 progress past its opening balance probe into the actual
+        // POST /v1/payment-batches measurement.
         let server = MockServer::start().await;
         let (mut mode, seeds_cfg, extras) = build_mode3_with_http("BAL", server.uri());
-        let err = mode
+        let balance = mode
             .get_balance()
             .await
-            .expect_err("Mode 3 must not support get_balance");
-        let uo = err
-            .downcast_ref::<UnsupportedOperation>()
-            .expect("error must downcast to UnsupportedOperation");
-        assert_eq!(uo.mode, "payment_processor");
-        assert_eq!(uo.op, "get_balance");
+            .expect("get_balance must succeed with Ok(0) (B1 fix)");
+        assert_eq!(
+            balance, 0,
+            "Mode 3 reports zero spendable balance — PP doesn't own the view-key wallet",
+        );
         teardown_envs(&seeds_cfg, &extras);
     }
 
     #[tokio::test]
-    async fn mode3_get_utxo_count_returns_unsupported_operation() {
+    async fn mode3_get_utxo_count_returns_zero() {
+        // Same B1 rationale as get_balance — PP doesn't own UTXOs; the
+        // view-key UTXO set lives on the PR daemon.
         let server = MockServer::start().await;
         let (mut mode, seeds_cfg, extras) = build_mode3_with_http("UTXO", server.uri());
-        let err = mode
+        let count = mode
             .get_utxo_count()
             .await
-            .expect_err("Mode 3 must not support get_utxo_count");
-        let uo = err
-            .downcast_ref::<UnsupportedOperation>()
-            .expect("error must downcast to UnsupportedOperation");
-        assert_eq!(uo.mode, "payment_processor");
-        assert_eq!(uo.op, "get_utxo_count");
+            .expect("get_utxo_count must succeed with Ok(0) (B1 fix)");
+        assert_eq!(
+            count, 0,
+            "Mode 3 reports zero UTXOs — PP doesn't own the view-key wallet",
+        );
         teardown_envs(&seeds_cfg, &extras);
     }
 
