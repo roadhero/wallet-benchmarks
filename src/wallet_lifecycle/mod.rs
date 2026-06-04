@@ -17,6 +17,7 @@ pub mod console_wallet;
 pub mod data_dir;
 pub mod grpc;
 pub mod pp_lifecycle;
+pub mod pr_balance_query;
 pub mod pr_lifecycle;
 
 use std::path::Path;

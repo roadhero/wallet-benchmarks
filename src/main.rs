@@ -127,7 +127,19 @@ async fn run_harness_async(
             "running funding pre-flight (3 transient console_wallet spawns; ~90s)",
         );
         let bq = WalletGrpcBalanceQuery::new(Arc::clone(&config), Arc::clone(&seeds));
-        guards::enforce_funding(&config, &seeds, &bq)
+        // Mode 3 (swe-review C4): when configured, route the SeedRole::Pp
+        // arm through the PR daemon's HTTP balance endpoint instead of
+        // the mnemonic-derived console_wallet path. The PR daemon isn't
+        // yet spawned at pre-flight time — the call will return a
+        // connection error and the Pp arm will be logged + skipped per
+        // the warn-path inside `enforce_funding`.
+        let pr_bq = config.mode_3.as_ref().map(|m| {
+            wallet_benchmarks::wallet_lifecycle::pr_balance_query::PrBalanceQuery::new(
+                format!("http://127.0.0.1:{}", m.pr_port),
+                "default",
+            )
+        });
+        guards::enforce_funding(&config, &seeds, &bq, pr_bq.as_ref())
             .await
             .context("enforce_funding pre-flight")?;
     } else {

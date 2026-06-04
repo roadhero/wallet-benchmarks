@@ -12,6 +12,7 @@ use anyhow::bail;
 use crate::{
     config::Config,
     seed::{SeedHandle, SeedRole},
+    wallet_lifecycle::pr_balance_query::PrBalanceQuery,
 };
 
 const LOG_TARGET: &str = "c::guards";
@@ -86,10 +87,24 @@ pub trait BalanceQuery: Send + Sync {
 /// [`enforce_esmeralda`] and before any mode runs. Funding-tx fees and
 /// timings are explicitly NOT in the result profile (AC-35) — this is a
 /// guardrail, not a measurement.
+///
+/// **Mode 3 note (swe-review C4)**: when `pr_balance_query` is `Some`,
+/// the `SeedRole::Pp` check uses the PR daemon's
+/// `GET /accounts/default/balance` endpoint rather than the generic
+/// `balance_query` (which would spawn a transient `console_wallet`
+/// against the PP mnemonic — wrong wallet, since Mode 3's signer is the
+/// view+spend keypair held by the PR daemon, not a mnemonic-derived
+/// address). When the PR daemon isn't yet up at pre-flight time
+/// (the harness spawns PR later, inside the per-mode loop), the HTTP
+/// call returns a transport error and the Mode 3 PP check is logged +
+/// skipped rather than failing the whole pre-flight. Operators who want
+/// strict pre-flight Mode 3 coverage must pre-warm the PR daemon
+/// out-of-band before running the harness; the warn log explains this.
 pub async fn enforce_funding(
     config: &Config,
     seeds: &SeedHandle,
     balance_query: &dyn BalanceQuery,
+    pr_balance_query: Option<&PrBalanceQuery>,
 ) -> anyhow::Result<()> {
     log::debug!(target: LOG_TARGET, "funding pre-flight against a_fund={}", config.a_fund);
     let required =
@@ -108,29 +123,65 @@ pub async fn enforce_funding(
         .get_balance(SeedRole::New)
         .await
         .map_err(|e| e.context("querying balance for the new-wallet seed"))?;
-    let bal_pp = balance_query
-        .get_balance(SeedRole::Pp)
-        .await
-        .map_err(|e| e.context("querying balance for the payment-processor seed"))?;
 
-    let any_short = bal_old < required || bal_new < required || bal_pp < required;
+    // Pp arm: Mode 3 path queries the PR daemon's HTTP API; the legacy
+    // mnemonic-derived path stays as the fallback for Mode 1+2 runs that
+    // don't configure Mode 3.
+    let bal_pp_opt: Option<u64> = if let Some(pr_bq) = pr_balance_query {
+        match pr_bq.get_balance().await {
+            Ok(b) => {
+                log::info!(
+                    target: LOG_TARGET,
+                    "Mode 3 PR-daemon balance pre-flight: {b} uT (querying {})",
+                    pr_bq.balance_url(),
+                );
+                Some(b)
+            }
+            Err(e) => {
+                log::warn!(
+                    target: LOG_TARGET,
+                    "Mode 3 PR-daemon balance pre-flight skipped: {e:#}. The PR daemon \
+                     isn't reachable at {} yet — pre-warm it out-of-band if you want \
+                     strict pre-flight coverage. Otherwise the per-mode loop will spawn \
+                     it before scenarios run.",
+                    pr_bq.balance_url(),
+                );
+                None
+            }
+        }
+    } else {
+        Some(
+            balance_query
+                .get_balance(SeedRole::Pp)
+                .await
+                .map_err(|e| e.context("querying balance for the payment-processor seed"))?,
+        )
+    };
+
+    let any_short =
+        bal_old < required || bal_new < required || bal_pp_opt.is_some_and(|b| b < required);
     if !any_short {
-        log::info!(
-            target: LOG_TARGET,
-            "funding pre-flight passed: required={required} uT, old={bal_old} uT, \
-             new={bal_new} uT, pp={bal_pp} uT",
-        );
+        match bal_pp_opt {
+            Some(bal_pp) => log::info!(
+                target: LOG_TARGET,
+                "funding pre-flight passed: required={required} uT, old={bal_old} uT, \
+                 new={bal_new} uT, pp={bal_pp} uT",
+            ),
+            None => log::info!(
+                target: LOG_TARGET,
+                "funding pre-flight passed (pp arm skipped): required={required} uT, \
+                 old={bal_old} uT, new={bal_new} uT",
+            ),
+        }
         return Ok(());
     }
 
     let mut report = format!(
         "Funding pre-flight failed. Required >= {required} uT per seed (a_fund * 11/10).\n",
     );
-    for (label, balance) in [
-        ("old_wallet", bal_old),
-        ("new_wallet", bal_new),
-        ("payment_processor", bal_pp),
-    ] {
+    let pp_row: Option<(&str, u64)> = bal_pp_opt.map(|b| ("payment_processor", b));
+    let core_rows: &[(&str, u64)] = &[("old_wallet", bal_old), ("new_wallet", bal_new)];
+    for (label, balance) in core_rows.iter().copied().chain(pp_row) {
         if balance < required {
             let deficit = required - balance;
             report.push_str(&format!(
@@ -139,6 +190,11 @@ pub async fn enforce_funding(
         } else {
             report.push_str(&format!("  {label}: {balance} uT OK\n"));
         }
+    }
+    if bal_pp_opt.is_none() {
+        report.push_str(
+            "  payment_processor: SKIPPED (PR daemon not reachable at pre-flight; see warn log)\n",
+        );
     }
     report.push_str("See RUNBOOK §Funding for how to mine to each address using minotari_miner.");
     bail!("{report}");
@@ -316,7 +372,7 @@ mod tests {
         bq.set(SeedRole::Old, required);
         bq.set(SeedRole::New, required + 1);
         bq.set(SeedRole::Pp, required.saturating_mul(2));
-        let r = enforce_funding(&cfg, &handle, &bq).await;
+        let r = enforce_funding(&cfg, &handle, &bq, None).await;
         unset_env(&seeds_cfg.old);
         unset_env(&seeds_cfg.new);
         unset_env(&seeds_cfg.payment_processor);
@@ -336,7 +392,7 @@ mod tests {
         bq.set(SeedRole::Old, required); // OK
         bq.set(SeedRole::New, 0); // short by required
         bq.set(SeedRole::Pp, required + 1_000_000); // OK
-        let err = enforce_funding(&cfg, &handle, &bq)
+        let err = enforce_funding(&cfg, &handle, &bq, None)
             .await
             .expect_err("a short balance must fail");
         unset_env(&seeds_cfg.old);
@@ -381,7 +437,7 @@ mod tests {
             ..Config::default()
         };
         let bq = FakeBalanceQuery::new(true);
-        let err = enforce_funding(&cfg, &handle, &bq)
+        let err = enforce_funding(&cfg, &handle, &bq, None)
             .await
             .expect_err("query err propagates");
         unset_env(&seeds_cfg.old);
@@ -395,6 +451,93 @@ mod tests {
         assert!(
             msg.contains("simulated balance query failure"),
             "underlying cause should be preserved: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_funding_routes_pp_arm_through_pr_balance_query_when_provided() {
+        // Per swe-review C4: when `pr_balance_query` is Some, the Pp
+        // arm uses the PR daemon's HTTP endpoint and the legacy
+        // BalanceQuery for Pp is NOT consulted. Wiremock proves the call
+        // shape (GET /accounts/default/balance), parses `available` from
+        // the JSON, and treats the Pp arm as funded.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let seeds_cfg = unique_seeds("C4_PR_ROUTING");
+        let handle = install_three_seeds(&seeds_cfg);
+        let cfg = Config {
+            a_fund: 10_000_000_000,
+            ..Config::default()
+        };
+        let required = cfg.a_fund * 11 / 10;
+        let mut bq = FakeBalanceQuery::new(false);
+        bq.set(SeedRole::Old, required);
+        bq.set(SeedRole::New, required);
+        // Pp arm on the FakeBalanceQuery is intentionally zero —
+        // if pr_balance_query routing is wrong and the fallback is taken,
+        // the test fails with "short by required".
+        bq.set(SeedRole::Pp, 0);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/accounts/default/balance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total": required + 1,
+                "available": required + 1,
+                "locked": 0_u64,
+                "unconfirmed": 0_u64,
+                "immature": 0_u64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let pr_bq = PrBalanceQuery::new(server.uri(), "default");
+
+        let result = enforce_funding(&cfg, &handle, &bq, Some(&pr_bq)).await;
+        unset_env(&seeds_cfg.old);
+        unset_env(&seeds_cfg.new);
+        unset_env(&seeds_cfg.payment_processor);
+        result.expect("pp arm via PR balance query must pass");
+
+        // FakeBalanceQuery records every call it sees. Confirm the
+        // Pp arm was NOT routed through it (the PrBalanceQuery handled
+        // Pp instead).
+        let calls = bq.calls.lock().unwrap().clone();
+        assert!(
+            !calls.contains(&SeedRole::Pp),
+            "FakeBalanceQuery must not have been asked for Pp — routing went through \
+             PrBalanceQuery instead. Saw calls: {calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_funding_logs_warning_and_skips_pp_when_pr_daemon_unreachable() {
+        // The common pre-flight case: Mode 3 is configured but the PR
+        // daemon isn't yet spawned (start_external_services runs later).
+        // The pre-flight gets a connection error on the Pp arm; the
+        // warn-path skips the Pp check and the rest of the pre-flight
+        // proceeds.
+        let seeds_cfg = unique_seeds("C4_PR_UNREACHABLE");
+        let handle = install_three_seeds(&seeds_cfg);
+        let cfg = Config {
+            a_fund: 10_000_000_000,
+            ..Config::default()
+        };
+        let required = cfg.a_fund * 11 / 10;
+        let mut bq = FakeBalanceQuery::new(false);
+        bq.set(SeedRole::Old, required);
+        bq.set(SeedRole::New, required);
+        // Point at port 1 — guaranteed connection-refused on every
+        // sane host.
+        let pr_bq = PrBalanceQuery::new("http://127.0.0.1:1", "default");
+
+        let result = enforce_funding(&cfg, &handle, &bq, Some(&pr_bq)).await;
+        unset_env(&seeds_cfg.old);
+        unset_env(&seeds_cfg.new);
+        unset_env(&seeds_cfg.payment_processor);
+        result.expect(
+            "pre-flight must pass with the Pp arm skipped when the PR daemon is unreachable",
         );
     }
 }
