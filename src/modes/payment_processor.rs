@@ -65,11 +65,20 @@ pub const PP_MAX_BATCH_SIZE: usize = 100;
 /// `"default"` to match (see `pp_lifecycle::ACCOUNT_NAME`).
 const ACCOUNT_NAME: &str = "default";
 
-/// Common reason string for every Skipped-by-Mode-3 scenario, per spec §7.
-const UNSUPPORTED_REASON: &str =
-    "Mode 3 (payment_processor) does not own a scanning wallet; the daemon holds view-keys \
-     only and signing is delegated to a separate console_wallet instance. Scenarios that \
-     exercise the scanning code path do not apply.";
+/// Reason string surfaced when `scan_from_birthday` is called against Mode 3
+/// (B0/S2/S3/S6/S7). Per swe-review C5, the reason names the specific
+/// operation rather than a one-size-fits-all generic so the cell log
+/// explains what's actually unsupported.
+const REASON_SCAN_FROM_BIRTHDAY: &str =
+    "Mode 3 doesn't own a scanning wallet — PP holds view-keys only and signing is \
+     delegated to a separate console_wallet";
+
+/// Reason string surfaced when `wipe_and_reimport` is called against Mode 3.
+/// The PR daemon's view-key wallet is managed at lifecycle startup, not
+/// reimported per-scenario; there's no operator-driven re-import surface.
+const REASON_WIPE_AND_REIMPORT: &str =
+    "Mode 3 doesn't own a re-importable wallet — the PR daemon's view-key wallet is \
+     managed at lifecycle startup";
 
 /// Mode 3 — `payment_processor`.
 ///
@@ -414,7 +423,7 @@ impl Mode for PaymentProcessor {
         Err(UnsupportedOperation {
             mode: MODE_NAME,
             op: "scan_from_birthday",
-            reason: UNSUPPORTED_REASON,
+            reason: REASON_SCAN_FROM_BIRTHDAY,
         }
         .into())
     }
@@ -443,7 +452,7 @@ impl Mode for PaymentProcessor {
         Err(UnsupportedOperation {
             mode: MODE_NAME,
             op: "wipe_and_reimport",
-            reason: UNSUPPORTED_REASON,
+            reason: REASON_WIPE_AND_REIMPORT,
         }
         .into())
     }
@@ -672,6 +681,9 @@ mod tests {
             .expect("error must downcast to UnsupportedOperation");
         assert_eq!(uo.mode, "payment_processor");
         assert_eq!(uo.op, "scan_from_birthday");
+        // Per swe-review C5: per-method reason names the actual gap so
+        // the cell log explains what's unsupported.
+        assert_eq!(uo.reason, REASON_SCAN_FROM_BIRTHDAY);
         teardown_envs(&seeds_cfg, &extras);
     }
 
@@ -724,6 +736,8 @@ mod tests {
             .expect("error must downcast to UnsupportedOperation");
         assert_eq!(uo.mode, "payment_processor");
         assert_eq!(uo.op, "wipe_and_reimport");
+        // Per swe-review C5: per-method reason names the actual gap.
+        assert_eq!(uo.reason, REASON_WIPE_AND_REIMPORT);
         teardown_envs(&seeds_cfg, &extras);
     }
 
