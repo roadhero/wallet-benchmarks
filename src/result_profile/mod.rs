@@ -525,7 +525,7 @@ fn round_to_json(r: &RoundOutcome) -> Value {
 }
 
 fn tx_record_to_json(t: &TxRecord) -> Value {
-    let mut v = json!({
+    json!({
         "txid": t.txid,
         "t_total_ms": t.t_total_ms,
         "t_broadcast_ms": t.t_broadcast_ms,
@@ -533,20 +533,7 @@ fn tx_record_to_json(t: &TxRecord) -> Value {
         "status": t.status,
         "error_string": t.error_string,
         "fee_microtari": t.fee_microtari,
-    });
-    // sub_segments_ms is Mode 3-only per MODE_3_REWORK_SPEC.md §10/§11
-    // — emit when present, omit otherwise so Modes 1 and 2 stay
-    // byte-stable with their pre-rework profile output.
-    if let Some(segments) = t.sub_segments_ms.as_ref() {
-        if let Value::Object(ref mut m) = v {
-            let map: serde_json::Map<String, Value> = segments
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::from(*v)))
-                .collect();
-            m.insert("sub_segments_ms".to_string(), Value::Object(map));
-        }
-    }
-    v
+    })
 }
 
 fn s2_payload(s: &S2Outcome) -> Value {

@@ -138,7 +138,6 @@ impl Mode for OldWallet {
             // reports it in `transaction_info`. Set to 0; scenario code
             // backfills via `GetTransactionInfo` polling in step 3i.
             fee_microtari: 0,
-            sub_segments_ms: None,
         })
     }
 
@@ -345,7 +344,6 @@ impl S4Dispatcher for OldWalletDispatcher {
             status,
             error_string,
             fee_microtari: 0,
-            sub_segments_ms: None,
         })
     }
 }

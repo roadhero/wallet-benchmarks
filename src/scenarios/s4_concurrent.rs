@@ -582,7 +582,6 @@ mod tests {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 0,
-            sub_segments_ms: None,
         }
     }
 
@@ -595,7 +594,6 @@ mod tests {
             status: "failure".to_string(),
             error_string: Some(reason.to_string()),
             fee_microtari: 0,
-            sub_segments_ms: None,
         }
     }
 

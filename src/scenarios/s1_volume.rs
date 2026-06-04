@@ -394,7 +394,6 @@ fn synthesize_failure_record(error_string: &str) -> TxRecord {
         status: "failure:construct".to_string(),
         error_string: Some(error_string.to_string()),
         fee_microtari: 0,
-        sub_segments_ms: None,
     }
 }
 
@@ -452,7 +451,6 @@ mod tests {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 50,
-            sub_segments_ms: None,
         }
     }
 
@@ -631,7 +629,6 @@ mod tests {
                 status: status.to_string(),
                 error_string: None,
                 fee_microtari: 0,
-                sub_segments_ms: None,
             }
         }
         let outcome = S1Outcome {

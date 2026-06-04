@@ -429,7 +429,6 @@ pub(super) async fn create_sign_and_submit(
                 status: TxRecordStatus::failed(TxRecordPhase::Broadcast).to_string(),
                 error_string: Some(format!("{e:#}")),
                 fee_microtari: 0,
-                sub_segments_ms: None,
             });
         }
     };
@@ -468,7 +467,6 @@ pub(super) async fn create_sign_and_submit(
         // backfills via subsequent polling (3i). 0 here is "not yet observed",
         // not "actually zero".
         fee_microtari: 0,
-        sub_segments_ms: None,
     })
 }
 
@@ -573,7 +571,6 @@ fn failed_record(
         status: TxRecordStatus::failed(phase).to_string(),
         error_string: Some(error_string),
         fee_microtari: 0,
-        sub_segments_ms: None,
     }
 }
 

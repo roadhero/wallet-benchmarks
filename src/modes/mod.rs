@@ -24,7 +24,6 @@ pub mod new_wallet;
 pub mod old_wallet;
 pub mod payment_processor;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tari_common_types::tari_address::TariAddress;
@@ -60,13 +59,6 @@ pub struct TxRecord {
     /// Fee paid in microTari for this transaction. Set to 0 when the
     /// transaction failed before fee computation.
     pub fee_microtari: u64,
-    /// Optional per-pipeline-stage sub-segment timings, keyed by stage name
-    /// (e.g. `"BatchCreated_to_AwaitingSignature"`). Populated by Mode 3
-    /// from PP's `/v1/events` stream per
-    /// `analysis/specs/MODE_3_REWORK_SPEC.md §10` recommendation; `None`
-    /// for Modes 1 and 2 (no equivalent stage decomposition).
-    #[allow(dead_code)]
-    pub sub_segments_ms: Option<HashMap<String, u64>>,
 }
 
 /// Per-scan outcome produced by `Mode::scan_from_birthday`. Carries the
@@ -634,7 +626,6 @@ pub(crate) mod test_support {
                 status: "success".to_string(),
                 error_string: None,
                 fee_microtari: 0,
-                sub_segments_ms: None,
             }
         }
 

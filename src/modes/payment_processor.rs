@@ -375,7 +375,6 @@ impl Mode for PaymentProcessor {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 0,
-            sub_segments_ms: None,
         })
     }
 
@@ -415,7 +414,6 @@ impl Mode for PaymentProcessor {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 0,
-            sub_segments_ms: None,
         })
     }
 
@@ -514,7 +512,6 @@ impl S4Dispatcher for PpDispatcher {
             status: "success".to_string(),
             error_string: None,
             fee_microtari: 0,
-            sub_segments_ms: None,
         })
     }
 }
