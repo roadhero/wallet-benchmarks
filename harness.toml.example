@@ -26,6 +26,11 @@ pp_binary_path = "/tmp/tari-pp-build/pp/target/release/minotari_payment_processo
 minotari_binary_path = "/usr/local/bin/minotari"
 api_port = 9145
 pr_port = 9146
+# Base URL the PR daemon talks to for its blockchain RPC client.
+# Passed via --base-url on `minotari daemon`. Default mirrors
+# `base_node_url` above; override only when running against a
+# co-located base node.
+pr_base_url = "https://rpc.esmeralda.tari.com"
 terminal_state_poll_timeout_secs = 60
 
 # Per-worker sleep overrides (seconds). Each `null` lets PP keep its

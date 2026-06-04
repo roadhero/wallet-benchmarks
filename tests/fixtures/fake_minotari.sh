@@ -17,6 +17,27 @@ set -eu
 
 echo "fake_minotari.sh: spawned (argv: $*)" >&2
 
+# Real `minotari` CLI carries top-level flags (`--network <name>`,
+# `--config <path>`) BEFORE the subcommand on argv. Walk past them so this
+# fake stays aligned with the real CLI's argv shape (see
+# `minotari-cli@52a7287a/minotari/src/cli.rs`).
+while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+        --network|--config)
+            shift 2
+            ;;
+        --*)
+            # Unknown leading flag — preserve and stop skipping so the
+            # downstream subcommand parser can complain (real CLI does the
+            # same on unknown global flags).
+            break
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 subcommand="${1:-}"
 
 case "$subcommand" in

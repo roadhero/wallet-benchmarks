@@ -56,9 +56,14 @@ pub const MODE_NAME: &str = "payment_processor";
 /// `MODE_3_REWORK_SPEC.md §10`.
 pub const PP_MAX_BATCH_SIZE: usize = 100;
 
-/// Account name PP and the PR daemon both watch. Mirrors
-/// `ACCOUNTS__BENCH__NAME=bench` on PP's spawn env.
-const ACCOUNT_NAME: &str = "bench";
+/// Account name PP and the PR daemon both watch. Unified to `"default"`
+/// because upstream `minotari-cli@52a7287a/minotari/src/utils/init_wallet.rs:121`
+/// hard-codes the PR daemon's wallet name as `"default"` and neither
+/// `daemon` nor `import-view-key` accepts an `--account-name` override.
+/// The PR daemon's `GET /accounts/{name}/balance` endpoint expects this
+/// exact value, and PP's `ACCOUNTS__BENCH__NAME` env value flips to
+/// `"default"` to match (see `pp_lifecycle::ACCOUNT_NAME`).
+const ACCOUNT_NAME: &str = "default";
 
 /// Common reason string for every Skipped-by-Mode-3 scenario, per spec §7.
 const UNSUPPORTED_REASON: &str =
@@ -111,6 +116,7 @@ impl PaymentProcessor {
             )
         })?;
         let pr_port = mode_3.pr_port;
+        let pr_base_url = mode_3.pr_base_url.clone();
         let (view_key_hex, spend_key_hex) =
             crate::wallet_lifecycle::pp_lifecycle::read_account_env(&mode_3.accounts.bench)?;
         let wallet_password = seeds
@@ -126,6 +132,7 @@ impl PaymentProcessor {
                 spend_public_key_hex: spend_key_hex,
                 wallet_password,
                 port: pr_port,
+                base_url: pr_base_url,
             },
             pr_data_dir,
         )?;
@@ -159,6 +166,7 @@ impl PaymentProcessor {
             anyhow::anyhow!("from_parts_for_test requires Config::mode_3 to be Some")
         })?;
         let pr_port = mode_3.pr_port;
+        let pr_base_url = mode_3.pr_base_url.clone();
         let (view_key_hex, spend_key_hex) =
             crate::wallet_lifecycle::pp_lifecycle::read_account_env(&mode_3.accounts.bench)?;
         let wallet_password = seeds
@@ -174,6 +182,7 @@ impl PaymentProcessor {
                 spend_public_key_hex: spend_key_hex,
                 wallet_password,
                 port: pr_port,
+                base_url: pr_base_url,
             },
             pr_data_dir,
         )?;
@@ -560,6 +569,7 @@ mod tests {
                 minotari_binary_path: fake_minotari_path(),
                 api_port: 9145,
                 pr_port: 9146,
+                pr_base_url: "https://rpc.esmeralda.tari.com".to_string(),
                 terminal_state_poll_timeout_secs: 1,
                 worker_sleep_overrides: WorkerSleepOverrides::default(),
                 accounts: Mode3Accounts {

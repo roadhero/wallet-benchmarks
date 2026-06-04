@@ -8,11 +8,18 @@
 //! `minotari import-view-key` consumes a view-key + spend-public-key hex
 //! pair (no mnemonic), and PP holds the corresponding spend secret.
 //!
-//! Spawn sequence (spec §5):
-//! 1. `minotari import-view-key --view-private-key <hex> --spend-public-key <hex>
-//!    --base-path <dd> --network esmeralda --password <pw>` (one-shot).
-//! 2. `minotari daemon --base-path <dd> --network esmeralda --port <port>
-//!    --account-name default --password <pw>` (long-running Child).
+//! Spawn sequence (spec §5, argvs match the real `minotari` CLI at
+//! `minotari-cli@52a7287a/minotari/src/cli.rs`):
+//! 1. `minotari --network esmeralda import-view-key --database-path <dd>
+//!    --view-private-key <hex> --spend-public-key <hex> --password <pw>`
+//!    (one-shot). `--network` is a top-level flag on `Cli`, not on the
+//!    subcommand. The subcommand accepts no `--account-name` — the wallet
+//!    name is hard-coded to `"default"` by upstream `init_wallet.rs:121`.
+//! 2. `minotari --network esmeralda daemon --database-path <dd>
+//!    --base-url <pr_base_url> --api-port <port> --password <pw>`
+//!    (long-running Child). Same notes apply: `--network` is top-level,
+//!    no `--account-name`, the data dir flag is `--database-path` (not
+//!    `--base-path`), the listen port flag is `--api-port` (not `--port`).
 //! 3. Poll `GET http://127.0.0.1:<port>/accounts/default/balance` until 200
 //!    (same 200ms backoff / 30s deadline as PP — see [`crate::pp_http_client`]).
 //!
@@ -41,8 +48,12 @@ const LOG_TARGET: &str = "c::wallet_lifecycle::pr_lifecycle";
 /// guard via [`crate::guards::enforce_esmeralda`]).
 const NETWORK_FLAG_VALUE: &str = "esmeralda";
 
-/// Account name passed via `--account-name`. v1 hard-codes `default`;
-/// matches the literal PP calls `/accounts/default/...` against.
+/// Account name PP and the PR daemon both watch. Unified to `"default"`
+/// because upstream `minotari-cli@52a7287a/minotari/src/utils/init_wallet.rs:121`
+/// hard-codes the wallet name as `"default"` and neither `daemon` nor
+/// `import-view-key` accepts an `--account-name` override. PP's
+/// `ACCOUNTS__BENCH__NAME=default` env value lines the two up so PP's
+/// `GET /accounts/default/balance` hits the PR daemon's actual account.
 const ACCOUNT_NAME: &str = "default";
 
 /// PR readiness-probe inter-attempt backoff (matches PP per spec §5).
@@ -77,6 +88,9 @@ pub struct PrLifecycleConfig {
     pub wallet_password: String,
     /// HTTP listen port (default 9146 — see `Mode3Config::pr_port`).
     pub port: u16,
+    /// Base URL the PR daemon's blockchain RPC client talks to, passed via
+    /// `--base-url` on `minotari daemon` (default `Mode3Config::pr_base_url`).
+    pub base_url: String,
 }
 
 /// Mode 3's PR daemon lifecycle handle.
@@ -119,39 +133,50 @@ impl PrLifecycle {
 
     /// Build the argv vector for the `minotari import-view-key` one-shot.
     /// Pure function so unit tests can snapshot it without spawning.
-    pub fn import_view_key_argv(
-        network: &str,
-        data_dir: &std::path::Path,
-        port: u16,
-    ) -> Vec<String> {
-        // `--port` and `--account-name` are not part of import-view-key,
-        // but `--base-path` is; we keep the rest constant. Wallet password
-        // and view/spend keys are appended in `spawn` since they're secrets.
-        let _ = port; // explicit silencing — argv shape does not include port
+    ///
+    /// Shape per the real CLI at `minotari-cli@52a7287a/minotari/src/cli.rs`:
+    /// `--network` is a top-level flag on `Cli` (positioned BEFORE the
+    /// subcommand), `--database-path` is the data-dir flag (alias from
+    /// `DatabaseArgs`), and the subcommand accepts no `--account-name` —
+    /// the wallet name is hard-coded to `"default"` upstream. View-key /
+    /// spend-key / password are appended in [`Self::spawn`] (kept out of
+    /// the argv builder so secrets don't sit in stable argv strings).
+    pub fn import_view_key_argv(network: &str, data_dir: &std::path::Path) -> Vec<String> {
         vec![
-            "import-view-key".to_string(),
-            "--base-path".to_string(),
-            data_dir.display().to_string(),
             "--network".to_string(),
             network.to_string(),
-            "--account-name".to_string(),
-            ACCOUNT_NAME.to_string(),
+            "import-view-key".to_string(),
+            "--database-path".to_string(),
+            data_dir.display().to_string(),
         ]
     }
 
     /// Build the argv vector for `minotari daemon`. Pure function so unit
     /// tests can snapshot it without spawning.
-    pub fn daemon_argv(network: &str, data_dir: &std::path::Path, port: u16) -> Vec<String> {
+    ///
+    /// Shape per the real CLI at `minotari-cli@52a7287a/minotari/src/cli.rs`:
+    /// `--network` is a top-level flag on `Cli` (positioned BEFORE the
+    /// subcommand), `--database-path` is the data-dir flag (alias from
+    /// `DatabaseArgs`), `--api-port` is the HTTP listen port flag, and
+    /// `--base-url` (from `NodeArgs`) is the blockchain RPC base URL the
+    /// daemon scans against. No `--account-name` — the wallet name is
+    /// hard-coded to `"default"` upstream.
+    pub fn daemon_argv(
+        network: &str,
+        data_dir: &std::path::Path,
+        port: u16,
+        base_url: &str,
+    ) -> Vec<String> {
         vec![
-            "daemon".to_string(),
-            "--base-path".to_string(),
-            data_dir.display().to_string(),
             "--network".to_string(),
             network.to_string(),
-            "--port".to_string(),
+            "daemon".to_string(),
+            "--database-path".to_string(),
+            data_dir.display().to_string(),
+            "--base-url".to_string(),
+            base_url.to_string(),
+            "--api-port".to_string(),
             port.to_string(),
-            "--account-name".to_string(),
-            ACCOUNT_NAME.to_string(),
         ]
     }
 
@@ -168,8 +193,7 @@ impl PrLifecycle {
             return Ok(());
         }
         // Step 1: import-view-key one-shot. Wait for exit; bail on non-zero.
-        let import_argv =
-            Self::import_view_key_argv(&self.cfg.network, self.data_dir.path(), self.cfg.port);
+        let import_argv = Self::import_view_key_argv(&self.cfg.network, self.data_dir.path());
         log::info!(
             target: LOG_TARGET,
             "spawning {} import-view-key (view key + spend key + password redacted)",
@@ -209,7 +233,12 @@ impl PrLifecycle {
         let stderr = stdout
             .try_clone()
             .context("cloning PR daemon log file handle for stderr")?;
-        let daemon_argv = Self::daemon_argv(&self.cfg.network, self.data_dir.path(), self.cfg.port);
+        let daemon_argv = Self::daemon_argv(
+            &self.cfg.network,
+            self.data_dir.path(),
+            self.cfg.port,
+            &self.cfg.base_url,
+        );
         log::info!(
             target: LOG_TARGET,
             "spawning {} daemon (port={}, account=default, password redacted)",
@@ -411,55 +440,125 @@ mod tests {
                 "40e65c9bbf4592bc995c421108c01a5d7c9f9b2239569757895134549cef371f".to_string(),
             wallet_password: "test-password".to_string(),
             port,
+            base_url: "https://rpc.esmeralda.tari.com".to_string(),
         }
     }
 
     #[test]
-    fn import_view_key_argv_matches_spec() {
-        // Pure-fn snapshot. Per spec §5 step 1 the argv must include
-        // import-view-key + --base-path + --network + --account-name in
-        // that order. The view-key / spend-key / password flags are
+    fn import_view_key_argv_matches_real_cli() {
+        // Pure-fn snapshot. Real CLI per minotari-cli@52a7287a/minotari/src/cli.rs:
+        // top-level `--network` precedes the subcommand; the subcommand
+        // accepts `--database-path` (alias from DatabaseArgs) and takes
+        // NO `--account-name` (wallet name is hard-coded to "default" by
+        // init_wallet.rs:121). View-key / spend-key / password are
         // appended in spawn() (kept out of the argv builder so secrets
         // don't sit in stable argv strings).
-        let argv = PrLifecycle::import_view_key_argv("esmeralda", Path::new("/tmp/pr"), 9146);
-        assert_eq!(argv[0], "import-view-key");
-        assert_eq!(argv[1], "--base-path");
-        assert_eq!(argv[2], "/tmp/pr");
-        assert_eq!(argv[3], "--network");
-        assert_eq!(argv[4], "esmeralda");
-        assert_eq!(argv[5], "--account-name");
-        assert_eq!(argv[6], ACCOUNT_NAME);
-        // Port is intentionally omitted — assert no element equals the
-        // port literal so a future regression that re-adds it surfaces.
+        let argv = PrLifecycle::import_view_key_argv("esmeralda", Path::new("/tmp/pr"));
+        assert_eq!(argv[0], "--network");
+        assert_eq!(argv[1], "esmeralda");
+        assert_eq!(argv[2], "import-view-key");
+        assert_eq!(argv[3], "--database-path");
+        assert_eq!(argv[4], "/tmp/pr");
+        // Account-name and the legacy --base-path are intentionally absent
+        // — assert no element matches so a future regression surfaces.
         assert!(
-            !argv.iter().any(|a| a == "9146"),
-            "import-view-key argv must not carry --port: {argv:?}",
+            !argv.iter().any(|a| a == "--account-name"),
+            "import-view-key takes no --account-name: {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--base-path"),
+            "import-view-key uses --database-path, not --base-path: {argv:?}",
         );
     }
 
     #[test]
-    fn daemon_argv_matches_spec() {
-        // Per spec §5 step 2 the daemon argv carries --port + --account-name
-        // in addition to the import-view-key shape.
-        let argv = PrLifecycle::daemon_argv("esmeralda", Path::new("/tmp/pr"), 9146);
-        assert_eq!(argv[0], "daemon");
-        assert_eq!(argv[1], "--base-path");
-        assert_eq!(argv[2], "/tmp/pr");
-        assert_eq!(argv[3], "--network");
-        assert_eq!(argv[4], "esmeralda");
-        assert_eq!(argv[5], "--port");
-        assert_eq!(argv[6], "9146");
-        assert_eq!(argv[7], "--account-name");
-        assert_eq!(argv[8], ACCOUNT_NAME);
+    fn daemon_argv_matches_real_cli() {
+        // Real CLI per minotari-cli@52a7287a/minotari/src/cli.rs:
+        // top-level `--network` precedes the subcommand; the subcommand
+        // accepts --database-path (DatabaseArgs), --base-url (NodeArgs),
+        // and --api-port. Takes NO --account-name (wallet name is
+        // hard-coded to "default" by init_wallet.rs:121).
+        let argv = PrLifecycle::daemon_argv(
+            "esmeralda",
+            Path::new("/tmp/pr"),
+            9146,
+            "https://rpc.esmeralda.tari.com",
+        );
+        assert_eq!(argv[0], "--network");
+        assert_eq!(argv[1], "esmeralda");
+        assert_eq!(argv[2], "daemon");
+        assert_eq!(argv[3], "--database-path");
+        assert_eq!(argv[4], "/tmp/pr");
+        assert_eq!(argv[5], "--base-url");
+        assert_eq!(argv[6], "https://rpc.esmeralda.tari.com");
+        assert_eq!(argv[7], "--api-port");
+        assert_eq!(argv[8], "9146");
+        // Account-name and the legacy --base-path/--port are intentionally
+        // absent — assert no element matches so a future regression
+        // surfaces.
+        assert!(
+            !argv.iter().any(|a| a == "--account-name"),
+            "daemon takes no --account-name: {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--base-path"),
+            "daemon uses --database-path, not --base-path: {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--port"),
+            "daemon uses --api-port, not --port: {argv:?}",
+        );
     }
 
     #[test]
     fn daemon_argv_includes_the_dynamic_port() {
-        let argv = PrLifecycle::daemon_argv("esmeralda", Path::new("/data"), 12345);
+        let argv = PrLifecycle::daemon_argv(
+            "esmeralda",
+            Path::new("/data"),
+            12345,
+            "https://rpc.esmeralda.tari.com",
+        );
         assert!(
             argv.iter().any(|a| a == "12345"),
             "daemon argv must reference the dynamic port literally: {argv:?}",
         );
+    }
+
+    #[test]
+    fn daemon_argv_includes_all_four_mandatory_flags() {
+        // Regression guard for swe-review B2: every daemon spawn MUST
+        // carry --database-path, --api-port, --base-url, and top-level
+        // --network. Asserting positions catches both "wrong flag name"
+        // and "flag in the wrong place" regressions (--network MUST come
+        // before the `daemon` subcommand or clap parse fails).
+        let argv = PrLifecycle::daemon_argv(
+            "esmeralda",
+            Path::new("/data"),
+            9146,
+            "https://rpc.esmeralda.tari.com",
+        );
+        let network_idx = argv
+            .iter()
+            .position(|a| a == "--network")
+            .expect("--network must be present");
+        let daemon_idx = argv
+            .iter()
+            .position(|a| a == "daemon")
+            .expect("daemon subcommand must be present");
+        assert!(
+            network_idx < daemon_idx,
+            "--network must precede the daemon subcommand (top-level Cli flag): {argv:?}",
+        );
+        for flag in ["--database-path", "--api-port", "--base-url"] {
+            let idx = argv
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("daemon argv must include {flag}: {argv:?}"));
+            assert!(
+                idx > daemon_idx,
+                "{flag} must follow the daemon subcommand: {argv:?}",
+            );
+        }
     }
 
     #[test]
@@ -495,7 +594,12 @@ mod tests {
         let log_path = logs.join("pr-daemon.log");
         let stdout = std::fs::File::create(&log_path).expect("create log");
         let stderr = stdout.try_clone().expect("clone log fd");
-        let argv = PrLifecycle::daemon_argv("esmeralda", dir.path(), allocate_port());
+        let argv = PrLifecycle::daemon_argv(
+            "esmeralda",
+            dir.path(),
+            allocate_port(),
+            "https://rpc.esmeralda.tari.com",
+        );
         let child = Command::new(fake_minotari_path())
             .args(&argv)
             .args(["--password", "test-password"])
@@ -542,7 +646,12 @@ mod tests {
         let log_path = logs.join("pr-daemon.log");
         let stdout = std::fs::File::create(&log_path).expect("create log");
         let stderr = stdout.try_clone().expect("clone log fd");
-        let argv = PrLifecycle::daemon_argv("esmeralda", life.data_dir_path(), port);
+        let argv = PrLifecycle::daemon_argv(
+            "esmeralda",
+            life.data_dir_path(),
+            port,
+            "https://rpc.esmeralda.tari.com",
+        );
         let child = Command::new(fake_minotari_path())
             .args(&argv)
             .args(["--password", "test-password"])
@@ -580,7 +689,12 @@ mod tests {
         let log_path = logs.join("pr-daemon.log");
         let stdout = std::fs::File::create(&log_path).expect("create log");
         let stderr = stdout.try_clone().expect("clone log fd");
-        let argv = PrLifecycle::daemon_argv("esmeralda", life.data_dir_path(), port);
+        let argv = PrLifecycle::daemon_argv(
+            "esmeralda",
+            life.data_dir_path(),
+            port,
+            "https://rpc.esmeralda.tari.com",
+        );
         let child = Command::new(fake_minotari_path())
             .args(&argv)
             .args(["--password", "test-password"])

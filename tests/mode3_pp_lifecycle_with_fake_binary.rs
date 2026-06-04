@@ -87,6 +87,7 @@ fn build_pp_lifecycle(suffix: &str) -> (PpLifecycle, Vec<String>) {
             minotari_binary_path: fake_minotari_path(),
             api_port: port,
             pr_port: allocate_port(),
+            pr_base_url: "https://rpc.esmeralda.tari.com".to_string(),
             terminal_state_poll_timeout_secs: 1,
             worker_sleep_overrides: WorkerSleepOverrides::default(),
             accounts: Mode3Accounts {

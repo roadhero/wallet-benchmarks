@@ -46,10 +46,18 @@ const LOG_TARGET: &str = "c::wallet_lifecycle::pp_lifecycle";
 /// — `crate::guards::enforce_esmeralda` is the primary gate.
 const NETWORK_ALLOWLIST: &str = "esmeralda";
 
-/// Hard-coded bench account name. Mirrors `[mode_3.accounts.bench]` in
-/// `harness.toml`; emitted as `ACCOUNTS__BENCH__NAME=bench`. v1 supports
-/// a single PP account (per spec §15 out-of-scope note).
-const ACCOUNT_NAME: &str = "bench";
+/// PP account `name` value emitted under `ACCOUNTS__BENCH__NAME`. Unified
+/// to `"default"` because upstream
+/// `minotari-cli@52a7287a/minotari/src/utils/init_wallet.rs:121`
+/// hard-codes the PR daemon's wallet name as `"default"` and neither
+/// `daemon` nor `import-view-key` accepts an `--account-name` override.
+/// PP routes `GET /accounts/{name}/balance` calls to the PR daemon using
+/// this value, so the two MUST line up. The operator-facing env-var KEY
+/// (`BENCH`) stays unchanged — PP's config parser at
+/// `vendor/.../config.rs:128` discards the env KEY and uses
+/// `raw_acc.name.to_lowercase()` as the map key, so flipping VALUE only
+/// is correct.
+const ACCOUNT_NAME: &str = "default";
 
 /// LISTEN_IP value baked at the lifecycle layer. `127.0.0.1` per spec §2's
 /// bench-safety note (PP's own default would bind `0.0.0.0`).
@@ -535,7 +543,7 @@ mod tests {
         // Per MODE_3_REWORK_SPEC.md §2 the spawn matrix must include every
         // key in the spec table. Snapshot the value set produced by
         // build_env and confirm every documented key is present, plus
-        // ACCOUNTS__BENCH__NAME=bench / LISTEN_IP=127.0.0.1 / REVEAL_PII=true.
+        // ACCOUNTS__BENCH__NAME=default / LISTEN_IP=127.0.0.1 / REVEAL_PII=true.
         let dir =
             HarnessDataDir::new("test-pp-build-env-all", "payment_processor").expect("data dir");
         let port = allocate_port();
@@ -573,7 +581,11 @@ mod tests {
         assert_eq!(env.get("LISTEN_IP").map(|s| s.as_str()), Some("127.0.0.1"));
         assert_eq!(
             env.get("ACCOUNTS__BENCH__NAME").map(|s| s.as_str()),
-            Some("bench")
+            Some("default"),
+            "ACCOUNTS__BENCH__NAME VALUE must be 'default' so PP's \
+             /accounts/default/balance hits the PR daemon's account name \
+             (hard-coded to 'default' by init_wallet.rs:121); the env-var \
+             KEY 'BENCH' is unchanged."
         );
         assert_eq!(env.get("REVEAL_PII").map(|s| s.as_str()), Some("true"));
         assert_eq!(

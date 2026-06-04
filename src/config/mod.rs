@@ -194,6 +194,15 @@ pub struct Mode3Config {
     #[serde(default = "Mode3Config::default_pr_port")]
     pub pr_port: u16,
 
+    /// Base URL the PR daemon (`minotari daemon`) talks to for its own
+    /// blockchain RPC client. Passed via `--base-url` on the `daemon`
+    /// subcommand; the real `minotari` CLI surfaces this flag through
+    /// `NodeArgs` and treats it as mandatory in practice (the daemon needs
+    /// a base node to scan). Default mirrors the harness-wide Esmeralda
+    /// base node so a fresh operator can opt in without extra config.
+    #[serde(default = "Mode3Config::default_pr_base_url")]
+    pub pr_base_url: String,
+
     /// Per-payment terminal-state poll timeout at shutdown (seconds).
     /// After all S4/S5 sends, the run loop polls each submitted payment
     /// for [`crate::pp_http_client::PaymentStatus::is_terminal`]; the
@@ -351,6 +360,9 @@ impl Mode3Config {
     }
     fn default_pr_port() -> u16 {
         9146
+    }
+    fn default_pr_base_url() -> String {
+        "https://rpc.esmeralda.tari.com".to_string()
     }
     fn default_terminal_poll_timeout() -> u64 {
         60
