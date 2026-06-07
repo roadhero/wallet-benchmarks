@@ -314,9 +314,9 @@ walkdir  = "2"
    - `GetState` (ready + tip tracking)
    - `GetAddress` (S0 funding verification)
    - `GetBalance` (every scenario's `balance_before` / `balance_after`)
-   - `Transfer` (S0, S1 doubling rounds, S1 fan-out, S4 (called concurrently via `tokio::JoinSet`), S5 individual arm)
+   - `Transfer` (S0, S1 doubling rounds, S1 fan-out, S4 (called concurrently via `tokio::JoinSet`), S5 individual arm, S5 batch arm with `single_tx = true` per maintainer comment 2026-06-05)
    - `GetCompletedTransactions` + `GetTransactionInfo` (confirmation polling, txid → status mapping)
-   - For S5 batch arm in Mode 1: skipped (per AC-20, batch arm runs for PP only). For Mode 1 we run only S5 individual arm; cell still emitted with `arms.batch.applies = false`.
+   - For S5 batch arm in Mode 1: runs via `Transfer` with `single_tx = true` and K recipients per call. Per the wallet.proto:578 doc: "SingleTx is used to indicate should this be sent as a single MW tx or multiple, one tx per recipient." With `single_tx = true` the wallet builds a single 1→K Mimblewimble transaction. Per @SWvheerden 2026-06-05.
 4. **Tear down.** `SIGTERM` → wait up to 10s for exit → `SIGKILL` → wait on PID. Wrapped in a `Drop` impl on `WalletHandle` so panics and Ctrl-C don't leak the process. Tempdir under `target/harness-data/<run-id>/old_wallet/` removed on graceful shutdown; left in place if harness panicked (operator can diagnose).
 5. **Knobs.** `network = "esmeralda"` (literal), `data_dir = <tempdir>`, password from `$HARNESS_WALLET_PW`, base-node URL from `config.base_node_url`. No `make-it-rain`.
 

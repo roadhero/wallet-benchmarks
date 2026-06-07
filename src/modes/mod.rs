@@ -109,10 +109,11 @@ pub trait Mode: Send + Sync {
     ) -> anyhow::Result<TxRecord>;
 
     /// Construct and broadcast a 1-to-many transaction. Mode 1 (`old_wallet`)
-    /// returns `Err` here — its gRPC `Transfer` does not natively support
-    /// 1→K batch (per `DESIGN.md §Mode 1 step 3` "For S5 batch arm in Mode 1:
-    /// skipped"). Mode 2 and Mode 3 implement this via repeated `--recipient`
-    /// flags on `minotari create-unsigned-transaction`.
+    /// dispatches gRPC `Transfer` with `single_tx = true` and K recipients
+    /// (one MW tx with K outputs, per `wallet.proto:578` and PR #6 inline
+    /// from @SWvheerden 2026-06-05). Mode 2 and Mode 3 implement this via
+    /// repeated `--recipient` flags on `minotari create-unsigned-transaction`.
+    /// See `analysis/DESIGN_AMENDMENT.md §11`.
     async fn send_batch_one_to_many(
         &mut self,
         recipients: &[(TariAddress, u64)],

@@ -7,13 +7,14 @@
 //! `minotari_app_grpc::tari_rpc::wallet_client::WalletClient`:
 //!
 //! * `send_single`: `Transfer` with a single `PaymentRecipient`.
-//! * `send_batch_one_to_many`: returns [`UnsupportedOperation`] per
-//!   `DESIGN.md §Mode 1 step 3` ("For S5 batch arm in Mode 1: skipped").
-//!   The gRPC `Transfer` accepts `repeated PaymentRecipient` but its
-//!   `TransferResponse.results` shape is "one TransferResult per
-//!   recipient" — semantically N independent single-recipient txs, not a
-//!   single 1→K batch. AC-20 reinforces that S5's batch arm runs on
-//!   `payment_processor` only.
+//! * `send_batch_one_to_many`: `Transfer` with K `PaymentRecipient` entries
+//!   and `single_tx = true`. Per `wallet.proto:578` ("SingleTx is used to
+//!   indicate should this be sent as a single MW tx or multiple, one tx
+//!   per recipient") the wallet constructs a single Mimblewimble
+//!   transaction with K outputs and broadcasts it — the 1→K batch shape
+//!   S5's batch arm needs. Greenlit by @SWvheerden on PR #6
+//!   (2026-06-05): "you can run this on the console wallet". See
+//!   `analysis/DESIGN_AMENDMENT.md §11`.
 //! * `scan_from_birthday`: teardown → wipe → spawn at the new birthday →
 //!   wait_ready (the wallet scans on start; readiness is the proxy for
 //!   scan complete).
@@ -43,7 +44,7 @@ use tari_common_types::{
 use tonic::{transport::Channel, Request};
 
 use crate::{
-    modes::{Mode, S4Dispatcher, ScanOutcome, TxRecord, UnsupportedOperation},
+    modes::{Mode, S4Dispatcher, ScanOutcome, TxRecord},
     wallet_lifecycle::{console_wallet::ConsoleWalletLifecycle, WalletLifecycle},
 };
 
@@ -143,16 +144,102 @@ impl Mode for OldWallet {
 
     async fn send_batch_one_to_many(
         &mut self,
-        _recipients: &[(TariAddress, u64)],
-        _fee_rate: u64,
+        recipients: &[(TariAddress, u64)],
+        fee_rate: u64,
     ) -> anyhow::Result<TxRecord> {
-        Err(anyhow::Error::new(UnsupportedOperation {
-            mode: "old_wallet",
-            op: "send_batch_one_to_many",
-            reason: "gRPC Transfer's TransferResponse is one TransferResult per recipient \
-                     (N independent single-recipient txs, not a 1->K batch); \
-                     S5's batch arm runs only on payment_processor (AC-20).",
-        }))
+        // K=0 is a harness bug — AC-19 specifies K=10 per batch call.
+        // Surface as Err so the scenario's `synthesize_failure_record`
+        // path tags `phase = "construct"` (per spec §4 Q3).
+        if recipients.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Mode 1 send_batch_one_to_many: empty recipients",
+            ));
+        }
+        let started = Instant::now();
+        let client = self.lifecycle.client_mut()?;
+        let payment_recipients: Vec<PaymentRecipient> = recipients
+            .iter()
+            .map(|(addr, amount)| PaymentRecipient {
+                address: addr.to_base58(),
+                amount: *amount,
+                fee_per_gram: fee_rate,
+                payment_type: PaymentType::OneSidedToStealthAddress as i32,
+                raw_payment_id: Vec::new(),
+                user_payment_id: None,
+            })
+            .collect();
+        let k = payment_recipients.len();
+        let req = TransferRequest {
+            recipients: payment_recipients,
+            // `single_tx = true` switches the wallet from "N independent
+            // 1-to-1 txs" to "one MW tx with K outputs" per
+            // `wallet.proto:578`. This is the batch shape AC-19/AC-20 want.
+            single_tx: true,
+        };
+        log::debug!(
+            target: LOG_TARGET,
+            "Mode 1 send_batch_one_to_many: K={k} fee_rate={fee_rate}",
+        );
+        let resp = client
+            .transfer(Request::new(req))
+            .await
+            .context("Mode 1 send_batch_one_to_many gRPC call")?
+            .into_inner();
+        let t_total = started.elapsed().as_millis() as u64;
+        let results = resp.results;
+        if results.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Mode 1 Transfer (batch) returned an empty results vector",
+            ));
+        }
+        // Canonical txid: take the first entry. With `single_tx = true`,
+        // either there is exactly one `TransferResult` (one MW tx) or all
+        // K entries share the same `transaction_id` — see spec §1
+        // "TransferResponse.results cardinality with `single_tx = true`".
+        let canonical_txid = results[0].transaction_id.to_string();
+        let success_count = results.iter().filter(|r| r.is_success).count();
+        let failure_count = results.len() - success_count;
+        let first_failure_message = results
+            .iter()
+            .find(|r| !r.is_success)
+            .map(|r| r.failure_message.clone());
+        let (status, error_string) = if failure_count == 0 {
+            ("success".to_string(), None)
+        } else if success_count == 0 {
+            // All-fail: mirror `send_single`'s shape — record the
+            // upstream failure message verbatim.
+            (
+                "failure".to_string(),
+                Some(first_failure_message.unwrap_or_default()),
+            )
+        } else {
+            // Partial failure: structurally rare under `single_tx = true`
+            // (the wallet either builds the single MW tx or it doesn't)
+            // but the response shape permits it. Fold to one failure
+            // entry with an explanatory string so S5's partition
+            // invariant (one TxRecord per send_*) holds. Per spec §4
+            // Q1 ratified mapping.
+            (
+                "failure".to_string(),
+                Some(format!(
+                    "partial failure: {failure_count}/{} recipients failed: {}",
+                    results.len(),
+                    first_failure_message.unwrap_or_default(),
+                )),
+            )
+        };
+        Ok(TxRecord {
+            txid: canonical_txid,
+            t_total_ms: t_total,
+            t_broadcast_ms: t_total,
+            t_confirm_ms: None,
+            status,
+            error_string,
+            // Per `send_single`'s convention: per-tx fee is not known at
+            // this layer; scenario code backfills via `GetTransactionInfo`
+            // polling in step 3i.
+            fee_microtari: 0,
+        })
     }
 
     async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
@@ -375,29 +462,6 @@ mod tests {
         // We can't instantiate `OldWallet` without spawning, but `name`
         // is a `&'static str` so it should match the source const.
         assert_eq!("old_wallet", "old_wallet");
-    }
-
-    #[test]
-    fn mode1_send_batch_one_to_many_error_names_ac20_and_old_wallet() {
-        // The error is constructed at the call site (matches the value
-        // returned by send_batch_one_to_many).
-        let err = UnsupportedOperation {
-            mode: "old_wallet",
-            op: "send_batch_one_to_many",
-            reason: "gRPC Transfer's TransferResponse is one TransferResult per recipient \
-                     (N independent single-recipient txs, not a 1->K batch); \
-                     S5's batch arm runs only on payment_processor (AC-20).",
-        };
-        let msg = format!("{err}");
-        assert!(msg.contains("old_wallet"), "name in message: {msg}");
-        assert!(
-            msg.contains("send_batch_one_to_many"),
-            "op in message: {msg}",
-        );
-        assert!(
-            msg.contains("AC-20"),
-            "rationale must name the AC for reviewability: {msg}",
-        );
     }
 
     #[test]

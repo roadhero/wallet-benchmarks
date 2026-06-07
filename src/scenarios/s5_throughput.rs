@@ -12,12 +12,12 @@
 //!   sends via [`Mode::send_single`]. Runs for every mode (`SeedRole::Old`,
 //!   `SeedRole::New`, `SeedRole::Pp`).
 //! * **Batch arm** — `s5_m / s5_k` (default 10) sequential `s5_k`-recipient
-//!   (default 10) sends via [`Mode::send_batch_one_to_many`]. Runs for Mode 2
-//!   (`SeedRole::New`) and Mode 3 (`SeedRole::Pp`) only. Mode 1
-//!   (`SeedRole::Old`) skips the batch arm entirely — `arms.batch.applies =
-//!   false` per AC-20 and `DESIGN.md` line 319 ("For S5 batch arm in Mode 1:
-//!   skipped"). Gating happens BEFORE invoking `send_batch_one_to_many` so
-//!   the Mode 1 `UnsupportedOperation` error never fires.
+//!   (default 10) sends via [`Mode::send_batch_one_to_many`]. Runs for all
+//!   three modes — Mode 1's batch path dispatches gRPC `Transfer` with
+//!   `single_tx = true` per @SWvheerden's 2026-06-05 PR-6 comment
+//!   ("you can run this on the console wallet"); Mode 2/3 dispatch via the
+//!   `minotari create-unsigned-transaction` subprocess pipeline. See
+//!   `analysis/DESIGN_AMENDMENT.md §11`.
 //!
 //! `throughput_multiplier = t_individual / t_batch` (wall-clock ratio per
 //! schema line 215) when both arms apply AND both `t_total_ms` are `> 0`;
@@ -50,9 +50,9 @@ use crate::seed::{derive_recipient_pool, SeedHandle, SeedRole};
 /// 200-216 for the per-arm shape, plus the universal cell counters from the
 /// `§errors sub-object` (lines 112-116) shared by every scenario.
 ///
-/// `arms.batch.applies` is the AC-20 gate: `false` for Mode 1 (`SeedRole::Old`)
-/// because gRPC `Transfer` does not support 1→K natively (per `DESIGN.md`
-/// line 319). On Mode 2 / Mode 3 both arms apply.
+/// `arms.batch.applies` is true for all three modes — Mode 1 wires the
+/// batch arm via gRPC `Transfer` with `single_tx = true` per
+/// `analysis/DESIGN_AMENDMENT.md §11`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct S5Outcome {
     /// Successful tx submissions across both arms. Schema line 112.
@@ -72,15 +72,14 @@ pub struct S5Outcome {
     /// Schema line 116 — one entry per non-success non-rejection event
     /// (broadcast / construct / sign failures from `Mode::send_*`).
     pub details: Vec<DetailRecord>,
-    /// Per-arm outcomes. `arms.batch.applies = false` on Mode 1; both
-    /// `applies = true` on Mode 2 / Mode 3.
+    /// Per-arm outcomes. Both `applies = true` on every mode post
+    /// `analysis/DESIGN_AMENDMENT.md §11`.
     pub arms: S5Arms,
     /// `throughput_multiplier` per schema line 215 + AC-19. Computed as
     /// `t_individual / t_batch` (wall-clock ratio; >1.0 means batch
     /// finishes faster overall than the equivalent volume of individual
-    /// sends) when both arms apply and both `t_total_ms` are `> 0`; `None`
-    /// otherwise (so Mode 1 always carries `None` here — batch arm did
-    /// not run).
+    /// sends) when both `t_total_ms` are `> 0`; `None` on divide-by-zero
+    /// (degenerate fake-mode case).
     pub throughput_multiplier: Option<f64>,
     /// `peak_rss_bytes` — `None` until the 1 Hz sampler lands in step 3j.
     pub peak_rss_bytes: Option<u64>,
@@ -96,7 +95,7 @@ pub struct S5Arms {
     /// Individual arm — `s5_m` sequential single-recipient sends.
     pub individual: ArmOutcome,
     /// Batch arm — `s5_m / s5_k` sequential `s5_k`-recipient batch sends.
-    /// `applies = false` on Mode 1 per AC-20.
+    /// Runs on all three modes per `analysis/DESIGN_AMENDMENT.md §11`.
     pub batch: ArmOutcome,
 }
 
@@ -109,56 +108,41 @@ pub struct S5Arms {
 /// `applies = false` — same convention as S1's `peak_*` sampler fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArmOutcome {
-    /// AC-20 — `false` only when the arm did not run (Mode 1 batch arm).
-    /// Schema line 207's `arms.batch.applies` bool gate.
+    /// AC-20 — `true` whenever the arm ran. Schema line 207's
+    /// `arms.batch.applies` bool gate. Post-DESIGN_AMENDMENT §11 all
+    /// three modes run both arms, so this is `true` on every produced
+    /// outcome; the field is kept for schema uniformity and for the
+    /// `compute_throughput_multiplier` divide-by-zero guard.
     pub applies: bool,
     /// Number of `send_*` calls in this arm: `s5_m` for individual,
-    /// `s5_m / s5_k` for batch. `0` when `applies = false`.
+    /// `s5_m / s5_k` for batch.
     pub tx_count: u32,
     /// Recipients per `send_*` call: `1` for individual, `s5_k` for batch.
-    /// `0` when `applies = false`.
     pub recipients_per_tx: u32,
-    /// `tx_count * recipients_per_tx` — total recipients served by this arm.
-    /// `0` when `applies = false`. Both arms target the same total under
-    /// the default config (`s5_m = 100`, `s5_k = 10`): individual arm
-    /// serves `100 * 1 = 100`, batch arm serves `10 * 10 = 100`.
+    /// `tx_count * recipients_per_tx` — total recipients served by this
+    /// arm. Both arms target the same total under the default config
+    /// (`s5_m = 100`, `s5_k = 10`): individual arm serves `100 * 1 = 100`,
+    /// batch arm serves `10 * 10 = 100`.
     pub total_sends: u32,
     /// Arm wall-clock from first `send_*` to last terminal-state event,
-    /// in milliseconds. `0` when `applies = false`.
+    /// in milliseconds.
     pub t_total_ms: u64,
     /// `tx_count / (t_total_ms / 1000)` — the comparable rate for the
-    /// AC-19 multiplier. `None` when `applies = false` OR `t_total_ms == 0`.
-    /// Per repo idiom for rate-per-unit-time fields.
+    /// AC-19 multiplier. `None` when `t_total_ms == 0` (divide-by-zero
+    /// guard). Per repo idiom for rate-per-unit-time fields.
     pub throughput_tx_per_sec: Option<f64>,
     /// Raw `TxRecord` from each `send_*` call in dispatch order. Schema-
     /// equivalent of the per-arm `tx_records[]` slot.
     pub tx_records: Vec<TxRecord>,
 }
 
-impl ArmOutcome {
-    /// Sentinel for an arm that did not run (Mode 1 batch arm). All metric
-    /// fields go to zero / empty / `None` per the schema's `applies = false`
-    /// gate.
-    fn skipped() -> Self {
-        Self {
-            applies: false,
-            tx_count: 0,
-            recipients_per_tx: 0,
-            total_sends: 0,
-            t_total_ms: 0,
-            throughput_tx_per_sec: None,
-            tx_records: Vec::new(),
-        }
-    }
-}
-
 /// Run S5 against the given mode.
 ///
-/// `seed_role_for_mode` drives the AC-20 batch-arm skip: `SeedRole::Old`
-/// (Mode 1) → batch arm skipped, `arms.batch.applies = false`. The same
-/// role names the seed slot from which the recipient pool is derived.
-/// Routed through `ScenarioInput::s5_seed_role_for_mode` by the run loop
-/// (step 3i.2) so the scenario stays mode-agnostic — see [`super::ScenarioInput`].
+/// `seed_role_for_mode` names the seed slot from which the recipient pool
+/// is derived. Routed through `ScenarioInput::s5_seed_role_for_mode` by
+/// the run loop (step 3i.2) so the scenario stays mode-agnostic — see
+/// [`super::ScenarioInput`]. All three modes run both arms per
+/// `analysis/DESIGN_AMENDMENT.md §11`.
 pub(super) async fn run(
     ctx: &ScenarioCtx<'_>,
     mode: &mut dyn Mode,
@@ -201,24 +185,20 @@ pub(super) async fn run(
     )
     .await?;
 
-    // Batch arm: skipped on Mode 1 (SeedRole::Old) per AC-20 + DESIGN.md
-    // §Mode 1 line 319. The skip happens BEFORE invoking
-    // `send_batch_one_to_many` so the UnsupportedOperation error never
-    // fires.
-    let batch = if matches!(seed_role_for_mode, SeedRole::Old) {
-        ArmOutcome::skipped()
-    } else {
-        run_batch_arm(
-            mode,
-            ctx.seeds,
-            &pool_strategy,
-            m,
-            k,
-            amount_per_recipient,
-            fee_rate,
-        )
-        .await?
-    };
+    // Batch arm runs for all three modes. Mode 1 dispatches the batch via
+    // gRPC `Transfer` with `single_tx = true` (per
+    // `analysis/DESIGN_AMENDMENT.md §11`); Mode 2/3 dispatch via the
+    // `minotari create-unsigned-transaction` subprocess pipeline.
+    let batch = run_batch_arm(
+        mode,
+        ctx.seeds,
+        &pool_strategy,
+        m,
+        k,
+        amount_per_recipient,
+        fee_rate,
+    )
+    .await?;
 
     // Cell-level counter fold: sum across both arms. stall_count stays
     // structurally 0 until 3k wires confirmation polling (see module docs);
@@ -389,9 +369,8 @@ fn throughput(tx_count: u32, t_total_ms: u64) -> Option<f64> {
 /// arms. >1.0 means batch finishes the equivalent send-volume faster
 /// than individual.
 ///
-/// `None` when the batch arm did not run (Mode 1 per AC-20) or either
-/// `t_total_ms` is zero (degenerate fake-mode case; divide-by-zero
-/// protection).
+/// `None` when either `t_total_ms` is zero (degenerate fake-mode case;
+/// divide-by-zero protection).
 fn compute_throughput_multiplier(individual: &ArmOutcome, batch: &ArmOutcome) -> Option<f64> {
     if !batch.applies {
         return None;
@@ -572,10 +551,10 @@ mod tests {
     /// throughput_tx_per_sec is Some, tx_records.len()=4.
     #[tokio::test]
     async fn s5_individual_arm_smoke() {
-        // Mode = New, but batch arm should NOT run here because we only
-        // assert the individual arm's shape. Skip the batch arm by
-        // pointing the role at Old (which skips batch) — keeps the canned
-        // sequence narrow.
+        // Post DESIGN_AMENDMENT §11 the batch arm runs on every role —
+        // provide a canned batch record so the test asserts only the
+        // individual arm's shape without the batch arm tripping
+        // FakeMode's "no canned value" bail.
         let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
             "INDIV_SMOKE",
             4,
@@ -586,7 +565,7 @@ mod tests {
                 SendOutcome::Ok(ok_record("c")),
                 SendOutcome::Ok(ok_record("d")),
             ],
-            None,
+            Some(ok_record("batch")),
         );
         let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
         let outcome = run(&ctx, &mut fake, SeedRole::Old)
@@ -608,8 +587,8 @@ mod tests {
         } else {
             assert!(outcome.arms.individual.throughput_tx_per_sec.is_some());
         }
-        // Cell-level: 4 successes, no failures.
-        assert_eq!(outcome.success_count, 4);
+        // Cell-level: 4 individual successes + 2 batch successes = 6.
+        assert_eq!(outcome.success_count, 6);
         assert_eq!(outcome.rejection_count, 0);
         assert_eq!(outcome.stall_count, 0);
         assert_eq!(outcome.timeout_count, 0);
@@ -619,12 +598,13 @@ mod tests {
         unset_env(&seeds_cfg.payment_processor);
     }
 
-    /// SeedRole::Old → batch arm SKIPS. No `send_batch_one_to_many` call
-    /// observed via FakeMode.calls. throughput_multiplier is None.
+    /// SeedRole::Old → batch arm RUNS post `analysis/DESIGN_AMENDMENT.md
+    /// §11`. With s5_m=4 / s5_k=2 the batch arm dispatches 4/2 = 2 batch
+    /// sends each carrying 2 recipients, identical to Modes 2/3.
     #[tokio::test]
-    async fn s5_batch_arm_skips_on_mode1() {
+    async fn s5_batch_arm_runs_on_mode1() {
         let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
-            "BATCH_SKIP",
+            "BATCH_RUNS_M1",
             4,
             2,
             vec![
@@ -633,8 +613,6 @@ mod tests {
                 SendOutcome::Ok(ok_record("c")),
                 SendOutcome::Ok(ok_record("d")),
             ],
-            // canned_batch present — but the skip must happen BEFORE the
-            // call so FakeMode.calls must NOT contain "send_batch_one_to_many".
             Some(ok_record("batch")),
         );
         let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
@@ -643,26 +621,21 @@ mod tests {
             .expect("S5 run ok");
 
         assert!(
-            !outcome.arms.batch.applies,
-            "SeedRole::Old must skip the batch arm per AC-20 + DESIGN.md line 319",
+            outcome.arms.batch.applies,
+            "Mode 1 batch arm must run post DESIGN_AMENDMENT §11",
         );
-        assert_eq!(outcome.arms.batch.tx_count, 0);
-        assert_eq!(outcome.arms.batch.recipients_per_tx, 0);
-        assert_eq!(outcome.arms.batch.total_sends, 0);
-        assert!(outcome.arms.batch.throughput_tx_per_sec.is_none());
-        assert!(outcome.arms.batch.tx_records.is_empty());
-        assert!(
-            outcome.throughput_multiplier.is_none(),
-            "throughput_multiplier must be None when batch arm did not run",
-        );
+        assert_eq!(outcome.arms.batch.tx_count, 2);
+        assert_eq!(outcome.arms.batch.recipients_per_tx, 2);
+        assert_eq!(outcome.arms.batch.total_sends, 4);
+        assert_eq!(outcome.arms.batch.tx_records.len(), 2);
         let calls = fake.calls.lock().unwrap().clone();
         let batch_calls = calls
             .iter()
             .filter(|c| **c == "send_batch_one_to_many")
             .count();
         assert_eq!(
-            batch_calls, 0,
-            "Mode 1 skip must happen BEFORE invoking send_batch_one_to_many",
+            batch_calls, 2,
+            "exactly 2 batch dispatches for s5_m=4/s5_k=2 on SeedRole::Old",
         );
         unset_env(&seeds_cfg.old);
         unset_env(&seeds_cfg.new);
