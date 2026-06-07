@@ -484,8 +484,63 @@ fn rewrite_birthday(mnemonic: &str, new_birthday: u16) -> anyhow::Result<String>
 
 #[cfg(test)]
 mod tests {
+    // NOTE: a gRPC transport-error test (the 4th case in the operator's
+    // brief) is genuinely not unit-testable here. Per `DESIGN.md` line
+    // 580 ("No tonic mock for Mode 1 gRPC — surface is too wide ~25
+    // methods; gRPC contract validated by live-network smoke + the
+    // committed baseline run") this repo intentionally does NOT carry a
+    // fake-gRPC server, and `CLAUDE.md` forbids test infrastructure
+    // outside the test tree. The transport-error path is exercised via
+    // `tests/live_esmeralda_smoke_batch.rs` against testnet and via the
+    // baseline-run artifact — see `analysis/specs/MODE_1_BATCH_SEND_SPEC.md
+    // §5 Layer 2/3`.
+
+    use minotari_app_grpc::tari_rpc::{TransferResponse, TransferResult};
+
     use super::*;
-    use crate::gen_seed;
+    use crate::{
+        config::{Config, Seeds},
+        gen_seed,
+        seed::{derive_address, SeedHandle},
+        wallet_lifecycle::HarnessDataDir,
+    };
+
+    /// Build a 100-recipient `(TariAddress, u64)` slice from a single seed
+    /// (one base address × 100 amounts) — sufficient for the pure
+    /// `build_batch_transfer_request` assertions which only inspect
+    /// `address`, `amount`, `fee_per_gram`, `payment_type`.
+    fn fixture_recipients(n: usize) -> Vec<(TariAddress, u64)> {
+        let mnemonic = gen_seed().expect("gen_seed");
+        let addr = derive_address(&mnemonic).expect("derive_address");
+        (0..n).map(|i| (addr.clone(), 1_000 + i as u64)).collect()
+    }
+
+    /// Synthesize a `TransferResponse` with `successes` is_success=true
+    /// entries followed by `failures` is_success=false entries. Each
+    /// entry shares `transaction_id = txid`; failure entries carry
+    /// `failure_message = "insufficient_funds"`.
+    fn synth_transfer_response(txid: u64, successes: usize, failures: usize) -> TransferResponse {
+        let mut results = Vec::with_capacity(successes + failures);
+        for _ in 0..successes {
+            results.push(TransferResult {
+                address: String::new(),
+                transaction_id: txid,
+                is_success: true,
+                failure_message: String::new(),
+                transaction_info: None,
+            });
+        }
+        for _ in 0..failures {
+            results.push(TransferResult {
+                address: String::new(),
+                transaction_id: txid,
+                is_success: false,
+                failure_message: "insufficient_funds".to_string(),
+                transaction_info: None,
+            });
+        }
+        TransferResponse { results }
+    }
 
     #[test]
     fn mode1_name_is_old_wallet() {
@@ -493,6 +548,164 @@ mod tests {
         // We can't instantiate `OldWallet` without spawning, but `name`
         // is a `&'static str` so it should match the source const.
         assert_eq!("old_wallet", "old_wallet");
+    }
+
+    /// Spec §5 case 1 — `build_batch_transfer_request` carries every
+    /// recipient with `single_tx = true`, `fee_per_gram = fee_rate`, and
+    /// `payment_type = OneSidedToStealthAddress`.
+    #[test]
+    fn build_batch_request_carries_all_recipients_with_single_tx() {
+        let recipients = fixture_recipients(100);
+        let fee_rate = 5;
+        let req = build_batch_transfer_request(&recipients, fee_rate);
+
+        assert!(req.single_tx, "single_tx must be true for 1→K batch");
+        assert_eq!(req.recipients.len(), 100, "all K recipients preserved");
+        for (i, pr) in req.recipients.iter().enumerate() {
+            assert_eq!(
+                pr.payment_type,
+                PaymentType::OneSidedToStealthAddress as i32,
+                "recipient[{i}] payment_type must be OneSidedToStealthAddress",
+            );
+            assert_eq!(
+                pr.fee_per_gram, fee_rate,
+                "recipient[{i}] fee_per_gram must equal fee_rate (uniform per spec §3)",
+            );
+            assert_eq!(
+                pr.address,
+                recipients[i].0.to_base58(),
+                "recipient[{i}] address must match input ordering",
+            );
+            assert_eq!(
+                pr.amount, recipients[i].1,
+                "recipient[{i}] amount must match input ordering",
+            );
+            assert!(
+                pr.raw_payment_id.is_empty(),
+                "recipient[{i}] raw_payment_id must be empty (matches send_single)",
+            );
+            assert!(
+                pr.user_payment_id.is_none(),
+                "recipient[{i}] user_payment_id must be None (matches send_single)",
+            );
+        }
+    }
+
+    /// Spec §5 case 5/9/10 — happy path. All K `is_success = true` →
+    /// `Ok(TxRecord { status: "success", error_string: None, txid =
+    /// results[0].transaction_id.to_string(), fee_microtari = 0, .. })`.
+    #[test]
+    fn fold_batch_response_happy_path_returns_ok_success() {
+        let resp = synth_transfer_response(12_345, 10, 0);
+        let t_total_ms = 42;
+        let rec = fold_batch_transfer_response(resp, t_total_ms).expect("happy path is Ok");
+
+        assert_eq!(rec.status, "success", "all-success → status \"success\"");
+        assert!(
+            rec.error_string.is_none(),
+            "all-success → error_string is None",
+        );
+        assert_eq!(
+            rec.txid, "12345",
+            "canonical txid taken from results[0].transaction_id",
+        );
+        assert_eq!(rec.t_total_ms, t_total_ms, "t_total_ms passes through");
+        assert_eq!(
+            rec.t_broadcast_ms, t_total_ms,
+            "t_broadcast_ms mirrors t_total_ms per send_single convention",
+        );
+        assert!(
+            rec.t_confirm_ms.is_none(),
+            "t_confirm_ms is None at fold time (scenario layer backfills)",
+        );
+        assert_eq!(
+            rec.fee_microtari, 0,
+            "fee_microtari = 0 per send_single convention (scenario backfills)",
+        );
+    }
+
+    /// Spec §5 case 7 / §4 partial-failure row — 50 success + 50 fail →
+    /// `Ok(TxRecord { status: "failure", error_string contains "partial
+    /// failure" and the upstream message })`.
+    #[test]
+    fn fold_batch_response_partial_failure_returns_ok_with_failure_status() {
+        let resp = synth_transfer_response(67_890, 50, 50);
+        let rec = fold_batch_transfer_response(resp, 11).expect("partial failure is Ok");
+
+        assert_eq!(
+            rec.status, "failure",
+            "partial failure → status \"failure\" (spec §4 Q1)",
+        );
+        let msg = rec
+            .error_string
+            .as_deref()
+            .expect("partial failure populates error_string");
+        assert!(
+            msg.contains("partial failure"),
+            "error_string must contain \"partial failure\" sentinel: {msg}",
+        );
+        assert!(
+            msg.contains("50/100"),
+            "error_string must report failure_count/total: {msg}",
+        );
+        assert!(
+            msg.contains("insufficient_funds"),
+            "error_string must include the upstream first_failure_message: {msg}",
+        );
+        assert_eq!(
+            rec.txid, "67890",
+            "canonical txid still taken from results[0] even on partial failure",
+        );
+    }
+
+    /// Spec §5 case 11 / §4 "Empty recipients slice" row — empty input
+    /// slice → `Err` with "empty recipients" in the message. This is the
+    /// only full-method test (no fake-gRPC needed: the bail at
+    /// `send_batch_one_to_many`'s entry runs BEFORE any
+    /// `lifecycle.client_mut()` call).
+    #[tokio::test]
+    async fn send_batch_empty_recipients_returns_err_without_grpc_call() {
+        // Build an unspawned ConsoleWalletLifecycle. The empty-recipients
+        // bail is the first statement in `send_batch_one_to_many`, so the
+        // unspawned wallet (no gRPC client, no child process) is never
+        // dereferenced — the test exercises only the K=0 guard.
+        let seeds_cfg = Seeds {
+            old: "WALLET_BENCHMARKS_TEST_EMPTY_BATCH_OLD".to_string(),
+            new: "WALLET_BENCHMARKS_TEST_EMPTY_BATCH_NEW".to_string(),
+            payment_processor: "WALLET_BENCHMARKS_TEST_EMPTY_BATCH_PP".to_string(),
+            wallet_password: "WALLET_BENCHMARKS_TEST_EMPTY_BATCH_PW".to_string(),
+        };
+        let m = gen_seed().expect("gen_seed");
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(&seeds_cfg.old, &m);
+            std::env::set_var(&seeds_cfg.wallet_password, "test-password");
+        }
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            ..Config::default()
+        };
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let data_dir = HarnessDataDir::new("empty_batch_test", "old_wallet").expect("data_dir");
+        let lifecycle =
+            ConsoleWalletLifecycle::new(&cfg, &seeds, data_dir).expect("lifecycle constructs");
+        let mut wallet = OldWallet::new(lifecycle);
+
+        let err = wallet
+            .send_batch_one_to_many(&[], 5)
+            .await
+            .expect_err("empty slice must Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty recipients"),
+            "error message must contain \"empty recipients\": {msg}",
+        );
+
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(&seeds_cfg.old);
+            std::env::remove_var(&seeds_cfg.wallet_password);
+        }
     }
 
     #[test]
