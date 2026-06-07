@@ -31,7 +31,7 @@ use std::{str::FromStr, sync::Arc, time::Instant};
 use anyhow::Context;
 use minotari_app_grpc::tari_rpc::{
     payment_recipient::PaymentType, wallet_client::WalletClient, Empty, GetBalanceRequest,
-    GetStateRequest, PaymentRecipient, TransferRequest,
+    GetStateRequest, PaymentRecipient, TransferRequest, TransferResponse,
 };
 use tari_common_types::{
     seeds::{
@@ -155,91 +155,21 @@ impl Mode for OldWallet {
                 "Mode 1 send_batch_one_to_many: empty recipients",
             ));
         }
-        let started = Instant::now();
-        let client = self.lifecycle.client_mut()?;
-        let payment_recipients: Vec<PaymentRecipient> = recipients
-            .iter()
-            .map(|(addr, amount)| PaymentRecipient {
-                address: addr.to_base58(),
-                amount: *amount,
-                fee_per_gram: fee_rate,
-                payment_type: PaymentType::OneSidedToStealthAddress as i32,
-                raw_payment_id: Vec::new(),
-                user_payment_id: None,
-            })
-            .collect();
-        let k = payment_recipients.len();
-        let req = TransferRequest {
-            recipients: payment_recipients,
-            // `single_tx = true` switches the wallet from "N independent
-            // 1-to-1 txs" to "one MW tx with K outputs" per
-            // `wallet.proto:578`. This is the batch shape AC-19/AC-20 want.
-            single_tx: true,
-        };
+        let req = build_batch_transfer_request(recipients, fee_rate);
+        let k = req.recipients.len();
         log::debug!(
             target: LOG_TARGET,
             "Mode 1 send_batch_one_to_many: K={k} fee_rate={fee_rate}",
         );
+        let started = Instant::now();
+        let client = self.lifecycle.client_mut()?;
         let resp = client
             .transfer(Request::new(req))
             .await
             .context("Mode 1 send_batch_one_to_many gRPC call")?
             .into_inner();
-        let t_total = started.elapsed().as_millis() as u64;
-        let results = resp.results;
-        if results.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Mode 1 Transfer (batch) returned an empty results vector",
-            ));
-        }
-        // Canonical txid: take the first entry. With `single_tx = true`,
-        // either there is exactly one `TransferResult` (one MW tx) or all
-        // K entries share the same `transaction_id` — see spec §1
-        // "TransferResponse.results cardinality with `single_tx = true`".
-        let canonical_txid = results[0].transaction_id.to_string();
-        let success_count = results.iter().filter(|r| r.is_success).count();
-        let failure_count = results.len() - success_count;
-        let first_failure_message = results
-            .iter()
-            .find(|r| !r.is_success)
-            .map(|r| r.failure_message.clone());
-        let (status, error_string) = if failure_count == 0 {
-            ("success".to_string(), None)
-        } else if success_count == 0 {
-            // All-fail: mirror `send_single`'s shape — record the
-            // upstream failure message verbatim.
-            (
-                "failure".to_string(),
-                Some(first_failure_message.unwrap_or_default()),
-            )
-        } else {
-            // Partial failure: structurally rare under `single_tx = true`
-            // (the wallet either builds the single MW tx or it doesn't)
-            // but the response shape permits it. Fold to one failure
-            // entry with an explanatory string so S5's partition
-            // invariant (one TxRecord per send_*) holds. Per spec §4
-            // Q1 ratified mapping.
-            (
-                "failure".to_string(),
-                Some(format!(
-                    "partial failure: {failure_count}/{} recipients failed: {}",
-                    results.len(),
-                    first_failure_message.unwrap_or_default(),
-                )),
-            )
-        };
-        Ok(TxRecord {
-            txid: canonical_txid,
-            t_total_ms: t_total,
-            t_broadcast_ms: t_total,
-            t_confirm_ms: None,
-            status,
-            error_string,
-            // Per `send_single`'s convention: per-tx fee is not known at
-            // this layer; scenario code backfills via `GetTransactionInfo`
-            // polling in step 3i.
-            fee_microtari: 0,
-        })
+        let t_total_ms = started.elapsed().as_millis() as u64;
+        fold_batch_transfer_response(resp, t_total_ms)
     }
 
     async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
@@ -433,6 +363,107 @@ impl S4Dispatcher for OldWalletDispatcher {
             fee_microtari: 0,
         })
     }
+}
+
+/// Build the [`TransferRequest`] for the Mode 1 batch send. Pure
+/// construction — no I/O, no client. Per spec §3 every recipient carries
+/// the same `fee_per_gram` (= `fee_rate`) and `payment_type =
+/// OneSidedToStealthAddress`; `single_tx = true` switches the wallet to
+/// the 1→K MW shape (`wallet.proto:578`).
+///
+/// Caller is responsible for the empty-`recipients` check — this helper
+/// builds whatever it is handed so the empty case is observable at the
+/// trait-method boundary (per spec §4 Q3).
+pub(crate) fn build_batch_transfer_request(
+    recipients: &[(TariAddress, u64)],
+    fee_rate: u64,
+) -> TransferRequest {
+    let payment_recipients: Vec<PaymentRecipient> = recipients
+        .iter()
+        .map(|(addr, amount)| PaymentRecipient {
+            address: addr.to_base58(),
+            amount: *amount,
+            fee_per_gram: fee_rate,
+            payment_type: PaymentType::OneSidedToStealthAddress as i32,
+            raw_payment_id: Vec::new(),
+            user_payment_id: None,
+        })
+        .collect();
+    TransferRequest {
+        recipients: payment_recipients,
+        // `single_tx = true` switches the wallet from "N independent 1-to-1
+        // txs" to "one MW tx with K outputs" per `wallet.proto:578`. This
+        // is the batch shape AC-19/AC-20 want.
+        single_tx: true,
+    }
+}
+
+/// Fold a [`TransferResponse`] into a [`TxRecord`] per the spec §4 error
+/// mapping. Pure function — no I/O, no client, no clock (the caller
+/// supplies `t_total_ms`).
+///
+/// * happy path (all `is_success`) → `Ok(TxRecord { status: "success", error_string: None, .. })`
+/// * all-fail → `Ok(TxRecord { status: "failure", error_string: Some(first_failure_message), .. })`
+/// * partial failure → `Ok(TxRecord { status: "failure", error_string: Some("partial failure: ..."), .. })`
+/// * empty `results` → `Err` (mirrors `send_single`'s line 117 shape)
+pub(crate) fn fold_batch_transfer_response(
+    resp: TransferResponse,
+    t_total_ms: u64,
+) -> anyhow::Result<TxRecord> {
+    let results = resp.results;
+    if results.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Mode 1 Transfer (batch) returned an empty results vector",
+        ));
+    }
+    // Canonical txid: take the first entry. With `single_tx = true`,
+    // either there is exactly one `TransferResult` (one MW tx) or all
+    // K entries share the same `transaction_id` — see spec §1
+    // "TransferResponse.results cardinality with `single_tx = true`".
+    let canonical_txid = results[0].transaction_id.to_string();
+    let success_count = results.iter().filter(|r| r.is_success).count();
+    let failure_count = results.len() - success_count;
+    let first_failure_message = results
+        .iter()
+        .find(|r| !r.is_success)
+        .map(|r| r.failure_message.clone());
+    let (status, error_string) = if failure_count == 0 {
+        ("success".to_string(), None)
+    } else if success_count == 0 {
+        // All-fail: mirror `send_single`'s shape — record the
+        // upstream failure message verbatim.
+        (
+            "failure".to_string(),
+            Some(first_failure_message.unwrap_or_default()),
+        )
+    } else {
+        // Partial failure: structurally rare under `single_tx = true`
+        // (the wallet either builds the single MW tx or it doesn't)
+        // but the response shape permits it. Fold to one failure
+        // entry with an explanatory string so S5's partition
+        // invariant (one TxRecord per send_*) holds. Per spec §4
+        // Q1 ratified mapping.
+        (
+            "failure".to_string(),
+            Some(format!(
+                "partial failure: {failure_count}/{} recipients failed: {}",
+                results.len(),
+                first_failure_message.unwrap_or_default(),
+            )),
+        )
+    };
+    Ok(TxRecord {
+        txid: canonical_txid,
+        t_total_ms,
+        t_broadcast_ms: t_total_ms,
+        t_confirm_ms: None,
+        status,
+        error_string,
+        // Per `send_single`'s convention: per-tx fee is not known at
+        // this layer; scenario code backfills via `GetTransactionInfo`
+        // polling in step 3i.
+        fee_microtari: 0,
+    })
 }
 
 /// Decode `mnemonic` to a [`CipherSeed`], rewrite its birthday to
