@@ -136,18 +136,23 @@ impl PrLifecycle {
     ///
     /// Shape per the real CLI at `minotari-cli@52a7287a/minotari/src/cli.rs`:
     /// `--network` is a top-level flag on `Cli` (positioned BEFORE the
-    /// subcommand), `--database-path` is the data-dir flag (alias from
+    /// subcommand), `--database-path` is the wallet sqlite3 file path (from
     /// `DatabaseArgs`), and the subcommand accepts no `--account-name` —
     /// the wallet name is hard-coded to `"default"` upstream. View-key /
     /// spend-key / password are appended in [`Self::spawn`] (kept out of
     /// the argv builder so secrets don't sit in stable argv strings).
+    ///
+    /// `--database-path` expects a sqlite3 file path, not the parent
+    /// directory; the harness appends `wallet.sqlite3` to match the
+    /// upstream wallet's default filename (mirrors the
+    /// `crate::modes::new_wallet::NewWallet::wallet_db_path` convention).
     pub fn import_view_key_argv(network: &str, data_dir: &std::path::Path) -> Vec<String> {
         vec![
             "--network".to_string(),
             network.to_string(),
             "import-view-key".to_string(),
             "--database-path".to_string(),
-            data_dir.display().to_string(),
+            data_dir.join("wallet.sqlite3").display().to_string(),
         ]
     }
 
@@ -156,11 +161,15 @@ impl PrLifecycle {
     ///
     /// Shape per the real CLI at `minotari-cli@52a7287a/minotari/src/cli.rs`:
     /// `--network` is a top-level flag on `Cli` (positioned BEFORE the
-    /// subcommand), `--database-path` is the data-dir flag (alias from
+    /// subcommand), `--database-path` is the wallet sqlite3 file path (from
     /// `DatabaseArgs`), `--api-port` is the HTTP listen port flag, and
     /// `--base-url` (from `NodeArgs`) is the blockchain RPC base URL the
     /// daemon scans against. No `--account-name` — the wallet name is
     /// hard-coded to `"default"` upstream.
+    ///
+    /// `--database-path` expects a sqlite3 file path, not the parent
+    /// directory; the harness appends `wallet.sqlite3` to point at the
+    /// file `import_view_key_argv` created.
     pub fn daemon_argv(
         network: &str,
         data_dir: &std::path::Path,
@@ -172,7 +181,7 @@ impl PrLifecycle {
             network.to_string(),
             "daemon".to_string(),
             "--database-path".to_string(),
-            data_dir.display().to_string(),
+            data_dir.join("wallet.sqlite3").display().to_string(),
             "--base-url".to_string(),
             base_url.to_string(),
             "--api-port".to_string(),
@@ -458,7 +467,9 @@ mod tests {
         assert_eq!(argv[1], "esmeralda");
         assert_eq!(argv[2], "import-view-key");
         assert_eq!(argv[3], "--database-path");
-        assert_eq!(argv[4], "/tmp/pr");
+        // --database-path is the sqlite3 file path (per DatabaseArgs in
+        // cli.rs); the harness appends wallet.sqlite3 to the data dir.
+        assert_eq!(argv[4], "/tmp/pr/wallet.sqlite3");
         // Account-name and the legacy --base-path are intentionally absent
         // — assert no element matches so a future regression surfaces.
         assert!(
@@ -488,7 +499,9 @@ mod tests {
         assert_eq!(argv[1], "esmeralda");
         assert_eq!(argv[2], "daemon");
         assert_eq!(argv[3], "--database-path");
-        assert_eq!(argv[4], "/tmp/pr");
+        // --database-path is the sqlite3 file path (per DatabaseArgs in
+        // cli.rs); the harness appends wallet.sqlite3 to the data dir.
+        assert_eq!(argv[4], "/tmp/pr/wallet.sqlite3");
         assert_eq!(argv[5], "--base-url");
         assert_eq!(argv[6], "https://rpc.esmeralda.tari.com");
         assert_eq!(argv[7], "--api-port");
