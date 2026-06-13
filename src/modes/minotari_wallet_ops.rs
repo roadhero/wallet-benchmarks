@@ -408,6 +408,103 @@ pub(super) async fn run_balance_subprocess(cfg: &Config, data_dir: &Path) -> any
     })
 }
 
+/// Poll interval for [`wait_for_balance_positive`]. 5 seconds matches the
+/// rate at which the upstream wallet's background scan task commits new
+/// outputs to the sqlite3 file; finer polling just spawns more
+/// `minotari Balance` subprocesses without surfacing state earlier.
+const BALANCE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default wall-clock budget for [`wait_for_balance_positive`]. 5 minutes
+/// gives a full sync window against canonical testnet from a fresh
+/// `wipe_and_reimport_via_create` without false-failing in the common case.
+const DEFAULT_BALANCE_WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Poll `minotari Balance` until it reports a positive total or `deadline`
+/// elapses.
+///
+/// Bug 3 from the canonical-baseline runbook: even after `run_scan_subprocess`
+/// exits successfully, Mode 2's first `create-unsigned-transaction` invocation
+/// can hit `insufficient_funds`. The `minotari scan` subprocess exits when
+/// blockchain catch-up completes, but the wallet still finalizes per-output
+/// commitment + state-write work asynchronously before the outputs are
+/// available for spending; calling `Balance` (which the harness already does
+/// for Mode 2's `get_balance`) is the cheapest signal that the wallet sees
+/// its money. The Mode 1 (`console_wallet`) equivalent is the
+/// `has_done_initial_validation` gate in
+/// [`crate::wallet_lifecycle::console_wallet::wait_ready`].
+///
+/// Returns the parsed balance on first positive reading. Bails with the
+/// last-observed reading on timeout so the operator can distinguish
+/// "scan never finished" from "wallet is genuinely empty".
+///
+/// Note on AC-32 (`tests/c_no_retry_backoff_throttle.rs`): the poll-cadence
+/// `sleep` lives inside a `tokio::select!` arm alongside the absolute
+/// `sleep_until(deadline)` bound. Both sleeps are deadlines/bounds, not
+/// throttles — the documented AC-32 carve-out excises `tokio::select!`
+/// bodies before grepping. Same idiom used by S0+ confirmation loops.
+pub(super) async fn wait_for_balance_positive(
+    cfg: &Config,
+    data_dir: &Path,
+    deadline: Option<std::time::Duration>,
+) -> anyhow::Result<u64> {
+    let deadline = deadline.unwrap_or(DEFAULT_BALANCE_WAIT_DEADLINE);
+    let started = std::time::Instant::now();
+    let deadline_instant = tokio::time::Instant::now() + deadline;
+    let mut last_seen: u64 = 0;
+    let mut polls: u32 = 0;
+    loop {
+        match run_balance_subprocess(cfg, data_dir).await {
+            Ok(balance) => {
+                polls = polls.saturating_add(1);
+                last_seen = balance;
+                if balance > 0 {
+                    log::info!(
+                        target: LOG_TARGET,
+                        "wait_for_balance_positive: wallet sees {balance} µT after {polls} polls \
+                         ({:?} elapsed)",
+                        started.elapsed(),
+                    );
+                    return Ok(balance);
+                }
+                log::debug!(
+                    target: LOG_TARGET,
+                    "wait_for_balance_positive: balance still 0 after {polls} polls \
+                     ({:?} elapsed); polling again in {BALANCE_POLL_INTERVAL:?}",
+                    started.elapsed(),
+                );
+            }
+            Err(e) => {
+                // Balance subprocess failures during the wait are transient
+                // (the DB is mid-write, the binary is mid-spawn). Log + keep
+                // polling rather than bailing — the deadline below catches
+                // genuinely stuck states.
+                log::debug!(
+                    target: LOG_TARGET,
+                    "wait_for_balance_positive: balance subprocess transient error: {e:#}; \
+                     polling again in {BALANCE_POLL_INTERVAL:?}",
+                );
+            }
+        }
+        // Deadline-arm idiom: the absolute deadline races the poll-cadence
+        // bound. AC-32 carve-out (per the test's tokio::select! exclusion)
+        // applies — both arm bodies are excised before the static grep.
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline_instant) => {
+                anyhow::bail!(
+                    "wait_for_balance_positive: wallet balance still 0 µT after {:?} \
+                     ({polls} polls; last_seen={last_seen} µT). Check that the funding tx \
+                     has been mined on the chain the wallet is scanning.",
+                    deadline,
+                );
+            }
+            _ = tokio::time::sleep(BALANCE_POLL_INTERVAL) => {
+                // Poll cadence elapsed; loop back and re-query Balance.
+            }
+        }
+    }
+}
+
 /// Parse the microTari u64 from `Balance`'s stdout.
 ///
 /// The stdout format is `Balance at height {h}({d}): {total}` where `{total}`

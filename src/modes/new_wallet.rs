@@ -43,7 +43,7 @@ use crate::{
         minotari_subprocess::{create_sign_and_submit, MinotariSubprocessDispatcher, SeedRole},
         minotari_wallet_ops::{
             rewrite_birthday, run_balance_subprocess, run_scan_subprocess,
-            wipe_and_reimport_via_create,
+            wait_for_balance_positive, wipe_and_reimport_via_create,
         },
         Mode, S4Dispatcher, ScanOutcome, TxRecord,
     },
@@ -194,6 +194,16 @@ impl Mode for NewWallet {
         )
         .await
         .context("Mode 2 run_scan_subprocess")?;
+        // Bug 3 from the canonical-baseline runbook: even after Scan exits,
+        // the wallet finalizes per-output commitment + state-write work
+        // asynchronously and `create-unsigned-transaction` then hits
+        // insufficient_funds. Poll Balance until the wallet reports a
+        // positive total (or the default 5-minute deadline elapses) before
+        // returning. The Mode 1 equivalent is `has_done_initial_validation`
+        // gate in `wallet_lifecycle::console_wallet::wait_ready`.
+        let _seen_balance = wait_for_balance_positive(&self.cfg, self.data_dir.path(), None)
+            .await
+            .context("Mode 2 wait_for_balance_positive after scan")?;
         let t_scan_ms = started.elapsed().as_millis() as u64;
         let db_path = self.wallet_db_path();
         let outputs_found = self
