@@ -356,27 +356,39 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
         loop {
             if started.elapsed() >= self.ready_deadline {
                 anyhow::bail!(
-                    "wallet did not reach ready (ConnectivityStatus::Online) within {:?}",
+                    "wallet did not reach ready (Online + initial validation complete) \
+                     within {:?}",
                     self.ready_deadline,
                 );
             }
             match client.get_state(GetStateRequest {}).await {
                 Ok(resp) => {
                     let state = resp.into_inner();
-                    // `network.status` is the prost-generated i32 corresponding to the
-                    // `ConnectivityStatus` enum in proto/network.proto:
-                    //   Initializing = 0, Online = 1, Degraded = 2, Offline = 3.
-                    // We treat `Online` as the ready signal — matches the wallet's own
-                    // self-reported readiness contract for scenario calls.
+                    // Two-part readiness gate:
+                    //
+                    // 1. `network.status == Online` — connectivity to the base node.
+                    //    Prost-generated i32 for `ConnectivityStatus` in
+                    //    proto/network.proto: Initializing=0, Online=1, Degraded=2,
+                    //    Offline=3.
+                    // 2. `has_done_initial_validation == true` — the wallet has
+                    //    finished scanning + validating outputs (GetStateResponse
+                    //    field 4 in wallet.proto). Without this gate, `enforce_funding`
+                    //    and scenario sends race the in-flight scan: GetBalance
+                    //    returns 0 (false fail) and Mode 2's
+                    //    `create-unsigned-transaction` subprocess hits
+                    //    insufficient_funds.
                     let connectivity = state
                         .network
                         .as_ref()
                         .map(|n| n.status)
                         .unwrap_or(ConnectivityStatus::Initializing as i32);
-                    if connectivity == ConnectivityStatus::Online as i32 {
+                    if connectivity == ConnectivityStatus::Online as i32
+                        && state.has_done_initial_validation
+                    {
                         log::info!(
                             target: LOG_TARGET,
-                            "wallet ready at gRPC {url} (scanned_height={}, status=Online)",
+                            "wallet ready at gRPC {url} (scanned_height={}, \
+                             status=Online, initial_validation=done)",
                             state.scanned_height,
                         );
                         self.client = Some(client);
@@ -384,9 +396,10 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
                     }
                     log::debug!(
                         target: LOG_TARGET,
-                        "wallet not yet Online (scanned_height={}, status={connectivity}); \
-                         polling again in {:?}",
+                        "wallet not yet ready (scanned_height={}, status={connectivity}, \
+                         initial_validation={}); polling again in {:?}",
                         state.scanned_height,
+                        state.has_done_initial_validation,
                         READY_POLL_INTERVAL,
                     );
                 }
