@@ -127,7 +127,10 @@ impl PaymentProcessor {
         let pr_port = mode_3.pr_port;
         let pr_base_url = mode_3.pr_base_url.clone();
         let (view_key_hex, spend_key_hex) =
-            crate::wallet_lifecycle::pp_lifecycle::read_account_env(&mode_3.accounts.bench)?;
+            crate::wallet_lifecycle::pp_lifecycle::resolve_account_keys(
+                &mode_3.accounts.bench,
+                &seeds,
+            )?;
         let wallet_password = seeds
             .wallet_password()
             .context("reading wallet password for Mode 3")?
@@ -177,7 +180,10 @@ impl PaymentProcessor {
         let pr_port = mode_3.pr_port;
         let pr_base_url = mode_3.pr_base_url.clone();
         let (view_key_hex, spend_key_hex) =
-            crate::wallet_lifecycle::pp_lifecycle::read_account_env(&mode_3.accounts.bench)?;
+            crate::wallet_lifecycle::pp_lifecycle::resolve_account_keys(
+                &mode_3.accounts.bench,
+                &seeds,
+            )?;
         let wallet_password = seeds
             .wallet_password()
             .context("reading wallet password for Mode 3 test ctor")?

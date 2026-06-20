@@ -145,21 +145,10 @@ impl PpLifecycle {
         })?;
         let pp_binary = mode_3.pp_binary_path.clone();
         let console_wallet_binary = mode_3.minotari_binary_path.clone();
-        let view_key_hex =
-            std::env::var(&mode_3.accounts.bench.view_key_env).with_context(|| {
-                format!(
-                    "reading hex view key from env var ${} (set it before running Mode 3; see \
-                 analysis/specs/MODE_3_REWORK_SPEC.md §12)",
-                    mode_3.accounts.bench.view_key_env,
-                )
-            })?;
-        let spend_key_hex = std::env::var(&mode_3.accounts.bench.public_spend_key_env)
-            .with_context(|| {
-                format!(
-                    "reading hex public spend key from env var ${} (set it before running Mode 3)",
-                    mode_3.accounts.bench.public_spend_key_env,
-                )
-            })?;
+        // Env-var override takes precedence; otherwise derive from
+        // HARNESS_SEED_PP. See resolve_account_keys for the policy.
+        let (view_key_hex, spend_key_hex) = resolve_account_keys(&mode_3.accounts.bench, seeds)
+            .context("PpLifecycle::new resolving view+spend keys")?;
         let wallet_password = seeds
             .wallet_password()
             .context("reading wallet password for PpLifecycle")?
@@ -437,23 +426,78 @@ impl Drop for PpLifecycle {
     }
 }
 
-/// Mode 3 account env-var names paired into a single argument for
-/// downstream construction. Mirrors the shape under `[mode_3.accounts.bench]`
-/// in `harness.toml`.
-pub fn read_account_env(account: &Mode3Account) -> anyhow::Result<(String, String)> {
-    let view_key = std::env::var(&account.view_key_env).with_context(|| {
-        format!(
-            "reading hex view key from env var ${} (see MODE_3_REWORK_SPEC.md §12)",
+/// Resolve the Mode 3 account `(view_private_key_hex, spend_public_key_hex)`
+/// pair, preferring operator-injected env vars and falling back to
+/// derivation from [`SeedRole::Pp`]'s mnemonic.
+///
+/// Resolution order:
+/// 1. **Both env vars set** (operator-injected override): use those values
+///    verbatim. Lets an operator pre-extract the keypair from a wallet
+///    that does not match the harness's `HARNESS_SEED_PP` (rare; useful
+///    when funding flows through a different wallet than the one the
+///    harness scans).
+/// 2. **Neither env var set** (default): derive the pair from the
+///    `HARNESS_SEED_PP` mnemonic via
+///    [`crate::seed::derive_view_spend_keypair`]. This is the common
+///    path; operators only need to provide one seed env var, not three.
+/// 3. **Exactly one env var set** (mixed): bail with a clear error.
+///    Half an override is almost always a typo, and silently filling
+///    the missing half from the seed would risk pairing two unrelated
+///    wallets' keys.
+///
+/// Resolves @SWvheerden's 2026-06-19 review feedback on PR #6: Mode 3
+/// no longer requires the operator to pre-extract the view+spend keys
+/// into env vars. The env-var path stays as an explicit override for
+/// the rare cases that need it.
+pub fn resolve_account_keys(
+    account: &Mode3Account,
+    seeds: &SeedHandle,
+) -> anyhow::Result<(String, String)> {
+    let env_view = std::env::var(&account.view_key_env).ok();
+    let env_spend = std::env::var(&account.public_spend_key_env).ok();
+    match (env_view, env_spend) {
+        (Some(view), Some(spend)) => {
+            log::debug!(
+                target: LOG_TARGET,
+                "resolve_account_keys: using operator-injected env vars (${} / ${})",
+                account.view_key_env,
+                account.public_spend_key_env,
+            );
+            Ok((view, spend))
+        }
+        (None, None) => {
+            log::info!(
+                target: LOG_TARGET,
+                "resolve_account_keys: deriving view+spend keys from HARNESS_SEED_PP \
+                 (env vars ${} / ${} not set)",
+                account.view_key_env,
+                account.public_spend_key_env,
+            );
+            let mnemonic = seeds.mnemonic_payment_processor().with_context(|| {
+                format!(
+                    "resolve_account_keys: reading SeedRole::Pp mnemonic for view+spend key \
+                     derivation (set ${} and ${} to override)",
+                    account.view_key_env, account.public_spend_key_env,
+                )
+            })?;
+            crate::seed::derive_view_spend_keypair(mnemonic.reveal())
+                .context("resolve_account_keys: deriving view+spend keys from HARNESS_SEED_PP")
+        }
+        (Some(_), None) => anyhow::bail!(
+            "resolve_account_keys: env var ${} is set but ${} is not. Set both to \
+             override seed derivation, or unset both to let the harness derive \
+             the pair from HARNESS_SEED_PP.",
             account.view_key_env,
-        )
-    })?;
-    let spend_key = std::env::var(&account.public_spend_key_env).with_context(|| {
-        format!(
-            "reading hex public spend key from env var ${} (see MODE_3_REWORK_SPEC.md §12)",
             account.public_spend_key_env,
-        )
-    })?;
-    Ok((view_key, spend_key))
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "resolve_account_keys: env var ${} is set but ${} is not. Set both to \
+             override seed derivation, or unset both to let the harness derive \
+             the pair from HARNESS_SEED_PP.",
+            account.public_spend_key_env,
+            account.view_key_env,
+        ),
+    }
 }
 
 /// POSIX signals used by [`PpLifecycle::teardown`]. Same shape as the

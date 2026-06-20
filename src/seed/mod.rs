@@ -277,6 +277,52 @@ pub fn derive_address(mnemonic: &str) -> anyhow::Result<TariAddress> {
     .map_err(|e| anyhow::Error::msg(format!("assembling TariAddress: {e}")))
 }
 
+/// Derive the `(view_private_key_hex, spend_public_key_hex)` pair from a
+/// 24-word Tari mnemonic. Used by Mode 3 to auto-derive the PR-daemon
+/// keypair from `HARNESS_SEED_PP` when the operator has not injected a
+/// pre-extracted pair via env vars. Same `WalletType` derivation path as
+/// [`derive_address`]; differs only in which keys are extracted.
+///
+/// The view-private-key is the secret half of the view keypair; the
+/// spend-public-key is the public half of the spend keypair. Together
+/// they let a view-only wallet (the PR daemon, run as
+/// `minotari daemon` against an `import-view-key`-imported wallet) scan
+/// for the account's incoming outputs without holding spend authority.
+///
+/// Both keys are 32-byte Ristretto scalars / curve points encoded to
+/// 64-char lowercase hex strings via [`tari_utilities::hex::Hex`].
+///
+/// The returned `view_private_key_hex` is treated as a secret by the
+/// caller and never logged; the spend-public-key is safe to log (it
+/// reveals only that the account exists, not its balance or its outputs).
+pub fn derive_view_spend_keypair(mnemonic: &str) -> anyhow::Result<(String, String)> {
+    let seed_words = SeedWords::from_str(mnemonic)
+        .map_err(|e| anyhow::Error::msg(format!("parsing mnemonic words: {e}")))?;
+    let cipher_seed = <CipherSeed as Mnemonic<CipherSeed>>::from_mnemonic(&seed_words, None)
+        .map_err(|e| anyhow::Error::msg(format!("decoding CipherSeed from mnemonic: {e}")))?;
+    let seed_words_wallet =
+        SeedWordsWallet::construct_new(cipher_seed).map_err(anyhow::Error::msg)?;
+    let wallet = WalletType::SeedWords(seed_words_wallet);
+    // Both key extractions use display formatters provided by the crate,
+    // not the `Hex` trait from `tari_utilities`. Reason: our direct dep
+    // is `tari_utilities = 0.8` but `tari_transaction_components` pulls
+    // `tari_crypto = 0.23` which impls `ByteArray` against the
+    // transitive `tari_utilities = 0.10`. The two `Hex` blanket impls
+    // are not the same trait; calling `to_hex()` here would not
+    // type-check. The Display impls below produce the same 64-char
+    // lowercase hex output without crossing that trait-version
+    // boundary.
+    //
+    // View private key: `RistrettoSecretKey::reveal()` returns a
+    // `RevealedSecretKey` whose `fmt::Display` impl is the secret's hex
+    // representation (per `tari_crypto/ristretto/ristretto_keys.rs`).
+    // Spend public key: `CompressedKey<RistrettoPublicKey>` has a
+    // `fmt::LowerHex` impl (per `tari_crypto/compressed_key.rs`).
+    let view_priv_hex = format!("{}", wallet.get_view_key().reveal());
+    let spend_pub_hex = format!("{:x}", wallet.get_public_spend_key());
+    Ok((view_priv_hex, spend_pub_hex))
+}
+
 /// Derive a pool of `size` distinct dual addresses from the seed mnemonic at
 /// `role`. Each slot `i` carries a distinct `payment_id_user_data = [i as bytes]`
 /// — per `tari_common_types::tari_address::DualAddress`, supplying a non-`None`
@@ -469,5 +515,72 @@ mod tests {
         let from_print = crate::print_address(ENV).expect("print_address path");
         unset_env(ENV);
         assert_eq!(direct.to_base58(), from_print);
+    }
+
+    #[test]
+    fn derive_view_spend_keypair_produces_two_distinct_64_char_hex_strings() {
+        // Mode 3 auto-derive path: HARNESS_SEED_PP is hashed into a
+        // CipherSeed, which yields a view-private + spend-public pair.
+        // Both hex strings must be 64 chars (32 bytes × 2), and they
+        // must NOT collide (a view-private equal to its own
+        // spend-public would be a critical key-derivation bug).
+        let m = gen_seed().expect("mnemonic");
+        let (view_hex, spend_hex) =
+            derive_view_spend_keypair(&m).expect("derive_view_spend_keypair");
+        assert_eq!(view_hex.len(), 64, "view-private-key hex must be 64 chars");
+        assert_eq!(spend_hex.len(), 64, "spend-public-key hex must be 64 chars");
+        assert!(
+            view_hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "view-private-key hex must be all hex digits: {view_hex}",
+        );
+        assert!(
+            spend_hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "spend-public-key hex must be all hex digits: {spend_hex}",
+        );
+        assert_ne!(
+            view_hex, spend_hex,
+            "view-private must differ from spend-public",
+        );
+    }
+
+    #[test]
+    fn derive_view_spend_keypair_is_deterministic_for_same_seed() {
+        // Same mnemonic in → same pair out. Critical for the
+        // operator-injected env-var override to match the seed-derived
+        // pair when both reference the same wallet.
+        let m = gen_seed().expect("mnemonic");
+        let (v1, s1) = derive_view_spend_keypair(&m).expect("first derive");
+        let (v2, s2) = derive_view_spend_keypair(&m).expect("second derive");
+        assert_eq!(v1, v2);
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn derive_view_spend_keypair_differs_across_distinct_seeds() {
+        // Pair must depend on the mnemonic — two distinct mnemonics
+        // produce two distinct pairs. Guards against a stub impl that
+        // returns a constant.
+        let m1 = gen_seed().expect("mnemonic 1");
+        let m2 = gen_seed().expect("mnemonic 2");
+        assert_ne!(m1, m2, "gen_seed must produce distinct mnemonics");
+        let (v1, s1) = derive_view_spend_keypair(&m1).expect("derive 1");
+        let (v2, s2) = derive_view_spend_keypair(&m2).expect("derive 2");
+        assert_ne!(v1, v2);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn derive_view_spend_keypair_rejects_invalid_mnemonic() {
+        let err = derive_view_spend_keypair("not a real mnemonic")
+            .expect_err("invalid mnemonic must fail");
+        let msg = format!("{err:#}");
+        // Upstream's SeedWords::from_str accepts any whitespace-separated
+        // token stream as candidate words; the actual rejection happens
+        // one step later, inside CipherSeed::from_mnemonic when the words
+        // do not match a known wordlist.
+        assert!(
+            msg.contains("CipherSeed") || msg.contains("Mnemonic"),
+            "error must surface mnemonic-decode context: {msg}",
+        );
     }
 }
