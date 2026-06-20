@@ -96,20 +96,26 @@ export HARNESS_SEED_PP="$(cat /tmp/seed-pp.txt)"
 
 Each prints one base58 Tari address. Record all three; you fund them in §4.
 
-### §2.5. Derive the Mode 3 view-key and spend-public-key
+### §2.5. Mode 3 view-key and spend-public-key (auto-derived; env override optional)
 
-Mode 3 watches a single account named `"default"` via a view-only wallet held by the PR daemon, plus a signing wallet held by PP's spawned `console_wallet`. Both daemons consume the same view-key and spend-public-key pair. The pair is derived from the Mode 3 seed (`HARNESS_SEED_PP`) and pre-extracted into env vars at run time:
+Mode 3 watches a single account named `"default"` via a view-only wallet held by the PR daemon, plus a signing wallet held by PP's spawned `console_wallet`. Both daemons consume the same view-key and spend-public-key pair.
+
+**The harness auto-derives the pair from `HARNESS_SEED_PP` at startup.** As of commit `b7d05a3` (per @SWvheerden's 2026-06-19 review feedback), `wallet_lifecycle::pp_lifecycle::resolve_account_keys` walks the mnemonic through the same `WalletType::SeedWords` path that `print-address` uses and extracts the `(view_private_key_hex, spend_public_key_hex)` pair. No manual extraction step is required for the common case.
+
+The env-var override path remains available for two cases:
+
+- **Operator-injected override.** When you want PP and the PR daemon to scan a wallet that differs from `HARNESS_SEED_PP` (rare; useful when funding flows through a different wallet). Set BOTH `TARI_BENCH_VIEW_KEY` and `TARI_BENCH_SPEND_KEY`; the harness uses them verbatim.
+- **Cross-machine handoff.** When the wallet was funded on a different machine and you only have the key pair, not the mnemonic. Same shape.
 
 ```sh
-# One-off extraction. The minotari binary exposes a key-export path
-# for view-only wallets; follow the upstream minotari-cli docs for
-# `show-keys` against the seed-imported wallet to obtain the two hex
-# values, OR derive them programmatically from the mnemonic.
+# Optional override only. Skip this block for normal canonical-baseline runs.
 export TARI_BENCH_VIEW_KEY=<hex view private key, 64 chars>
 export TARI_BENCH_SPEND_KEY=<hex public spend key, 64 chars>
 ```
 
-For first-time runs against operator-pre-funded test wallets, the operator may also have the funded keypair handed over directly. The harness reads only these env vars; it does not store the values in any file.
+`resolve_account_keys` requires **both or neither** of the env vars to be set. Half an override (only `TARI_BENCH_VIEW_KEY` set, or only `TARI_BENCH_SPEND_KEY` set) bails at startup with a clear error message — half-overrides are almost always a typo and silently filling the missing half from the seed would risk pairing two unrelated wallets' keys.
+
+The harness reads the env-var values only; it never writes them to disk.
 
 ### §2.6. Set the wallet password
 
@@ -131,8 +137,11 @@ export HARNESS_SEED_OLD="$(cat /tmp/seed-old.txt)"
 export HARNESS_SEED_NEW="$(cat /tmp/seed-new.txt)"
 export HARNESS_SEED_PP="$(cat /tmp/seed-pp.txt)"
 export HARNESS_WALLET_PW=harness_pp_password
-export TARI_BENCH_VIEW_KEY=<hex>
-export TARI_BENCH_SPEND_KEY=<hex>
+# Optional Mode 3 overrides — leave commented for the common case.
+# Setting these makes PP and the PR daemon scan a wallet that differs
+# from HARNESS_SEED_PP (§2.5). Set both or neither.
+# export TARI_BENCH_VIEW_KEY=<hex>
+# export TARI_BENCH_SPEND_KEY=<hex>
 EOF
 chmod 600 .env.harness
 ```
@@ -231,7 +240,9 @@ view_key_env = "TARI_BENCH_VIEW_KEY"
 public_spend_key_env = "TARI_BENCH_SPEND_KEY"
 ```
 
-The two `*_env` fields name env vars holding the 64-char hex view key and the 64-char hex public spend key. The values themselves never live in TOML; same convention as the `[seeds]` block. PP and the PR daemon watch the same `"default"` account using this keypair; the operator-facing config key segment `BENCH` is the env-var convention and does not need to match what minotari calls the account internally (per `init_wallet.rs:121` that name is hardcoded `"default"`).
+The two `*_env` fields name env vars holding the 64-char hex view key and the 64-char hex public spend key. **Both env vars are optional.** When unset (the common case), the harness auto-derives the pair from `HARNESS_SEED_PP` via `wallet_lifecycle::pp_lifecycle::resolve_account_keys` (see §2.5). When set, the env-var values override the derived pair for operators who need to scan a wallet that differs from `HARNESS_SEED_PP`. The values themselves never live in TOML; same convention as the `[seeds]` block.
+
+PP and the PR daemon watch the same `"default"` account using whichever keypair `resolve_account_keys` returns. The operator-facing config key segment `BENCH` is the env-var-name convention and does not need to match what minotari calls the account internally (per `init_wallet.rs:121` that name is hardcoded `"default"`).
 
 ------
 
@@ -308,6 +319,30 @@ RUST_LOG=info,wallet_benchmarks=debug ./target/release/wallet-benchmarks run
 ```
 
 `wallet_benchmarks=debug` surfaces the per-mode lifecycle events (wait_ready transitions, balance polling, subprocess spawn/teardown, PP HTTP probes). `info` keeps the per-tx noise readable.
+
+### §5.4. Terminal feedback (independent of `RUST_LOG`)
+
+As of commit `eab102a`, the harness prints progress to stdout at every scenario boundary regardless of `RUST_LOG`. A baseline run looks like:
+
+```
+[14:33:09] preflight  old=11000000000uT new=11000000000uT pp=11000000000uT  PASS
+[14:33:11] mode=old_wallet scenario=B0  start
+[14:33:42] mode=old_wallet scenario=B0  done   tx_count=0 elapsed=31.4s status=ok
+[14:33:42] mode=old_wallet scenario=S0  start
+[14:33:47] mode=old_wallet scenario=S0  done   tx_count=1 elapsed=4.2s status=ok
+...
+[18:11:43] mode=payment_processor scenario=S7  done   tx_count=0 elapsed=0.1s status=skipped
+
+=== run summary ===
+mode\scenario        B0            S0            S1            S2            ...
+old_wallet           ok (0)        ok (1)        ok (512)      ok (0)        ...
+new_wallet           ok (0)        ok (1)        ok (512)      ok (0)        ...
+payment_processor    skipped       ok (1)        skipped       skipped       ...
+```
+
+The pre-flight line is emitted by `enforce_funding` after balances pass; if it fails, `enforce_funding` bails before the line prints and the harness exits non-zero. Each per-scenario `start` / `done` pair brackets one `(mode, scenario)` cell. The `tx_count` column is a best-effort count per scenario (S5 reports `success_count`, S4 reconstructs from `n_concurrent × success_rate`, scan-only scenarios report 0); the canonical numbers live in the result-profile JSON. `status` is one of `ok`, `skipped` (the runner mapped an `UnsupportedOperation` to `CellResult::NotRun`), or `err`.
+
+The summary table at the end is a fixed-width text table that pastes cleanly into a PR comment.
 
 ------
 
