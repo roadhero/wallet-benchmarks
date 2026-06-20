@@ -162,16 +162,30 @@ pub async fn enforce_funding(
         bal_old < required || bal_new < required || bal_pp_opt.is_some_and(|b| b < required);
     if !any_short {
         match bal_pp_opt {
-            Some(bal_pp) => log::info!(
-                target: LOG_TARGET,
-                "funding pre-flight passed: required={required} uT, old={bal_old} uT, \
-                 new={bal_new} uT, pp={bal_pp} uT",
-            ),
-            None => log::info!(
-                target: LOG_TARGET,
-                "funding pre-flight passed (pp arm skipped): required={required} uT, \
-                 old={bal_old} uT, new={bal_new} uT",
-            ),
+            Some(bal_pp) => {
+                log::info!(
+                    target: LOG_TARGET,
+                    "funding pre-flight passed: required={required} uT, old={bal_old} uT, \
+                     new={bal_new} uT, pp={bal_pp} uT",
+                );
+                // Terminal feedback (stdout, independent of RUST_LOG) so
+                // the operator sees pre-flight outcome without log noise.
+                println!(
+                    "[{}] preflight  old={bal_old}uT new={bal_new}uT pp={bal_pp}uT  PASS",
+                    chrono::Local::now().format("%H:%M:%S"),
+                );
+            }
+            None => {
+                log::info!(
+                    target: LOG_TARGET,
+                    "funding pre-flight passed (pp arm skipped): required={required} uT, \
+                     old={bal_old} uT, new={bal_new} uT",
+                );
+                println!(
+                    "[{}] preflight  old={bal_old}uT new={bal_new}uT pp=SKIPPED  PASS",
+                    chrono::Local::now().format("%H:%M:%S"),
+                );
+            }
         }
         return Ok(());
     }

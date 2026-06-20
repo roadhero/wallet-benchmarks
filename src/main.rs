@@ -188,6 +188,16 @@ async fn run_harness_async(
                 target: LOG_TARGET,
                 "running {scenario_id} for mode {mode_role:?}",
             );
+            // Terminal feedback (stdout, independent of RUST_LOG). A
+            // canonical baseline takes 3-5 hours; per-scenario start/done
+            // lines let the operator see the harness is still alive
+            // without paging through structured log output.
+            println!(
+                "[{}] mode={} scenario={}  start",
+                chrono::Local::now().format("%H:%M:%S"),
+                mode_name(mode_role),
+                scenario_id,
+            );
 
             // Tip queries only happen for send scenarios. Scans
             // (B0/S2/S3/S6/S7) supply intrinsic `h_tip_*` on their
@@ -272,6 +282,20 @@ async fn run_harness_async(
                     }
                 }
             };
+            // Terminal feedback at scenario completion. Peek at
+            // `cell_result` before it's moved into matrix.record.
+            let (status, tx_count) = match &cell_result {
+                CellResult::Outcome(o) => ("ok", count_txs(o.as_ref())),
+                CellResult::NotRun => ("skipped", 0),
+                CellResult::Error(_) => ("err", 0),
+            };
+            println!(
+                "[{}] mode={} scenario={}  done   tx_count={tx_count} elapsed={:.1}s status={status}",
+                chrono::Local::now().format("%H:%M:%S"),
+                mode_name(mode_role),
+                scenario_id,
+                wall_clock_ms as f64 / 1000.0,
+            );
             matrix.record(
                 mode_role,
                 scenario_id,
@@ -294,6 +318,11 @@ async fn run_harness_async(
             }
         }
     }
+
+    // 5b. Print the operator-facing summary table to stdout before
+    //     serializing the JSON. The table assembles from `matrix`,
+    //     which is the same source the writer reads from.
+    print_summary_table(&matrix);
 
     // 6. Serialize via the result-profile writer.
     //    Confirmation-poll backfill for S4/S5 (t_confirm_ms population +
@@ -350,6 +379,75 @@ impl ModeHandle {
 /// brings up via `PaymentProcessor::start_external_services` after this
 /// function returns and tears down via `PaymentProcessor::shutdown` after
 /// the scenario loop completes.
+/// Human-readable mode name for stdout progress lines. The
+/// `seed_label_for_metric` already exists for result-profile JSON keys,
+/// but stays internal; this is the stdout-facing label.
+fn mode_name(role: SeedRole) -> &'static str {
+    match role {
+        SeedRole::Old => "old_wallet",
+        SeedRole::New => "new_wallet",
+        SeedRole::Pp => "payment_processor",
+    }
+}
+
+/// Per-scenario transaction count for stdout progress lines. Maps the
+/// `ScenarioOutcome` variant to "what the operator naturally calls the
+/// tx count for this scenario": for send scenarios the success count;
+/// for scan-only scenarios 0 (no txs sent). Best-effort summary, not a
+/// load-bearing value — the canonical numbers live in the result
+/// profile.
+fn count_txs(outcome: &ScenarioOutcome) -> u64 {
+    use wallet_benchmarks::scenarios::ScenarioOutcome as S;
+    match outcome {
+        S::B0(_) | S::S2(_) | S::S3(_) | S::S6(_) | S::S7(_) => 0,
+        S::S0(_) => 1,
+        S::S1(s1) => s1.success_count,
+        S::S4(s4) => {
+            // SubBlockOutcome carries `n_concurrent` (u32) and
+            // `success_rate` (f64 in [0,1]); reconstruct the success count
+            // per sub-block and sum.
+            s4.sub_blocks
+                .iter()
+                .map(|b| (f64::from(b.n_concurrent) * b.success_rate).round() as u64)
+                .sum()
+        }
+        S::S5(s5) => s5.success_count,
+    }
+}
+
+/// Final summary table printed to stdout after the per-mode × per-scenario
+/// loop completes, before the result-profile JSON is written. Rows = mode,
+/// columns = scenario. Each cell shows status + tx_count.
+fn print_summary_table(matrix: &Matrix) {
+    println!();
+    println!("=== run summary ===");
+    let scenarios = ScenarioId::all();
+    let modes = [SeedRole::Old, SeedRole::New, SeedRole::Pp];
+    // Header.
+    print!("{:<20}", "mode\\scenario");
+    for sid in &scenarios {
+        print!("  {:<12}", format!("{sid}"));
+    }
+    println!();
+    // Body.
+    for role in modes {
+        print!("{:<20}", mode_name(role));
+        for sid in &scenarios {
+            let cell = match matrix.cells.get(&(role, *sid)) {
+                Some(c) => match &c.result {
+                    CellResult::Outcome(o) => format!("ok ({})", count_txs(o.as_ref())),
+                    CellResult::NotRun => "skipped".to_string(),
+                    CellResult::Error(_) => "err".to_string(),
+                },
+                None => "n/a".to_string(),
+            };
+            print!("  {:<12}", cell);
+        }
+        println!();
+    }
+    println!();
+}
+
 fn construct_mode(
     role: SeedRole,
     config: &Arc<Config>,
