@@ -113,7 +113,7 @@ export TARI_BENCH_VIEW_KEY=<hex view private key, 64 chars>
 export TARI_BENCH_SPEND_KEY=<hex public spend key, 64 chars>
 ```
 
-`resolve_account_keys` requires **both or neither** of the env vars to be set. Half an override (only `TARI_BENCH_VIEW_KEY` set, or only `TARI_BENCH_SPEND_KEY` set) bails at startup with a clear error message — half-overrides are almost always a typo and silently filling the missing half from the seed would risk pairing two unrelated wallets' keys.
+`resolve_account_keys` requires **both or neither** of the env vars to be set. Half an override (only `TARI_BENCH_VIEW_KEY` set, or only `TARI_BENCH_SPEND_KEY` set) bails at startup with a clear error message: half-overrides are almost always a typo, and silently filling the missing half from the seed would risk pairing two unrelated wallets' keys.
 
 The harness reads the env-var values only; it never writes them to disk.
 
@@ -137,7 +137,7 @@ export HARNESS_SEED_OLD="$(cat /tmp/seed-old.txt)"
 export HARNESS_SEED_NEW="$(cat /tmp/seed-new.txt)"
 export HARNESS_SEED_PP="$(cat /tmp/seed-pp.txt)"
 export HARNESS_WALLET_PW=harness_pp_password
-# Optional Mode 3 overrides — leave commented for the common case.
+# Optional Mode 3 overrides (leave commented for the common case).
 # Setting these makes PP and the PR daemon scan a wallet that differs
 # from HARNESS_SEED_PP (§2.5). Set both or neither.
 # export TARI_BENCH_VIEW_KEY=<hex>
