@@ -256,22 +256,45 @@ For each of the three addresses recorded in §2.4, request funding via the Tari 
 
 ### §4.2. Verify each wallet sees the funds
 
-For Mode 1 and Mode 2, verify via the console wallet's `get-balance`:
+There is no one-shot `get-balance` subcommand on `minotari_console_wallet`; the wallet is a long-running daemon that exposes balance via gRPC. The fastest reliable verification path is to let the harness's own `enforce_funding` pre-flight do the check.
 
-```sh
-# Mode 1 (old) seed
-HARNESS_SEED=$HARNESS_SEED_OLD \
-  minotari_console_wallet \
-    --network esmeralda \
-    --base-path /tmp/verify-old \
-    --password "$HARNESS_WALLET_PW" \
-    --seed-words "$HARNESS_SEED_OLD" \
-    get-balance
+**Primary verify path: run the harness's pre-flight.** Set up the env file from §2.7 and run the harness with default flags. `enforce_funding` (per `src/guards.rs`) spawns a transient `minotari_console_wallet` per seed, waits until each wallet sees a positive balance via `wait_ready_funded` (per `src/wallet_lifecycle/console_wallet.rs`, gates on `Online + GetStateResponse.balance.available_balance > 0`), then prints:
+
+```
+[HH:MM:SS] preflight  old=11000000000uT new=11000000000uT pp=11000000000uT  PASS
 ```
 
-Repeat with `HARNESS_SEED_NEW` and `HARNESS_SEED_PP`. The output reports an `available_balance` field. Wait until each shows at least 11k tXTM equivalent (`11_000_000_000` µT) before proceeding.
+If any wallet is short, `enforce_funding` bails with a per-seed shortage report naming exactly which seed and by how much. This is the same scan-and-balance code path the canonical run uses, so a green pre-flight here means a green pre-flight on the canonical run that follows.
 
-Allow time for initial scan completion on each wallet. The console_wallet reports the balance via gRPC `GetState`, but the scan-and-validation step takes minutes from a cold import. The harness's own `console_wallet::wait_ready` (see §7 "Troubleshooting") gates on `has_done_initial_validation`, so a partial scan returns 0 and surfaces as `enforce_funding` failure during a run if the operator hasn't pre-confirmed funded state.
+Per-wallet timing on a healthy network: ~30s of subprocess startup plus the wallet's own scan time (5-15 min on a cold import to a recent block height). The harness sequences the three checks serially under one `per_tx_confirmation_timeout_ms` deadline (30 min by default), so a fully cold three-seed pre-flight wraps inside an hour.
+
+**Manual verify path (optional).** If you want to verify outside the harness (e.g. before configuring `harness.toml`), the working pattern mirrors what the harness does for Mode 1's console wallet:
+
+```sh
+# 1. Pre-create the seed file the wallet reads (the wallet expects
+#    a file path via --seed-words-file, NOT a mnemonic via --seed-words).
+mkdir -p /tmp/verify-old
+echo "$HARNESS_SEED_OLD" > /tmp/verify-old/seed.txt
+chmod 600 /tmp/verify-old/seed.txt
+
+# 2. Spawn the wallet non-interactively. It scans on start; the gRPC
+#    server stays up so you can query balance. Pick any free port.
+./tools/minotari_console_wallet \
+  --network esmeralda \
+  --base-path /tmp/verify-old \
+  --password "$HARNESS_WALLET_PW" \
+  --seed-words-file /tmp/verify-old/seed.txt \
+  --non-interactive-mode \
+  --grpc-address /ip4/127.0.0.1/tcp/18142 &
+
+# 3. Tail the wallet log for scan progress, then either query gRPC
+#    directly (grpcurl + GetState / GetBalance) or kill the wallet
+#    and let the harness's pre-flight do the read.
+```
+
+The two flag corrections vs the original draft are: `--seed-words-file <path>` (not `--seed-words <mnemonic>`), and `--non-interactive-mode` (so the wallet starts without a TTY prompt). The harness uses these same flags successfully in `src/wallet_lifecycle/console_wallet.rs::spawn_argv`. Note also that `get-balance` is NOT a console-wallet subcommand: the wallet is a daemon and balance reads go over gRPC.
+
+In practice, sticking to the primary path (let `enforce_funding` do it) is simpler and is what `RUNBOOK §5` already assumes.
 
 ### §4.3. Mode 3: view-key wallet check
 
