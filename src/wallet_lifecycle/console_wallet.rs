@@ -68,6 +68,45 @@ const SIGTERM_GRACE: Duration = Duration::from_secs(10);
 /// Tick interval inside the SIGTERM grace loop.
 const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Settle window for [`ReadyPolicy::OnlineAndScanStable`]: if
+/// `scanned_height` is non-zero and does not change for this duration,
+/// the wallet is treated as ready (scan has plateaued, presumably at
+/// tip). 30s matches the operator-spec guidance from @SWvheerden's
+/// 2026-06-22 review of `556fb94`.
+const SCAN_STABLE_WINDOW: Duration = Duration::from_secs(30);
+
+/// Strategy controlling [`ConsoleWalletLifecycle::wait_ready_with_policy`].
+///
+/// `wait_ready` (the trait-method default) calls with
+/// [`Self::OnlineAndScanStable`]: scenarios just need the wallet
+/// connected to a base node and not actively scanning.
+/// `wait_ready_funded` (called by the funding pre-flight) uses
+/// [`Self::OnlineAndFunded`]: the caller is about to read the balance,
+/// so the operationally-meaningful signal is "wallet sees its money."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyPolicy {
+    /// Wallet is `Online` AND `scanned_height` has not changed for
+    /// [`SCAN_STABLE_WINDOW`] (with a baseline of `scanned_height > 0`
+    /// so a wallet that hasn't started scanning is never declared
+    /// stable). Coarse but reliable, and the right gate for sending
+    /// scenarios.
+    OnlineAndScanStable,
+    /// Wallet is `Online` AND `GetStateResponse.balance.available_balance > 0`.
+    /// Use from the funding pre-flight: if the wallet stays at 0 for the
+    /// entire `ready_deadline`, the funding pre-flight will report a
+    /// per-seed shortage error, which is the right outcome.
+    OnlineAndFunded,
+}
+
+impl std::fmt::Display for ReadyPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OnlineAndScanStable => write!(f, "OnlineAndScanStable"),
+            Self::OnlineAndFunded => write!(f, "OnlineAndFunded"),
+        }
+    }
+}
+
 /// `Network` allowlist string we cross-check at spawn time as defense in
 /// depth. `crate::guards::enforce_esmeralda` is the primary gate; this is the
 /// belt-and-braces re-assertion called out in
@@ -344,75 +383,8 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
     }
 
     async fn wait_ready(&mut self) -> anyhow::Result<()> {
-        if self.client.is_some() {
-            return Ok(());
-        }
-        let url = self.grpc_url()?;
-        // Connect-time backoff is allowed (see grpc.rs); use the configured
-        // per-tx confirmation timeout as the wall-clock budget for the entire
-        // wait-ready phase.
-        let mut client = connect_with_retry(&url, self.ready_deadline).await?;
-        let started = Instant::now();
-        loop {
-            if started.elapsed() >= self.ready_deadline {
-                anyhow::bail!(
-                    "wallet did not reach ready (Online + initial validation complete) \
-                     within {:?}",
-                    self.ready_deadline,
-                );
-            }
-            match client.get_state(GetStateRequest {}).await {
-                Ok(resp) => {
-                    let state = resp.into_inner();
-                    // Two-part readiness gate:
-                    //
-                    // 1. `network.status == Online` — connectivity to the base node.
-                    //    Prost-generated i32 for `ConnectivityStatus` in
-                    //    proto/network.proto: Initializing=0, Online=1, Degraded=2,
-                    //    Offline=3.
-                    // 2. `has_done_initial_validation == true` — the wallet has
-                    //    finished scanning + validating outputs (GetStateResponse
-                    //    field 4 in wallet.proto). Without this gate, `enforce_funding`
-                    //    and scenario sends race the in-flight scan: GetBalance
-                    //    returns 0 (false fail) and Mode 2's
-                    //    `create-unsigned-transaction` subprocess hits
-                    //    insufficient_funds.
-                    let connectivity = state
-                        .network
-                        .as_ref()
-                        .map(|n| n.status)
-                        .unwrap_or(ConnectivityStatus::Initializing as i32);
-                    if connectivity == ConnectivityStatus::Online as i32
-                        && state.has_done_initial_validation
-                    {
-                        log::info!(
-                            target: LOG_TARGET,
-                            "wallet ready at gRPC {url} (scanned_height={}, \
-                             status=Online, initial_validation=done)",
-                            state.scanned_height,
-                        );
-                        self.client = Some(client);
-                        return Ok(());
-                    }
-                    log::debug!(
-                        target: LOG_TARGET,
-                        "wallet not yet ready (scanned_height={}, status={connectivity}, \
-                         initial_validation={}); polling again in {:?}",
-                        state.scanned_height,
-                        state.has_done_initial_validation,
-                        READY_POLL_INTERVAL,
-                    );
-                }
-                Err(status) => {
-                    log::debug!(
-                        target: LOG_TARGET,
-                        "GetState transient error: {status}; polling again in {:?}",
-                        READY_POLL_INTERVAL,
-                    );
-                }
-            }
-            sleep(READY_POLL_INTERVAL).await;
-        }
+        self.wait_ready_with_policy(ReadyPolicy::OnlineAndScanStable)
+            .await
     }
 
     async fn teardown(&mut self) -> anyhow::Result<()> {
@@ -454,6 +426,119 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
 
     fn data_dir(&self) -> &Path {
         self.data_dir.path()
+    }
+}
+
+impl ConsoleWalletLifecycle {
+    /// Wait until the wallet reports a positive `available_balance`.
+    ///
+    /// The gate used by [`crate::wallet_lifecycle::balance_query::WalletGrpcBalanceQuery`]
+    /// in the funding pre-flight. The caller is about to query the
+    /// balance anyway, so the readiness signal that actually matters is
+    /// "scan reached a block containing this wallet's outputs". The
+    /// `has_done_initial_validation` gate that previously lived in
+    /// `wait_ready` (commit `556fb94`) is replaced because the upstream
+    /// flag does not assert reliably in the field per @SWvheerden's
+    /// 2026-06-22 review on PR #6: wallets hit the 30 min deadline
+    /// before the flag flips even on healthy networks.
+    ///
+    /// If the wallet is genuinely unfunded the deadline still elapses
+    /// and the funding pre-flight surfaces a per-seed shortage error,
+    /// which is the right outcome.
+    pub async fn wait_ready_funded(&mut self) -> anyhow::Result<()> {
+        self.wait_ready_with_policy(ReadyPolicy::OnlineAndFunded)
+            .await
+    }
+
+    /// Inner readiness loop. Returns when [`ReadyPolicy`] is satisfied or
+    /// `ready_deadline` elapses. Defined here rather than on the trait
+    /// so the trait surface stays small (only the trait-method
+    /// `wait_ready` is in the contract).
+    async fn wait_ready_with_policy(&mut self, policy: ReadyPolicy) -> anyhow::Result<()> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+        let url = self.grpc_url()?;
+        let mut client = connect_with_retry(&url, self.ready_deadline).await?;
+        let started = Instant::now();
+        // Scan-stability state, used by `OnlineAndScanStable` only.
+        let mut last_scanned_height: Option<u64> = None;
+        let mut stable_since: Option<Instant> = None;
+        loop {
+            if started.elapsed() >= self.ready_deadline {
+                anyhow::bail!(
+                    "wallet did not reach ready ({policy}) within {:?}",
+                    self.ready_deadline,
+                );
+            }
+            match client.get_state(GetStateRequest {}).await {
+                Ok(resp) => {
+                    let state = resp.into_inner();
+                    let connectivity = state
+                        .network
+                        .as_ref()
+                        .map(|n| n.status)
+                        .unwrap_or(ConnectivityStatus::Initializing as i32);
+                    let online = connectivity == ConnectivityStatus::Online as i32;
+                    let available = state
+                        .balance
+                        .as_ref()
+                        .map(|b| b.available_balance)
+                        .unwrap_or(0);
+
+                    let satisfied = match policy {
+                        ReadyPolicy::OnlineAndFunded => online && available > 0,
+                        ReadyPolicy::OnlineAndScanStable => {
+                            if !online || state.scanned_height == 0 {
+                                // Reset stability tracking on regressions / pre-Online state.
+                                last_scanned_height = None;
+                                stable_since = None;
+                                false
+                            } else {
+                                match (last_scanned_height, stable_since) {
+                                    (Some(prev), Some(since)) if prev == state.scanned_height => {
+                                        since.elapsed() >= SCAN_STABLE_WINDOW
+                                    }
+                                    _ => {
+                                        last_scanned_height = Some(state.scanned_height);
+                                        stable_since = Some(Instant::now());
+                                        false
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    if satisfied {
+                        log::info!(
+                            target: LOG_TARGET,
+                            "wallet ready at gRPC {url} (policy={policy}, \
+                             scanned_height={}, available_balance={available} uT, \
+                             status={connectivity})",
+                            state.scanned_height,
+                        );
+                        self.client = Some(client);
+                        return Ok(());
+                    }
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "wallet not yet ready (policy={policy}, scanned_height={}, \
+                         available_balance={available} uT, status={connectivity}); \
+                         polling again in {:?}",
+                        state.scanned_height,
+                        READY_POLL_INTERVAL,
+                    );
+                }
+                Err(status) => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "GetState transient error: {status}; polling again in {:?}",
+                        READY_POLL_INTERVAL,
+                    );
+                }
+            }
+            sleep(READY_POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -617,5 +702,52 @@ mod tests {
             std::env::remove_var(&seeds_cfg.old);
             std::env::remove_var(&seeds_cfg.wallet_password);
         }
+    }
+
+    // ---------- ReadyPolicy ----------
+
+    #[test]
+    fn ready_policy_display_matches_log_format() {
+        // The wait_ready_with_policy log format relies on `{policy}`
+        // resolving to a short, unambiguous string. If a future refactor
+        // breaks the Display impl, this test catches it before the next
+        // canonical-baseline run produces opaque error messages.
+        assert_eq!(
+            format!("{}", ReadyPolicy::OnlineAndScanStable),
+            "OnlineAndScanStable",
+        );
+        assert_eq!(
+            format!("{}", ReadyPolicy::OnlineAndFunded),
+            "OnlineAndFunded",
+        );
+    }
+
+    #[test]
+    fn ready_policy_variants_are_exhaustive_and_distinct() {
+        // Cheap compile-time guard against accidental enum drift: if
+        // someone adds a third variant the match below stops being
+        // exhaustive (Rust forces the new arm), and the assert_ne
+        // pair guards against two variants being defined to compare
+        // equal.
+        let scan = ReadyPolicy::OnlineAndScanStable;
+        let funded = ReadyPolicy::OnlineAndFunded;
+        match scan {
+            ReadyPolicy::OnlineAndScanStable | ReadyPolicy::OnlineAndFunded => {}
+        }
+        assert_ne!(scan, funded);
+    }
+
+    #[test]
+    fn scan_stable_window_is_a_short_seconds_grade_duration() {
+        // The wait_ready_with_policy stability gate uses
+        // SCAN_STABLE_WINDOW as the "no progress for X seconds → ready"
+        // bound. A canonical baseline run uses the default
+        // per_tx_confirmation_timeout_ms = 30 min as the overall
+        // wait_ready ceiling, so the stable window must be much
+        // shorter than that. Asserting an explicit bound here catches
+        // a future tweak that accidentally bumps the constant into the
+        // minutes-or-more range and starves the baseline run.
+        assert!(SCAN_STABLE_WINDOW >= Duration::from_secs(5));
+        assert!(SCAN_STABLE_WINDOW <= Duration::from_secs(120));
     }
 }

@@ -94,11 +94,25 @@ impl WalletGrpcBalanceQuery {
         let mut lifecycle = ConsoleWalletLifecycle::new(&self.config, &self.seeds, data_dir)?;
         lifecycle.replace_mnemonic(mnemonic.reveal().to_string())?;
 
-        // Spawn + wait_ready + query, capturing the result regardless of
-        // the wait_ready outcome so teardown still runs below.
+        // Spawn + wait_ready_funded + query, capturing the result
+        // regardless of the wait outcome so teardown still runs below.
         let result = async {
             lifecycle.spawn().await?;
-            lifecycle.wait_ready().await?;
+            // Funding pre-flight gate: wait until the wallet sees a
+            // positive available_balance (or `ready_deadline` elapses).
+            // The default trait `wait_ready` uses `OnlineAndScanStable`,
+            // which is not the right signal here: this call site is
+            // about to read GetBalance, so the operationally-meaningful
+            // signal is "scan reached a funded block." Per @SWvheerden's
+            // 2026-06-22 review on PR #6, the `has_done_initial_validation`
+            // flag does not assert reliably in healthy environments;
+            // `wait_ready_funded` gates on the value we actually care
+            // about (`GetStateResponse.balance.available_balance > 0`).
+            //
+            // If the wallet is genuinely unfunded, the wait deadline
+            // elapses with a 0 balance and the funding pre-flight reports
+            // a per-seed shortage error, which is the right outcome.
+            lifecycle.wait_ready_funded().await?;
             let client = lifecycle.client_mut()?;
             let resp = client
                 .get_balance(Request::new(GetBalanceRequest { payment_id: None }))
