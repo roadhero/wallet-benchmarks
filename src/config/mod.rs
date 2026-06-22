@@ -343,12 +343,15 @@ impl Config {
     }
 
     /// Validate cross-field invariants after deserialization. Currently
-    /// runs [`Mode3Config::validate`] when Mode 3 config is present —
-    /// hard-fails on missing binary paths or unset bench-account env
-    /// vars per `analysis/specs/MODE_3_REWORK_SPEC.md §12`.
+    /// runs [`Mode3Config::validate`] when Mode 3 config is present,
+    /// hard-failing on missing binary paths or unresolvable bench-account
+    /// keys per `analysis/specs/MODE_3_REWORK_SPEC.md §12`. The seeds
+    /// table is passed through so the account-key validation can fall
+    /// back to seed derivation when the env-var override is not set.
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(m) = self.mode_3.as_ref() {
-            m.validate().context("validating mode_3 config")?;
+            m.validate(&self.seeds)
+                .context("validating mode_3 config")?;
         }
         Ok(())
     }
@@ -373,32 +376,109 @@ impl Mode3Config {
     /// Bails when:
     /// * `pp_binary_path` does not exist or is not a regular file.
     /// * `minotari_binary_path` does not exist or is not a regular file.
-    /// * either bench-account env var (view key or public spend key) is
-    ///   unset at validation time.
+    /// * The bench-account keypair cannot be resolved at run time. The
+    ///   keypair has two paths: an operator-injected env-var override
+    ///   ([`Mode3Account::view_key_env`] + [`Mode3Account::public_spend_key_env`]),
+    ///   and a seed-derive fallback that reads
+    ///   [`Seeds::payment_processor`]'s env var. Validation policy
+    ///   (mirrors `pp_lifecycle::resolve_account_keys` at the lifecycle
+    ///   layer):
+    ///
+    ///   - **Both override env vars set** → validate each is a 64-char
+    ///     ASCII-hex string. Lifecycle will use them verbatim.
+    ///   - **Neither override env var set** → require that
+    ///     `seeds.payment_processor`'s env var is set. Lifecycle will
+    ///     derive the pair from that mnemonic via
+    ///     [`crate::seed::derive_view_spend_keypair`].
+    ///   - **Exactly one override env var set** → bail. Half an override
+    ///     is almost always a typo, and silently filling the missing
+    ///     half from the seed would risk pairing two unrelated wallets'
+    ///     keys (same policy as `resolve_account_keys`).
     ///
     /// Failure mode #1 + #10 per spec §14. Called by [`Config::validate`]
-    /// when [`Config::mode_3`] is `Some` so a missing path / env var
-    /// surfaces before any subprocess is spawned.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    /// when [`Config::mode_3`] is `Some` so a missing path / unresolvable
+    /// keypair surfaces before any subprocess is spawned.
+    pub fn validate(&self, seeds: &Seeds) -> anyhow::Result<()> {
         ensure_executable(&self.pp_binary_path, "mode_3.pp_binary_path")?;
         ensure_executable(&self.minotari_binary_path, "mode_3.minotari_binary_path")?;
-        let view_key_env = &self.accounts.bench.view_key_env;
-        std::env::var(view_key_env).map_err(|e| {
-            anyhow::anyhow!(
-                "mode_3.accounts.bench.view_key_env=${view_key_env} unset ({e}); set the hex \
-                 view key in the env var before running Mode 3 (see \
-                 analysis/specs/MODE_3_REWORK_SPEC.md §12)"
-            )
-        })?;
-        let spend_key_env = &self.accounts.bench.public_spend_key_env;
-        std::env::var(spend_key_env).map_err(|e| {
-            anyhow::anyhow!(
-                "mode_3.accounts.bench.public_spend_key_env=${spend_key_env} unset ({e}); set \
-                 the hex public spend key in the env var before running Mode 3"
-            )
-        })?;
-        Ok(())
+
+        let view_env_name = &self.accounts.bench.view_key_env;
+        let spend_env_name = &self.accounts.bench.public_spend_key_env;
+        let view_env = std::env::var(view_env_name).ok();
+        let spend_env = std::env::var(spend_env_name).ok();
+
+        match (view_env, spend_env) {
+            (Some(view), Some(spend)) => {
+                // Override path: validate hex shape so a misformatted
+                // override fails here (single source of truth) rather
+                // than deep in `minotari import-view-key` argv parsing.
+                ensure_hex_64(&view, "mode_3.accounts.bench.view_key_env", view_env_name)?;
+                ensure_hex_64(
+                    &spend,
+                    "mode_3.accounts.bench.public_spend_key_env",
+                    spend_env_name,
+                )?;
+                Ok(())
+            }
+            (None, None) => {
+                // Seed-derive path: lifecycle will hash HARNESS_SEED_PP
+                // (or whatever seeds.payment_processor points to) into
+                // the keypair. Require the seed env var to be set so
+                // the derivation does not fail at lifecycle spawn time.
+                let pp_seed_env = &seeds.payment_processor;
+                std::env::var(pp_seed_env).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Mode 3 keypair cannot be resolved: env vars ${} and ${} are unset \
+                         (override path) AND seeds.payment_processor=${pp_seed_env} is unset \
+                         ({e}) (seed-derive fallback). Set ${pp_seed_env} to the Mode 3 \
+                         mnemonic for the default derivation, or set BOTH ${} and ${} to \
+                         override the derivation. See RUNBOOK §2.5.",
+                        view_env_name,
+                        spend_env_name,
+                        view_env_name,
+                        spend_env_name,
+                    )
+                })?;
+                Ok(())
+            }
+            (Some(_), None) => anyhow::bail!(
+                "Mode 3 keypair override is half-set: env var ${} is set but ${} is not. \
+                 Set BOTH to override the seed-derive default, or unset both to derive \
+                 the pair from ${}.",
+                view_env_name,
+                spend_env_name,
+                seeds.payment_processor,
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "Mode 3 keypair override is half-set: env var ${} is set but ${} is not. \
+                 Set BOTH to override the seed-derive default, or unset both to derive \
+                 the pair from ${}.",
+                spend_env_name,
+                view_env_name,
+                seeds.payment_processor,
+            ),
+        }
     }
+}
+
+/// Validate that `value` is a 64-character ASCII-hex string (32 bytes,
+/// lowercase or uppercase). `config_key` is the dotted TOML path, used in
+/// the error message; `env_name` is the env-var name whose value was read.
+fn ensure_hex_64(value: &str, config_key: &str, env_name: &str) -> anyhow::Result<()> {
+    if value.len() != 64 {
+        anyhow::bail!(
+            "{config_key} (read from ${env_name}) must be 64 hex chars (32 bytes); \
+             got {} chars",
+            value.len(),
+        );
+    }
+    if !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "{config_key} (read from ${env_name}) must be ASCII hex digits only \
+             (0-9, a-f, A-F)",
+        );
+    }
+    Ok(())
 }
 
 fn ensure_executable(path: &std::path::Path, key: &str) -> anyhow::Result<()> {
@@ -615,6 +695,202 @@ mod tests {
         assert!(
             msg.contains("network") || msg.contains("string"),
             "error should describe the network/string mismatch: {msg}"
+        );
+    }
+
+    // ---------- Mode 3 validate ----------
+    //
+    // The three policies validate() must enforce per @SWvheerden's review
+    // of b7d05a3:
+    //   (a) both override env vars set + valid hex → passes
+    //   (b) both override env vars unset + seed env set → passes
+    //   (c) both override env vars unset + seed env unset → fails
+
+    /// Builds a `Mode3Config` with two binaries that *do* exist on every
+    /// dev box (`/bin/sh`, `/bin/cat`) so `ensure_executable` passes; tests
+    /// can then focus on the keypair-resolution policy without setting up
+    /// a real PP binary on disk.
+    fn build_validating_mode3(view_env: &str, spend_env: &str) -> Mode3Config {
+        Mode3Config {
+            pp_binary_path: PathBuf::from("/bin/sh"),
+            minotari_binary_path: PathBuf::from("/bin/cat"),
+            api_port: 9145,
+            pr_port: 9146,
+            pr_base_url: "https://rpc.esmeralda.tari.com".to_string(),
+            terminal_state_poll_timeout_secs: 60,
+            worker_sleep_overrides: WorkerSleepOverrides::default(),
+            accounts: Mode3Accounts {
+                bench: Mode3Account {
+                    view_key_env: view_env.to_string(),
+                    public_spend_key_env: spend_env.to_string(),
+                },
+            },
+        }
+    }
+
+    /// 64-char ASCII hex used as a valid override value.
+    const VALID_HEX_A: &str = "572a5fb63972da84aeec33071d13074e244d80c52be842ab5b0859ef4b4db00a";
+    const VALID_HEX_B: &str = "40e65c9bbf4592bc995c421108c01a5d7c9f9b2239569757895134549cef371f";
+
+    /// Mutate env via `set_var` / `remove_var`. Both calls are `unsafe` on
+    /// modern Rust; allow `unused_unsafe` for older toolchains.
+    fn set_env(name: &str, value: &str) {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+    fn unset_env(name: &str) {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    /// Unique env-var names per-test to avoid cross-test mutation races
+    /// under cargo's default parallel runner.
+    fn unique_envs(suffix: &str) -> (String, String, String) {
+        (
+            format!("WB_TEST_MODE3_VIEW_{suffix}"),
+            format!("WB_TEST_MODE3_SPEND_{suffix}"),
+            format!("WB_TEST_MODE3_SEED_{suffix}"),
+        )
+    }
+
+    fn seeds_with_pp(seed_env: &str) -> Seeds {
+        Seeds {
+            old: "WB_TEST_SEED_OLD".to_string(),
+            new: "WB_TEST_SEED_NEW".to_string(),
+            payment_processor: seed_env.to_string(),
+            wallet_password: "WB_TEST_PW".to_string(),
+        }
+    }
+
+    #[test]
+    fn mode3_validate_passes_with_both_override_env_vars_set_to_valid_hex() {
+        // Case (a): override env vars set + hex valid → validate passes
+        // without needing the seed env var to be set.
+        let (view, spend, seed) = unique_envs("OVERRIDE_VALID");
+        let cfg = build_validating_mode3(&view, &spend);
+        let seeds = seeds_with_pp(&seed);
+        set_env(&view, VALID_HEX_A);
+        set_env(&spend, VALID_HEX_B);
+        unset_env(&seed); // explicitly unset to prove the seed is not required
+        let result = cfg.validate(&seeds);
+        unset_env(&view);
+        unset_env(&spend);
+        assert!(
+            result.is_ok(),
+            "override path with valid hex should pass: {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn mode3_validate_passes_with_both_override_env_vars_unset_and_seed_set() {
+        // Case (b): override env vars unset + seed env set → lifecycle
+        // will derive the pair; validate passes without inspecting the
+        // seed value itself (the derive happens at lifecycle spawn).
+        let (view, spend, seed) = unique_envs("SEED_PATH");
+        let cfg = build_validating_mode3(&view, &spend);
+        let seeds = seeds_with_pp(&seed);
+        unset_env(&view);
+        unset_env(&spend);
+        set_env(&seed, "any non-empty value passes presence check");
+        let result = cfg.validate(&seeds);
+        unset_env(&seed);
+        assert!(
+            result.is_ok(),
+            "seed-derive path with seed set should pass: {:?}",
+            result.err(),
+        );
+    }
+
+    #[test]
+    fn mode3_validate_fails_when_overrides_and_seed_all_unset() {
+        // Case (c): override env vars unset + seed env unset → no path to
+        // resolve the keypair. Bail with a message naming both paths.
+        let (view, spend, seed) = unique_envs("ALL_UNSET");
+        let cfg = build_validating_mode3(&view, &spend);
+        let seeds = seeds_with_pp(&seed);
+        unset_env(&view);
+        unset_env(&spend);
+        unset_env(&seed);
+        let err = cfg
+            .validate(&seeds)
+            .expect_err("no resolvable keypair must fail");
+        let msg = format!("{err:#}");
+        // Error must name both resolution paths so the operator knows
+        // their two options.
+        assert!(
+            msg.contains(&view) && msg.contains(&spend),
+            "error must name both override env vars: {msg}",
+        );
+        assert!(
+            msg.contains(&seed),
+            "error must name the seed env var: {msg}",
+        );
+    }
+
+    #[test]
+    fn mode3_validate_fails_when_only_view_override_is_set() {
+        // Mixed override: ${view} set, ${spend} not → bail. Pairing
+        // half an override with a seed-derived half would risk crossing
+        // wallets.
+        let (view, spend, seed) = unique_envs("HALF_VIEW");
+        let cfg = build_validating_mode3(&view, &spend);
+        let seeds = seeds_with_pp(&seed);
+        set_env(&view, VALID_HEX_A);
+        unset_env(&spend);
+        set_env(
+            &seed,
+            "irrelevant — half-override should bail before seed check",
+        );
+        let err = cfg.validate(&seeds).expect_err("half override must fail");
+        unset_env(&view);
+        unset_env(&seed);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("half-set") && msg.contains(&view) && msg.contains(&spend),
+            "error must flag half-set + name both env vars: {msg}",
+        );
+    }
+
+    #[test]
+    fn mode3_validate_fails_when_only_spend_override_is_set() {
+        // Mirror of the above: ${spend} set, ${view} not → bail.
+        let (view, spend, seed) = unique_envs("HALF_SPEND");
+        let cfg = build_validating_mode3(&view, &spend);
+        let seeds = seeds_with_pp(&seed);
+        unset_env(&view);
+        set_env(&spend, VALID_HEX_B);
+        unset_env(&seed);
+        let err = cfg.validate(&seeds).expect_err("half override must fail");
+        unset_env(&spend);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("half-set") && msg.contains(&view) && msg.contains(&spend),
+            "error must flag half-set + name both env vars: {msg}",
+        );
+    }
+
+    #[test]
+    fn mode3_validate_fails_when_override_view_key_is_not_64_hex_chars() {
+        // Override path's hex shape gate. A short / non-hex value is
+        // almost always a paste error; surface it at validate time
+        // rather than as a clap parse failure inside `minotari import-view-key`.
+        let (view, spend, seed) = unique_envs("BAD_VIEW");
+        let cfg = build_validating_mode3(&view, &spend);
+        let seeds = seeds_with_pp(&seed);
+        set_env(&view, "too short");
+        set_env(&spend, VALID_HEX_B);
+        let err = cfg.validate(&seeds).expect_err("invalid hex must fail");
+        unset_env(&view);
+        unset_env(&spend);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("64 hex chars"),
+            "error must name the hex-length rule: {msg}",
         );
     }
 }
