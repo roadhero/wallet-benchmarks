@@ -115,48 +115,64 @@ pub async fn enforce_funding(
     // from a half-spawned wallet.
     seeds.assert_distinct()?;
 
-    let bal_old = balance_query
-        .get_balance(SeedRole::Old)
-        .await
-        .map_err(|e| e.context("querying balance for the old-wallet seed"))?;
-    let bal_new = balance_query
-        .get_balance(SeedRole::New)
-        .await
-        .map_err(|e| e.context("querying balance for the new-wallet seed"))?;
-
+    // Three balance queries run concurrently. Each transient
+    // console_wallet pays its own ~30s startup + ready-deadline cost
+    // (per `analysis/WAIT_READY_AUDIT.md`, the wait_ready ceiling is
+    // `per_tx_confirmation_timeout_ms`, default 30 min). Serially that
+    // was 3× — worst-case ~90 min before the scenario matrix runs.
+    // `tokio::try_join!` brings worst-case wall-clock down to 1× and
+    // short-circuits on the first failure exactly like the previous
+    // sequential `?`-chain did.
+    let old_fut = async {
+        balance_query
+            .get_balance(SeedRole::Old)
+            .await
+            .map_err(|e| e.context("querying balance for the old-wallet seed"))
+    };
+    let new_fut = async {
+        balance_query
+            .get_balance(SeedRole::New)
+            .await
+            .map_err(|e| e.context("querying balance for the new-wallet seed"))
+    };
     // Pp arm: Mode 3 path queries the PR daemon's HTTP API; the legacy
     // mnemonic-derived path stays as the fallback for Mode 1+2 runs that
-    // don't configure Mode 3.
-    let bal_pp_opt: Option<u64> = if let Some(pr_bq) = pr_balance_query {
-        match pr_bq.get_balance().await {
-            Ok(b) => {
-                log::info!(
-                    target: LOG_TARGET,
-                    "Mode 3 PR-daemon balance pre-flight: {b} uT (querying {})",
-                    pr_bq.balance_url(),
-                );
-                Some(b)
+    // don't configure Mode 3. The PR-daemon variant soft-skips on
+    // transport error (returns `Ok(None)`) so an unreachable daemon
+    // doesn't fail the whole pre-flight — same semantics as before
+    // parallelization.
+    let pp_fut = async {
+        if let Some(pr_bq) = pr_balance_query {
+            match pr_bq.get_balance().await {
+                Ok(b) => {
+                    log::info!(
+                        target: LOG_TARGET,
+                        "Mode 3 PR-daemon balance pre-flight: {b} uT (querying {})",
+                        pr_bq.balance_url(),
+                    );
+                    Ok::<Option<u64>, anyhow::Error>(Some(b))
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: LOG_TARGET,
+                        "Mode 3 PR-daemon balance pre-flight skipped: {e:#}. The PR daemon \
+                         isn't reachable at {} yet — pre-warm it out-of-band if you want \
+                         strict pre-flight coverage. Otherwise the per-mode loop will spawn \
+                         it before scenarios run.",
+                        pr_bq.balance_url(),
+                    );
+                    Ok(None)
+                }
             }
-            Err(e) => {
-                log::warn!(
-                    target: LOG_TARGET,
-                    "Mode 3 PR-daemon balance pre-flight skipped: {e:#}. The PR daemon \
-                     isn't reachable at {} yet — pre-warm it out-of-band if you want \
-                     strict pre-flight coverage. Otherwise the per-mode loop will spawn \
-                     it before scenarios run.",
-                    pr_bq.balance_url(),
-                );
-                None
-            }
-        }
-    } else {
-        Some(
-            balance_query
+        } else {
+            let b = balance_query
                 .get_balance(SeedRole::Pp)
                 .await
-                .map_err(|e| e.context("querying balance for the payment-processor seed"))?,
-        )
+                .map_err(|e| e.context("querying balance for the payment-processor seed"))?;
+            Ok(Some(b))
+        }
     };
+    let (bal_old, bal_new, bal_pp_opt) = tokio::try_join!(old_fut, new_fut, pp_fut)?;
 
     let any_short =
         bal_old < required || bal_new < required || bal_pp_opt.is_some_and(|b| b < required);
