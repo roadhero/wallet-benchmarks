@@ -107,6 +107,83 @@ impl std::fmt::Display for ReadyPolicy {
     }
 }
 
+/// Snapshot of the `GetState` fields that drive [`ReadyPolicy`] evaluation.
+///
+/// Carved out of the response so [`evaluate_ready_policy`] is a pure
+/// function of (snapshot, policy, scan-stability state, monotonic now) —
+/// the loop in [`ConsoleWalletLifecycle::wait_ready_with_policy`] is
+/// then a thin wrapper that handles gRPC + sleeping + the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PollSnapshot {
+    pub connectivity: i32,
+    pub scanned_height: u64,
+    pub available_balance: u64,
+}
+
+/// Per-call tracker for the [`ReadyPolicy::OnlineAndScanStable`] window.
+/// `evaluate_ready_policy` is the only mutator; the loop owns one
+/// instance for its lifetime.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ScanStability {
+    pub last_height: Option<u64>,
+    pub stable_since: Option<Instant>,
+}
+
+/// Result of evaluating a [`ReadyPolicy`] against the latest poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadyDecision {
+    Ready,
+    NotYet,
+}
+
+/// Pure policy evaluator extracted from the polling loop so the four
+/// cases the audit (`analysis/WAIT_READY_AUDIT.md`) calls out — happy
+/// path, Online+0 forever, never-Online, balance-arrives-with-Online
+/// same-poll race — are unit-testable without spinning a real wallet.
+///
+/// The `now` parameter is taken explicitly (rather than reading
+/// `Instant::now()` inside) so tests can drive a synthetic monotonic
+/// timeline by adding [`Duration`] offsets to a single baseline.
+pub(crate) fn evaluate_ready_policy(
+    snapshot: PollSnapshot,
+    policy: ReadyPolicy,
+    stability: &mut ScanStability,
+    now: Instant,
+) -> ReadyDecision {
+    let online = snapshot.connectivity == ConnectivityStatus::Online as i32;
+    match policy {
+        ReadyPolicy::OnlineAndFunded => {
+            if online && snapshot.available_balance > 0 {
+                ReadyDecision::Ready
+            } else {
+                ReadyDecision::NotYet
+            }
+        }
+        ReadyPolicy::OnlineAndScanStable => {
+            if !online || snapshot.scanned_height == 0 {
+                // Reset stability tracking on regressions / pre-Online state.
+                stability.last_height = None;
+                stability.stable_since = None;
+                return ReadyDecision::NotYet;
+            }
+            match (stability.last_height, stability.stable_since) {
+                (Some(prev), Some(since)) if prev == snapshot.scanned_height => {
+                    if now.saturating_duration_since(since) >= SCAN_STABLE_WINDOW {
+                        ReadyDecision::Ready
+                    } else {
+                        ReadyDecision::NotYet
+                    }
+                }
+                _ => {
+                    stability.last_height = Some(snapshot.scanned_height);
+                    stability.stable_since = Some(now);
+                    ReadyDecision::NotYet
+                }
+            }
+        }
+    }
+}
+
 /// `Network` allowlist string we cross-check at spawn time as defense in
 /// depth. `crate::guards::enforce_esmeralda` is the primary gate; this is the
 /// belt-and-braces re-assertion called out in
@@ -454,6 +531,12 @@ impl ConsoleWalletLifecycle {
     /// `ready_deadline` elapses. Defined here rather than on the trait
     /// so the trait surface stays small (only the trait-method
     /// `wait_ready` is in the contract).
+    ///
+    /// The policy decision per poll is delegated to
+    /// [`evaluate_ready_policy`] so the four logical cases (happy path,
+    /// Online+0 forever, never-Online, balance-arrives-with-Online
+    /// same-poll race) are unit-testable without a real wallet — see
+    /// `analysis/WAIT_READY_AUDIT.md` for the rationale.
     async fn wait_ready_with_policy(&mut self, policy: ReadyPolicy) -> anyhow::Result<()> {
         if self.client.is_some() {
             return Ok(());
@@ -461,9 +544,7 @@ impl ConsoleWalletLifecycle {
         let url = self.grpc_url()?;
         let mut client = connect_with_retry(&url, self.ready_deadline).await?;
         let started = Instant::now();
-        // Scan-stability state, used by `OnlineAndScanStable` only.
-        let mut last_scanned_height: Option<u64> = None;
-        let mut stable_since: Option<Instant> = None;
+        let mut stability = ScanStability::default();
         loop {
             if started.elapsed() >= self.ready_deadline {
                 anyhow::bail!(
@@ -474,48 +555,30 @@ impl ConsoleWalletLifecycle {
             match client.get_state(GetStateRequest {}).await {
                 Ok(resp) => {
                     let state = resp.into_inner();
-                    let connectivity = state
-                        .network
-                        .as_ref()
-                        .map(|n| n.status)
-                        .unwrap_or(ConnectivityStatus::Initializing as i32);
-                    let online = connectivity == ConnectivityStatus::Online as i32;
-                    let available = state
-                        .balance
-                        .as_ref()
-                        .map(|b| b.available_balance)
-                        .unwrap_or(0);
-
-                    let satisfied = match policy {
-                        ReadyPolicy::OnlineAndFunded => online && available > 0,
-                        ReadyPolicy::OnlineAndScanStable => {
-                            if !online || state.scanned_height == 0 {
-                                // Reset stability tracking on regressions / pre-Online state.
-                                last_scanned_height = None;
-                                stable_since = None;
-                                false
-                            } else {
-                                match (last_scanned_height, stable_since) {
-                                    (Some(prev), Some(since)) if prev == state.scanned_height => {
-                                        since.elapsed() >= SCAN_STABLE_WINDOW
-                                    }
-                                    _ => {
-                                        last_scanned_height = Some(state.scanned_height);
-                                        stable_since = Some(Instant::now());
-                                        false
-                                    }
-                                }
-                            }
-                        }
+                    let snapshot = PollSnapshot {
+                        connectivity: state
+                            .network
+                            .as_ref()
+                            .map(|n| n.status)
+                            .unwrap_or(ConnectivityStatus::Initializing as i32),
+                        scanned_height: state.scanned_height,
+                        available_balance: state
+                            .balance
+                            .as_ref()
+                            .map(|b| b.available_balance)
+                            .unwrap_or(0),
                     };
-
-                    if satisfied {
+                    let decision =
+                        evaluate_ready_policy(snapshot, policy, &mut stability, Instant::now());
+                    if decision == ReadyDecision::Ready {
                         log::info!(
                             target: LOG_TARGET,
                             "wallet ready at gRPC {url} (policy={policy}, \
-                             scanned_height={}, available_balance={available} uT, \
-                             status={connectivity})",
-                            state.scanned_height,
+                             scanned_height={}, available_balance={} uT, \
+                             status={})",
+                            snapshot.scanned_height,
+                            snapshot.available_balance,
+                            snapshot.connectivity,
                         );
                         self.client = Some(client);
                         return Ok(());
@@ -523,9 +586,10 @@ impl ConsoleWalletLifecycle {
                     log::debug!(
                         target: LOG_TARGET,
                         "wallet not yet ready (policy={policy}, scanned_height={}, \
-                         available_balance={available} uT, status={connectivity}); \
-                         polling again in {:?}",
-                        state.scanned_height,
+                         available_balance={} uT, status={}); polling again in {:?}",
+                        snapshot.scanned_height,
+                        snapshot.available_balance,
+                        snapshot.connectivity,
                         READY_POLL_INTERVAL,
                     );
                 }
@@ -749,5 +813,199 @@ mod tests {
         // minutes-or-more range and starves the baseline run.
         assert!(SCAN_STABLE_WINDOW >= Duration::from_secs(5));
         assert!(SCAN_STABLE_WINDOW <= Duration::from_secs(120));
+    }
+
+    // ---------- evaluate_ready_policy ----------
+    //
+    // The four cases the audit (analysis/WAIT_READY_AUDIT.md) calls out
+    // are exercised here without spinning a real wallet so future
+    // gate tweaks don't ship without coverage:
+    //
+    //   1. happy path: Online + funded → Ready immediately.
+    //   2. Online + 0 balance forever → NotYet forever.
+    //   3. never-Online → NotYet (and a hypothetical "balance leaked
+    //      while still pre-Online" race is also NotYet).
+    //   4. balance arrives in the same poll as Online → Ready (no
+    //      one-poll delay smuggled in by the loop's state-tracking).
+    //
+    // Plus a pair for the scan-stable policy: it ticks Ready after
+    // SCAN_STABLE_WINDOW of no-progress, and resets on height advance.
+
+    fn online_snap(scanned_height: u64, available: u64) -> PollSnapshot {
+        PollSnapshot {
+            connectivity: ConnectivityStatus::Online as i32,
+            scanned_height,
+            available_balance: available,
+        }
+    }
+
+    #[test]
+    fn online_and_funded_ready_on_first_funded_poll() {
+        let mut stability = ScanStability::default();
+        let now = Instant::now();
+        let snap = online_snap(12_345, 1_000_000);
+        assert_eq!(
+            evaluate_ready_policy(snap, ReadyPolicy::OnlineAndFunded, &mut stability, now),
+            ReadyDecision::Ready,
+        );
+    }
+
+    #[test]
+    fn online_and_funded_stays_not_yet_when_balance_is_zero_forever() {
+        let mut stability = ScanStability::default();
+        let baseline = Instant::now();
+        for i in 0..200 {
+            let snap = online_snap(100 + i, 0);
+            let now = baseline + Duration::from_secs(i);
+            assert_eq!(
+                evaluate_ready_policy(snap, ReadyPolicy::OnlineAndFunded, &mut stability, now),
+                ReadyDecision::NotYet,
+                "iteration {i}: a wallet that reports 0 balance must never be declared ready by OnlineAndFunded",
+            );
+        }
+    }
+
+    #[test]
+    fn online_and_funded_not_yet_when_never_online() {
+        let mut stability = ScanStability::default();
+        let now = Instant::now();
+        let init = PollSnapshot {
+            connectivity: ConnectivityStatus::Initializing as i32,
+            scanned_height: 0,
+            available_balance: 0,
+        };
+        assert_eq!(
+            evaluate_ready_policy(init, ReadyPolicy::OnlineAndFunded, &mut stability, now),
+            ReadyDecision::NotYet,
+        );
+        // Even a hypothetical race where the wallet reports a non-zero
+        // balance while still pre-Online must not flip the gate — Online
+        // is a hard precondition.
+        let pre_online_with_balance = PollSnapshot {
+            connectivity: ConnectivityStatus::Offline as i32,
+            scanned_height: 100,
+            available_balance: 42_000,
+        };
+        assert_eq!(
+            evaluate_ready_policy(
+                pre_online_with_balance,
+                ReadyPolicy::OnlineAndFunded,
+                &mut stability,
+                now,
+            ),
+            ReadyDecision::NotYet,
+            "balance > 0 must not satisfy OnlineAndFunded while connectivity is pre-Online",
+        );
+    }
+
+    #[test]
+    fn online_and_funded_ready_when_balance_arrives_in_same_poll_as_online() {
+        let mut stability = ScanStability::default();
+        let baseline = Instant::now();
+        // Five polls of pre-Online state: NotYet each time.
+        for i in 0..5 {
+            let snap = PollSnapshot {
+                connectivity: ConnectivityStatus::Initializing as i32,
+                scanned_height: 0,
+                available_balance: 0,
+            };
+            let now = baseline + Duration::from_secs(i);
+            assert_eq!(
+                evaluate_ready_policy(snap, ReadyPolicy::OnlineAndFunded, &mut stability, now),
+                ReadyDecision::NotYet,
+            );
+        }
+        // Sixth poll: Online + funded both arrive in the same response.
+        // The gate must declare Ready immediately — no extra poll cycle.
+        let now = baseline + Duration::from_secs(6);
+        let snap = online_snap(12_345, 42_000);
+        assert_eq!(
+            evaluate_ready_policy(snap, ReadyPolicy::OnlineAndFunded, &mut stability, now),
+            ReadyDecision::Ready,
+            "OnlineAndFunded must satisfy on the same poll Online+funded both become true",
+        );
+    }
+
+    #[test]
+    fn scan_stable_ready_after_window_with_no_height_progress() {
+        let mut stability = ScanStability::default();
+        let baseline = Instant::now();
+        let snap = online_snap(100, 0);
+        // First observation: records baseline, NotYet.
+        assert_eq!(
+            evaluate_ready_policy(
+                snap,
+                ReadyPolicy::OnlineAndScanStable,
+                &mut stability,
+                baseline,
+            ),
+            ReadyDecision::NotYet,
+        );
+        // Same height, just before the window closes: still NotYet.
+        assert_eq!(
+            evaluate_ready_policy(
+                snap,
+                ReadyPolicy::OnlineAndScanStable,
+                &mut stability,
+                baseline + SCAN_STABLE_WINDOW - Duration::from_millis(1),
+            ),
+            ReadyDecision::NotYet,
+        );
+        // Same height, at the window boundary: Ready.
+        assert_eq!(
+            evaluate_ready_policy(
+                snap,
+                ReadyPolicy::OnlineAndScanStable,
+                &mut stability,
+                baseline + SCAN_STABLE_WINDOW,
+            ),
+            ReadyDecision::Ready,
+        );
+    }
+
+    #[test]
+    fn scan_stable_resets_when_height_advances() {
+        let mut stability = ScanStability::default();
+        let baseline = Instant::now();
+        // First observation at height 100.
+        evaluate_ready_policy(
+            online_snap(100, 0),
+            ReadyPolicy::OnlineAndScanStable,
+            &mut stability,
+            baseline,
+        );
+        // Long after SCAN_STABLE_WINDOW, but at a NEW height: must be NotYet,
+        // because the stability tracker resets to the new height/time.
+        assert_eq!(
+            evaluate_ready_policy(
+                online_snap(200, 0),
+                ReadyPolicy::OnlineAndScanStable,
+                &mut stability,
+                baseline + SCAN_STABLE_WINDOW * 3,
+            ),
+            ReadyDecision::NotYet,
+            "scan-stable must reset on height advance instead of treating the elapsed wall-clock as 'no progress'",
+        );
+        // And the new height now also needs SCAN_STABLE_WINDOW from this moment
+        // to flip to Ready — anything shorter is NotYet.
+        let new_baseline = baseline + SCAN_STABLE_WINDOW * 3;
+        assert_eq!(
+            evaluate_ready_policy(
+                online_snap(200, 0),
+                ReadyPolicy::OnlineAndScanStable,
+                &mut stability,
+                new_baseline + SCAN_STABLE_WINDOW - Duration::from_millis(1),
+            ),
+            ReadyDecision::NotYet,
+        );
+        assert_eq!(
+            evaluate_ready_policy(
+                online_snap(200, 0),
+                ReadyPolicy::OnlineAndScanStable,
+                &mut stability,
+                new_baseline + SCAN_STABLE_WINDOW,
+            ),
+            ReadyDecision::Ready,
+        );
     }
 }
