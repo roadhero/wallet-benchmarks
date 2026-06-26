@@ -136,6 +136,26 @@ pub(crate) enum ReadyDecision {
     NotYet,
 }
 
+/// Human label for a [`ConnectivityStatus`] proto code. Used by the
+/// diagnostic logs and the timeout error so operators don't have to
+/// translate `status=1` back to "Online" by hand. Falls back to an
+/// explicit `Unknown(<n>)` form rather than swallowing an unrecognised
+/// code, so a future upstream proto change shows up in the diagnostic
+/// stream instead of being silently misread.
+pub(crate) fn connectivity_label(code: i32) -> String {
+    if code == ConnectivityStatus::Initializing as i32 {
+        "Initializing".to_string()
+    } else if code == ConnectivityStatus::Online as i32 {
+        "Online".to_string()
+    } else if code == ConnectivityStatus::Degraded as i32 {
+        "Degraded".to_string()
+    } else if code == ConnectivityStatus::Offline as i32 {
+        "Offline".to_string()
+    } else {
+        format!("Unknown({code})")
+    }
+}
+
 /// Pure policy evaluator extracted from the polling loop so the four
 /// cases the audit (`analysis/WAIT_READY_AUDIT.md`) calls out — happy
 /// path, Online+0 forever, never-Online, balance-arrives-with-Online
@@ -460,7 +480,9 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
     }
 
     async fn wait_ready(&mut self) -> anyhow::Result<()> {
-        self.wait_ready_with_policy(ReadyPolicy::OnlineAndScanStable)
+        // The trait method has no role context; tag the diagnostic
+        // stream with the policy name so operators can grep for it.
+        self.wait_ready_with_policy(ReadyPolicy::OnlineAndScanStable, "wait_ready")
             .await
     }
 
@@ -522,8 +544,8 @@ impl ConsoleWalletLifecycle {
     /// If the wallet is genuinely unfunded the deadline still elapses
     /// and the funding pre-flight surfaces a per-seed shortage error,
     /// which is the right outcome.
-    pub async fn wait_ready_funded(&mut self) -> anyhow::Result<()> {
-        self.wait_ready_with_policy(ReadyPolicy::OnlineAndFunded)
+    pub async fn wait_ready_funded(&mut self, role_label: &str) -> anyhow::Result<()> {
+        self.wait_ready_with_policy(ReadyPolicy::OnlineAndFunded, role_label)
             .await
     }
 
@@ -537,18 +559,57 @@ impl ConsoleWalletLifecycle {
     /// Online+0 forever, never-Online, balance-arrives-with-Online
     /// same-poll race) are unit-testable without a real wallet — see
     /// `analysis/WAIT_READY_AUDIT.md` for the rationale.
-    async fn wait_ready_with_policy(&mut self, policy: ReadyPolicy) -> anyhow::Result<()> {
+    ///
+    /// Diagnostic instrumentation per the audit's Part 2 deliverable:
+    ///
+    /// * INFO once at entry — role label, gRPC URL, policy, deadline.
+    /// * DEBUG per poll — poll index, elapsed seconds, connectivity
+    ///   (human label), scanned_height, available_balance.
+    /// * On timeout, the `anyhow::bail!` message embeds the LAST
+    ///   observed [`PollSnapshot`] (or a "no successful poll" note if
+    ///   `GetState` failed every iteration) so operators can tell which
+    ///   of audit causes (a)/(c)/(f) they hit without re-running with
+    ///   `RUST_LOG=debug`. The single INFO + the embedded last-state
+    ///   are the minimum needed for the next iteration on a real
+    ///   funded wallet to produce actionable evidence.
+    async fn wait_ready_with_policy(
+        &mut self,
+        policy: ReadyPolicy,
+        role_label: &str,
+    ) -> anyhow::Result<()> {
         if self.client.is_some() {
             return Ok(());
         }
         let url = self.grpc_url()?;
+        log::info!(
+            target: LOG_TARGET,
+            "wait_ready starting (role={role_label}, grpc={url}, policy={policy}, deadline={:?})",
+            self.ready_deadline,
+        );
         let mut client = connect_with_retry(&url, self.ready_deadline).await?;
         let started = Instant::now();
         let mut stability = ScanStability::default();
+        let mut poll_count: u64 = 0;
+        let mut last_snapshot: Option<PollSnapshot> = None;
+        let mut last_grpc_err: Option<String> = None;
         loop {
             if started.elapsed() >= self.ready_deadline {
+                let last_desc = match last_snapshot {
+                    Some(s) => format!(
+                        "connectivity={} ({}), scanned_height={}, available_balance={} uT",
+                        connectivity_label(s.connectivity),
+                        s.connectivity,
+                        s.scanned_height,
+                        s.available_balance,
+                    ),
+                    None => match last_grpc_err {
+                        Some(e) => format!("no successful GetState reply (last gRPC error: {e})"),
+                        None => "no GetState attempts completed".to_string(),
+                    },
+                };
                 anyhow::bail!(
-                    "wallet did not reach ready ({policy}) within {:?}",
+                    "wallet did not reach ready (policy={policy}, role={role_label}, \
+                     grpc={url}) within {:?}; polls={poll_count}; last state: {last_desc}",
                     self.ready_deadline,
                 );
             }
@@ -568,37 +629,45 @@ impl ConsoleWalletLifecycle {
                             .map(|b| b.available_balance)
                             .unwrap_or(0),
                     };
+                    poll_count += 1;
+                    last_snapshot = Some(snapshot);
+                    last_grpc_err = None;
+                    let elapsed_s = started.elapsed().as_secs();
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "wait_ready poll {poll_count} (role={role_label}, policy={policy}, \
+                         elapsed={elapsed_s}s): connectivity={} ({}), scanned_height={}, \
+                         available_balance={} uT",
+                        connectivity_label(snapshot.connectivity),
+                        snapshot.connectivity,
+                        snapshot.scanned_height,
+                        snapshot.available_balance,
+                    );
                     let decision =
                         evaluate_ready_policy(snapshot, policy, &mut stability, Instant::now());
                     if decision == ReadyDecision::Ready {
                         log::info!(
                             target: LOG_TARGET,
-                            "wallet ready at gRPC {url} (policy={policy}, \
-                             scanned_height={}, available_balance={} uT, \
-                             status={})",
+                            "wallet ready at gRPC {url} (role={role_label}, policy={policy}, \
+                             polls={poll_count}, elapsed={elapsed_s}s): connectivity={}, \
+                             scanned_height={}, available_balance={} uT",
+                            connectivity_label(snapshot.connectivity),
                             snapshot.scanned_height,
                             snapshot.available_balance,
-                            snapshot.connectivity,
                         );
                         self.client = Some(client);
                         return Ok(());
                     }
-                    log::debug!(
-                        target: LOG_TARGET,
-                        "wallet not yet ready (policy={policy}, scanned_height={}, \
-                         available_balance={} uT, status={}); polling again in {:?}",
-                        snapshot.scanned_height,
-                        snapshot.available_balance,
-                        snapshot.connectivity,
-                        READY_POLL_INTERVAL,
-                    );
                 }
                 Err(status) => {
+                    let msg = status.to_string();
                     log::debug!(
                         target: LOG_TARGET,
-                        "GetState transient error: {status}; polling again in {:?}",
-                        READY_POLL_INTERVAL,
+                        "wait_ready GetState transient error (role={role_label}, \
+                         polls={poll_count}, elapsed={}s): {msg}",
+                        started.elapsed().as_secs(),
                     );
+                    last_grpc_err = Some(msg);
                 }
             }
             sleep(READY_POLL_INTERVAL).await;

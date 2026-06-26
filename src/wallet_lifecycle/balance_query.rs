@@ -78,6 +78,14 @@ impl WalletGrpcBalanceQuery {
             SeedRole::New => "balance_query_new",
             SeedRole::Pp => "balance_query_pp",
         };
+        // Short label used in the wait_ready diagnostic stream so
+        // operators can attribute per-poll log lines to a seed without
+        // grepping run_id.
+        let role_label = match role {
+            SeedRole::Old => "Old",
+            SeedRole::New => "New",
+            SeedRole::Pp => "Pp",
+        };
         let run_id = format!(
             "{}_{}",
             std::process::id(),
@@ -112,7 +120,7 @@ impl WalletGrpcBalanceQuery {
             // If the wallet is genuinely unfunded, the wait deadline
             // elapses with a 0 balance and the funding pre-flight reports
             // a per-seed shortage error, which is the right outcome.
-            lifecycle.wait_ready_funded().await?;
+            lifecycle.wait_ready_funded(role_label).await?;
             let client = lifecycle.client_mut()?;
             let resp = client
                 .get_balance(Request::new(GetBalanceRequest { payment_id: None }))
