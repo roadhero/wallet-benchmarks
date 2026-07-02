@@ -419,13 +419,26 @@ This section maps real upstream-wallet behaviour to operator-facing symptoms. Mi
 
 **Resolution**: This is an upstream toolchain composition bug, not a harness defect. It is the expected outcome of a Mode 3 canonical baseline against current `v5.4.0-pre.4` plus `minotari-cli@52a7287a` plus PP@`f0572c9`. The harness records the real PP terminal state and the actual error string per the "harness does not hide wallet pain" AC. Ingest throughput (`POST /v1/payment-batches`) remains measurable; end-to-end settlement is not. See `analysis/PP_PEPESILVIA_RECON.md` for the upstream reproduction.
 
-### §7.2. Mode 1 / Mode 2 `enforce_funding` fails on a wallet you just funded
+### §7.2. Mode 1 / Mode 2 `enforce_funding` times out on a wallet you just funded
 
-**Symptom**: The harness aborts at startup with `enforce_funding: wallet X reports 0 balance` even though you confirmed the wallet was funded in §4.2.
+**Symptom**: The harness aborts with `wallet did not reach ready (policy=OnlineAndFunded, role=..., grpc=...) within 1800s; polls=N; last state: connectivity=Online (1), scanned_height=H, available_balance=B uT` even though you confirmed the wallet was funded in §4.2.
 
-**Cause**: The funding pre-flight spawns a transient console_wallet per seed (Mode 1 / Mode 2 / Mode 3), polls its gRPC `GetState`, and reads `available_balance`. The wallet's gRPC reports `Online` connectivity status well before scan-and-output-validation completes. Before the bug fix in `src/wallet_lifecycle/console_wallet.rs::wait_ready`, the readiness gate returned on `Online` alone and the balance read raced an in-flight scan, returning 0.
+**Read the embedded last state first.** The pre-flight gate is `Online` AND `available_balance > 0`; the timeout error reports the last `GetState` snapshot so you can classify the failure without a re-run:
 
-**Resolution**: Current code gates on both `Online` AND `has_done_initial_validation == true` (per `GetStateResponse` field 4). If you still see this, the pre-flight is honouring the gate but the scan hasn't reached the funding tx height yet. Wait 5 to 10 minutes after funding before re-running, or run `minotari_console_wallet ... get-balance` (§4.2) to pre-warm.
+- `connectivity=Online, scanned_height=0` for the whole window: the wallet's UTXO scanner never completed a pass. See the scanner note below; this is almost always a poisoned or missing scan source, not a funding problem.
+- `connectivity=Online, scanned_height` advancing but `available_balance=0`: the scan is running but has not reached the funding transaction's height yet (or the wallet genuinely holds nothing). Give it time or check the funding tx landed.
+- `connectivity=Initializing/Offline` throughout: the wallet never reached the network; check connectivity/tor.
+
+Per-poll detail is available with `RUST_LOG=info,c=debug` (§5.3): one DEBUG line per second per wallet with connectivity, scanned_height, and available_balance.
+
+**How the wallet scans (v5.4.x)**: the console wallet's UTXO scanner reads the chain over the base node's HTTP wallet-query service, NOT over gRPC or p2p. The scan source is `wallet.http_server_url`, which defaults to `http://127.0.0.1:9005` on Esmeralda, with `https://rpc.esmeralda.tari.com` as fallback, on a 60 second scan interval. The fallback engages only when the primary does not respond at all.
+
+**The trap**: if anything answers on `127.0.0.1:9005` with a stale or unsynced chain view (a local base node mid-sync is the classic case; every `minotari_node` serves this port by default), every console wallet on that host scans against it, sees a chain shorter than the funding height, and reports `available_balance=0` forever. The primary responded, so the fallback never engages, and the wallet still shows `Online` because p2p connectivity is healthy. From the outside this is indistinguishable from an unfunded wallet, except that `scanned_height` stays pinned at 0 (or at the stale node's tip).
+
+**Resolution**:
+- If you run a local base node, make sure it is fully synced (`curl -s http://127.0.0.1:9005/get_tip_info | jq .is_synced` must be `true`) before running the pre-flight; a synced local node is also the fastest scan source.
+- If you do not run one, make sure nothing else is bound to 9005, so the wallet falls back to the public endpoint.
+- To pin the scan source explicitly, pass `-p wallet.http_server_url=<url>` to any manually spawned console wallet (the harness's spawned wallets use the wallet defaults).
 
 ### §7.3. Mode 2 hits `insufficient_funds` mid-run
 
