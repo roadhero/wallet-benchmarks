@@ -315,12 +315,17 @@ pub(super) async fn run_scan_subprocess(
     let harness_toml = write_harness_toml(data_dir)?;
     let database_path = data_dir.join("wallet.sqlite3");
     let max_blocks_to_scan = max_blocks.unwrap_or(DEFAULT_MAX_BLOCKS_TO_SCAN);
+    // Url::as_str() renders a trailing slash on host-only URLs; the CLI
+    // scanner concatenates "{base_url}/get_tip_info", so an untrimmed
+    // value produces "//get_tip_info" paths that the node's router 404s
+    // and the scan retries forever. Trim it off.
+    let base_url = cfg.base_node_url.as_str().trim_end_matches('/');
     let argv = build_scan_argv(
         &harness_toml,
         &database_path,
         password,
         max_blocks_to_scan,
-        cfg.base_node_url.as_str(),
+        base_url,
     );
     let binary = resolve_binary(cfg);
     let (harness_home, path_env) = subprocess_env(data_dir);
