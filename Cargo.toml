@@ -31,16 +31,16 @@ sha2        = "0.10"
 hex         = "0.4"
 
 # Tari ecosystem — Mode 1 (gRPC) and Mode 2/3 (offline sign + HTTP submit)
-minotari_app_grpc           = { version = "5.3.1", default-features = false }
-minotari_node_wallet_client = "5.3.1"
+minotari_app_grpc           = { version = "5.4.0-rc.1", default-features = false }
+minotari_node_wallet_client = "5.4.0-rc.1"
 tonic                       = { version = "0.13", features = ["transport"] }
 prost                       = "0.13"
 
-tari_common                 = "5.3.1"
-tari_common_types           = "5.3.1"
-tari_transaction_components = "5.3.1"
-tari_crypto                 = { version = "0.22.1", features = ["borsh"] }
-tari_utilities              = "0.8"
+tari_common                 = "5.4.0-rc.1"
+tari_common_types           = "5.4.0-rc.1"
+tari_transaction_components = "5.4.0-rc.1"
+tari_crypto                 = { version = "0.23", features = ["borsh"] }
+tari_utilities              = "0.10"
 
 # Trait objects with async fn — matches the maintainer-idiom used by
 # minotari_node_wallet_client and the tari ecosystem broadly.

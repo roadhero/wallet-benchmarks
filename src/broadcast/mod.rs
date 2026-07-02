@@ -171,6 +171,7 @@ mod tests {
             accepted,
             rejection_reason: reason,
             is_synced,
+            details: None,
         }
     }
 
