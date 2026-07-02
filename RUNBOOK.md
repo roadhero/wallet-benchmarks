@@ -12,11 +12,13 @@ For background on what each mode measures, see `analysis/PR_BODY_v2.md`. For the
 
 | Component | Required version | Where it comes from |
 |---|---|---|
-| `minotari_node`, `minotari_console_wallet`, `tari_base_node` (and the rest of the tari_suite bundle) | `v5.4.0-pre.4` Esmeralda build | GitHub release `tari-project/tari/v5.4.0-pre.4`. Operator pre-extracts and places on `$PATH` or sets `Config::minotari_console_wallet_path` in `harness.toml`. |
-| `minotari` CLI | commit `52a7287a` of `tari-project/minotari-cli` | Operator clones, `cargo build --release`, drops the resulting binary somewhere reachable (default `/usr/local/bin/minotari`). |
-| `minotari_payment_processor` (PP) | commit `f0572c9` of `tari-project/minotari_payment_processor` | Vendored as a submodule at `vendor/minotari_payment_processor`. Operator builds from the submodule per §2. |
+| `minotari_node`, `minotari_console_wallet`, `tari_base_node` (and the rest of the tari_suite bundle) | `v5.4.0-pre.4` or later Esmeralda build | GitHub release `tari-project/tari/v5.4.0-pre.4`. Operator pre-extracts and places on `$PATH` or sets `Config::minotari_console_wallet_path` in `harness.toml`. |
+| `minotari` CLI | commit `52a7287a` of `tari-project/minotari-cli`, **with the tari crates bumped to `5.4.0-rc.1`** (see the wallet-crypto warning below) | Operator clones, bumps the `tari_*` workspace versions from `5.3.1-pre.0` to `5.4.0-rc.1`, `cargo build --release`, drops the resulting binary somewhere reachable (default `/usr/local/bin/minotari`). |
+| `minotari_payment_processor` (PP) | commit `f0572c9` of `tari-project/minotari_payment_processor` | Vendored as a submodule at `vendor/minotari_payment_processor`. Operator builds from the submodule per §2. **Known limitation:** PP pins tari `5.2.1-pre.2` (tari_crypto 0.22.1) and cannot read outputs created on the current network era; Mode 3 scanning does not work until upstream PP moves its pin (see the warning below). |
 | Rust toolchain | stable, edition 2021 | The harness builds against the standard `rust-toolchain.toml` (no nightly features). |
 | sqlite3 system lib | present | The harness's `rusqlite` dependency is built with `bundled` so the system sqlite isn't strictly required, but PP's `sqlx` build needs the system header on Linux. |
+
+**Wallet-crypto version alignment (load-bearing).** The v5.4.0-pre/rc binaries build against `tari_crypto 0.23`; tari `5.3.x` and earlier crates build against `tari_crypto 0.22.1`. The encrypted-data recovery that wallet scanning depends on is not compatible across that boundary: a wallet built on 0.22.1 components recovers nothing from outputs created by v5.4-era binaries (verified live with a recovery probe: identical output bytes and identical seed recover under 5.4.0-rc components and return nothing under 5.3.0-pre.3). Every component that scans or signs, including this harness, the `minotari` CLI, and PP, must be built against the same tari lineage as the network binaries. The harness's own `Cargo.toml` pins `5.4.0-rc.1` for this reason. Upstream `minotari-cli` main still pins `5.3.0-pre.3` and needs the bump at build time; upstream PP pins `5.2.1-pre.2` and does not compile against 5.4 without migration.
 
 ### Repository checkout
 
@@ -256,9 +258,28 @@ PP and the PR daemon watch the same `"default"` account using whichever keypair 
 
 The three wallets must each hold at least **11_000_000_000 µT (11k tXTM)** before the run starts. The bounty's `a_fund` parameter is 10k XTM per wallet; the extra 10% is `enforce_funding`'s headroom margin to account for fees consumed during the run.
 
-### §4.1. Request testnet faucet funds
+### §4.1. Fund the wallets (faucet or solo mining)
 
 For each of the three addresses recorded in §2.4, request funding via the Tari Esmeralda faucet (or whichever testnet funding channel your operator setup uses). Allow a few minutes for mining and confirmation.
+
+**Solo mining path (no faucet needed).** Esmeralda SHA3 difficulty is low enough for CPU solo mining (a laptop finds blocks in seconds to minutes), and coinbase maturity is only 6 blocks. Against a fully synced local node:
+
+```sh
+minotari_miner --network esmeralda -b <miner_base_dir> \
+  --non-interactive-mode --miner-max-blocks 1 \
+  -p miner.base_node_grpc_address=http://127.0.0.1:18142 \
+  -p miner.wallet_payment_address=<address from §2.4> \
+  -p miner.num_mining_threads=8 \
+  -p miner.mine_on_tip_only=true \
+  -p miner.range_proof_type=bullet_proof_plus
+```
+
+Two traps, both verified live on v5.4.0-rc.1:
+
+* **Use `bullet_proof_plus` coinbases.** The miner's default `revealed_value` coinbases are not recoverable by scanning wallets: the wallet decrypts the value but reconstructs a different commitment, the base node reports the reconstructed output as unmined, and the funds stay invisible forever. BulletProofPlus coinbases recover normally.
+* **The node's gRPC allowlist must include the mining methods** (`get_new_block_template`, `get_new_block`, `submit_block`), and the node must be fully synced (`mine_on_tip_only` refuses otherwise, which is what you want; mining on an unsynced node forks you off canonical).
+
+One block pays roughly the full block reward (thousands of tXTM at current esmeralda emission), so a single block per wallet more than covers `a_fund` with headroom.
 
 ### §4.2. Verify each wallet sees the funds
 
@@ -277,28 +298,25 @@ Per-wallet timing on a healthy network: ~30s of subprocess startup plus the wall
 **Manual verify path (optional).** If you want to verify outside the harness (e.g. before configuring `harness.toml`), the working pattern mirrors what the harness does for Mode 1's console wallet:
 
 ```sh
-# 1. Pre-create the seed file the wallet reads (the wallet expects
-#    a file path via --seed-words-file, NOT a mnemonic via --seed-words).
-mkdir -p /tmp/verify-old
-echo "$HARNESS_SEED_OLD" > /tmp/verify-old/seed.txt
-chmod 600 /tmp/verify-old/seed.txt
-
-# 2. Spawn the wallet non-interactively. It scans on start; the gRPC
-#    server stays up so you can query balance. Pick any free port.
+# 1. Spawn the wallet non-interactively in RECOVERY mode with the seed
+#    words in the wallet's env var. It recovers from the wallet birthday
+#    during boot; the gRPC server then reports the balance immediately.
+#    Pick any free port.
+MINOTARI_WALLET_SEED_WORDS="$HARNESS_SEED_OLD" \
 ./tools/minotari_console_wallet \
   --network esmeralda \
   --base-path /tmp/verify-old \
   --password "$HARNESS_WALLET_PW" \
-  --seed-words-file /tmp/verify-old/seed.txt \
+  --recovery \
   --non-interactive-mode \
   --grpc-address /ip4/127.0.0.1/tcp/18142 &
 
-# 3. Tail the wallet log for scan progress, then either query gRPC
+# 2. Tail the wallet log for recovery progress, then either query gRPC
 #    directly (grpcurl + GetState / GetBalance) or kill the wallet
 #    and let the harness's pre-flight do the read.
 ```
 
-The two flag corrections vs the original draft are: `--seed-words-file <path>` (not `--seed-words <mnemonic>`), and `--non-interactive-mode` (so the wallet starts without a TTY prompt). The harness uses these same flags successfully in `src/wallet_lifecycle/console_wallet.rs::spawn_argv`. Note also that `get-balance` is NOT a console-wallet subcommand: the wallet is a daemon and balance reads go over gRPC.
+**Do NOT use `--seed-words-file` to import a seed.** On the v5.4 wallet that flag is an EXPORT: `init_wallet` writes the wallet's own seed words to the given path after startup and never reads it. A fresh non-interactive wallet given only `--seed-words-file` silently creates a brand-new random wallet and overwrites your file with its new mnemonic; the wallet then scans forever for keys nobody funded. Seed import is `--recovery` plus `--seed-words "<24 words>"` (or the `MINOTARI_WALLET_SEED_WORDS` env var, which keeps the mnemonic off argv). The harness spawns wallets exactly this way in `src/wallet_lifecycle/console_wallet.rs::spawn`. Note also that `get-balance` is NOT a console-wallet subcommand: the wallet is a daemon and balance reads go over gRPC.
 
 In practice, sticking to the primary path (let `enforce_funding` do it) is simpler and is what `RUNBOOK §5` already assumes.
 
