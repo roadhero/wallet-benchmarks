@@ -446,6 +446,47 @@ const DEFAULT_BALANCE_WAIT_DEADLINE: std::time::Duration = std::time::Duration::
 /// last-observed reading on timeout so the operator can distinguish
 /// "scan never finished" from "wallet is genuinely empty".
 ///
+/// One-shot balance read for a seed through the `minotari` CLI: create the
+/// wallet db from the mnemonic in a fresh tempdir, scan against the
+/// configured base node, read the balance, drop the tempdir.
+///
+/// Used by the funding pre-flight for the New and Pp roles. Those roles
+/// spend through the `minotari` CLI / payment processor stack, whose
+/// seed-to-key derivation (`SeedWordsWallet`) differs from the
+/// `console_wallet` key-manager derivation that Mode 1 uses. A
+/// `console_wallet` spawned from the same mnemonic therefore reports the
+/// balance of keys the New/Pp modes never spend from, and the pre-flight
+/// passes or fails on the wrong wallet. Verified live: a seed whose CLI
+/// wallet held 2500 T reported 0 through a console_wallet spawned from the
+/// same mnemonic, because the two stacks derive distinct view/spend
+/// keypairs.
+pub(crate) async fn cli_balance_for_seed(
+    cfg: &Config,
+    mnemonic: &str,
+    password: &str,
+    role_tag: &str,
+) -> anyhow::Result<u64> {
+    let run_id = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    let mut data_dir = HarnessDataDir::new(&run_id, role_tag)?;
+    wipe_and_reimport_via_create(cfg, &mut data_dir, mnemonic, password)
+        .await
+        .context("cli_balance_for_seed: creating wallet db from mnemonic")?;
+    let data_path = data_dir.path().to_path_buf();
+    run_scan_subprocess(cfg, &data_path, password, None)
+        .await
+        .context("cli_balance_for_seed: scanning")?;
+    run_balance_subprocess(cfg, &data_path)
+        .await
+        .context("cli_balance_for_seed: reading balance")
+}
+
 /// Note on AC-32 (`tests/c_no_retry_backoff_throttle.rs`): the poll-cadence
 /// `sleep` lives inside a `tokio::select!` arm alongside the absolute
 /// `sleep_until(deadline)` bound. Both sleeps are deadlines/bounds, not

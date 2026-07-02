@@ -24,6 +24,11 @@ pub mod new_wallet;
 pub mod old_wallet;
 pub mod payment_processor;
 
+// Re-exported for the funding pre-flight: the New/Pp roles must be
+// balance-checked through the same CLI wallet stack they spend from (see
+// `cli_balance_for_seed` for the derivation-mismatch rationale).
+pub(crate) use minotari_wallet_ops::cli_balance_for_seed;
+
 use std::sync::Arc;
 
 use tari_common_types::tari_address::TariAddress;

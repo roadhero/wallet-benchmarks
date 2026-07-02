@@ -152,9 +152,37 @@ impl WalletGrpcBalanceQuery {
 #[async_trait]
 impl BalanceQuery for WalletGrpcBalanceQuery {
     async fn get_balance(&self, role: SeedRole) -> anyhow::Result<u64> {
-        self.inner_get_balance(role)
-            .await
-            .map_err(|e| e.context(format!("WalletGrpcBalanceQuery for role {role:?}")))
+        match role {
+            // Mode 1 spends through the console_wallet, so its funding is
+            // checked through a console_wallet spawned from the seed.
+            SeedRole::Old => self
+                .inner_get_balance(role)
+                .await
+                .map_err(|e| e.context(format!("WalletGrpcBalanceQuery for role {role:?}"))),
+            // Modes 2 and 3 spend through the minotari CLI / payment
+            // processor stack, whose SeedWordsWallet derivation produces a
+            // different keypair than the console_wallet derives from the
+            // same mnemonic. Checking these roles through a console_wallet
+            // reports the balance of keys those modes never spend from, so
+            // the pre-flight must read the CLI wallet instead.
+            SeedRole::New | SeedRole::Pp => {
+                let mnemonic = self.seeds.mnemonic_for(role)?;
+                let password = self.seeds.wallet_password()?;
+                let role_tag = match role {
+                    SeedRole::New => "balance_query_cli_new",
+                    SeedRole::Pp => "balance_query_cli_pp",
+                    SeedRole::Old => unreachable!("Old handled above"),
+                };
+                crate::modes::cli_balance_for_seed(
+                    &self.config,
+                    mnemonic.reveal(),
+                    password.reveal(),
+                    role_tag,
+                )
+                .await
+                .map_err(|e| e.context(format!("CLI balance query for role {role:?}")))
+            }
+        }
     }
 }
 
