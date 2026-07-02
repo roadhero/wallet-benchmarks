@@ -121,6 +121,7 @@ pub(super) fn build_scan_argv(
     database_path: &Path,
     password: &str,
     max_blocks_to_scan: u64,
+    base_url: &str,
 ) -> Vec<String> {
     vec![
         "--config".to_string(),
@@ -136,6 +137,8 @@ pub(super) fn build_scan_argv(
         ACCOUNT_NAME.to_string(),
         "--max-blocks-to-scan".to_string(),
         max_blocks_to_scan.to_string(),
+        "--base-url".to_string(),
+        base_url.to_string(),
     ]
 }
 
@@ -312,7 +315,13 @@ pub(super) async fn run_scan_subprocess(
     let harness_toml = write_harness_toml(data_dir)?;
     let database_path = data_dir.join("wallet.sqlite3");
     let max_blocks_to_scan = max_blocks.unwrap_or(DEFAULT_MAX_BLOCKS_TO_SCAN);
-    let argv = build_scan_argv(&harness_toml, &database_path, password, max_blocks_to_scan);
+    let argv = build_scan_argv(
+        &harness_toml,
+        &database_path,
+        password,
+        max_blocks_to_scan,
+        cfg.base_node_url.as_str(),
+    );
     let binary = resolve_binary(cfg);
     let (harness_home, path_env) = subprocess_env(data_dir);
 
@@ -618,6 +627,7 @@ mod tests {
             Path::new("/data/wallet.sqlite3"),
             "pw",
             12345,
+            "http://127.0.0.1:9005/",
         );
         assert_eq!(argv[0], "--config");
         assert_eq!(argv[1], "/data/harness.toml");
@@ -632,7 +642,9 @@ mod tests {
         assert_eq!(argv[10], "default");
         assert_eq!(argv[11], "--max-blocks-to-scan");
         assert_eq!(argv[12], "12345");
-        assert_eq!(argv.len(), 13);
+        assert_eq!(argv[13], "--base-url");
+        assert_eq!(argv[14], "http://127.0.0.1:9005/");
+        assert_eq!(argv.len(), 15);
     }
 
     #[test]
