@@ -58,12 +58,18 @@ The harness CLI is at `target/release/wallet-benchmarks`. Use the absolute path 
 
 ### §2.2. Build the PP daemon
 
+PP uses `sqlx` compile-time checked queries with no committed offline query cache, so a bare `cargo build` fails with ~30 `set DATABASE_URL to use query macros online` errors. Point `DATABASE_URL` at a sqlite database with the PP schema applied; the migrations are plain SQL and apply with the stock `sqlite3` CLI (no `sqlx-cli` install needed):
+
 ```sh
 cd vendor/minotari_payment_processor
-cargo build --release
+rm -f /tmp/pp-build.db
+for f in migrations/*.sql; do sqlite3 /tmp/pp-build.db < "$f"; done
+DATABASE_URL="sqlite:///tmp/pp-build.db" cargo build --release
 ls target/release/minotari_payment_processor
 cd ../..
 ```
+
+The build database is only consulted at compile time for query type-checking; PP creates and migrates its real runtime database itself.
 
 The PP path goes into `harness.toml` as `mode_3.pp_binary_path`. Default the spec uses is `/tmp/tari-pp-build/pp/target/release/minotari_payment_processor`; you can place it anywhere readable and reference the actual path.
 
@@ -338,10 +344,10 @@ A canonical Esmeralda baseline takes 3 to 5 hours. The dominant cost is S1 (volu
 `env_logger` reads `RUST_LOG`. The defaults are quiet; for a baseline run, set:
 
 ```sh
-RUST_LOG=info,wallet_benchmarks=debug ./target/release/wallet-benchmarks run
+RUST_LOG=info,c=debug ./target/release/wallet-benchmarks run
 ```
 
-`wallet_benchmarks=debug` surfaces the per-mode lifecycle events (wait_ready transitions, balance polling, subprocess spawn/teardown, PP HTTP probes). `info` keeps the per-tx noise readable.
+The harness's log targets use the `c::` prefix (mirroring the tari codebase convention; see the `LOG_TARGET` constants in `src/`), so the DEBUG directive must be `c=debug`, NOT `wallet_benchmarks=debug`. A crate-name directive matches the module path only when the log macro omits `target:`, which the harness never does; with the wrong directive every per-poll wait_ready diagnostic is silently filtered out. `c=debug` surfaces the per-mode lifecycle events (wait_ready poll-by-poll state, balance polling, subprocess spawn/teardown, PP HTTP probes). `info` keeps the per-tx noise readable.
 
 ### §5.4. Terminal feedback (independent of `RUST_LOG`)
 
