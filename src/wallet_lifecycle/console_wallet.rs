@@ -9,11 +9,12 @@
 //! Argv shape (literal, in this order, per `DESIGN.md §Mode 1 step 1`):
 //!
 //! ```text
+//! MINOTARI_WALLET_SEED_WORDS="<24 words>" \
 //! minotari_console_wallet \
 //!   --network esmeralda \
 //!   --base-path  <data_dir> \
 //!   --password   $HARNESS_WALLET_PW \
-//!   --seed-words-file <data_dir>/seed.txt \
+//!   --recovery \
 //!   --non-interactive-mode \
 //!   --grpc-address /ip4/127.0.0.1/tcp/<dynamic-port>
 //! ```
@@ -226,7 +227,7 @@ pub struct ConsoleWalletLifecycle {
     network: String,
     /// Wallet passphrase (revealed at spawn time, otherwise redacted).
     wallet_password: String,
-    /// Seed mnemonic (revealed at spawn time when written to seed.txt).
+    /// Seed mnemonic (revealed at spawn time when exported via env).
     seed_mnemonic: String,
     /// Bound port from the OS — held in `Self::spawn_argv` so callers can
     /// poll the same endpoint via [`super::grpc::connect_with_retry`].
@@ -300,19 +301,27 @@ impl ConsoleWalletLifecycle {
         Ok(port)
     }
 
-    /// Build the argv vector for `minotari_console_wallet` per `DESIGN.md
-    /// §Mode 1 step 1`. Pulled out so unit tests can snapshot it without
-    /// spawning a subprocess.
+    /// Build the argv vector for `minotari_console_wallet`. Pulled out so
+    /// unit tests can snapshot it without spawning a subprocess.
+    ///
+    /// Seed import happens through `--recovery` plus the
+    /// `MINOTARI_WALLET_SEED_WORDS` env var that [`Self::spawn`] sets. The
+    /// `--seed-words-file` flag this argv previously carried is an EXPORT
+    /// option on the v5.4 wallet (`init_wallet` writes the wallet's own
+    /// seed words to that path after startup, and never reads it). A fresh
+    /// non-interactive wallet given only `--seed-words-file` generates a
+    /// random wallet and overwrites the file with the new mnemonic, so
+    /// every spawned wallet held keys the operator never funded. Verified
+    /// live on v5.4.0-rc.1: the spawned wallet's GetAddress differed from
+    /// the seed's derived address and seed.txt came back rewritten.
     pub fn spawn_argv(network: &str, data_dir: &Path, port: u16) -> Vec<String> {
-        let seed_path = data_dir.join("seed.txt");
         let grpc_addr = format!("/ip4/127.0.0.1/tcp/{port}");
         vec![
             "--network".to_string(),
             network.to_string(),
             "--base-path".to_string(),
             data_dir.display().to_string(),
-            "--seed-words-file".to_string(),
-            seed_path.display().to_string(),
+            "--recovery".to_string(),
             "--non-interactive-mode".to_string(),
             "--grpc-address".to_string(),
             grpc_addr,
@@ -367,17 +376,18 @@ impl ConsoleWalletLifecycle {
     }
 
     /// Replace the held seed mnemonic. The next call to [`Self::spawn`]
-    /// writes this new mnemonic into the freshly-wiped data dir's
-    /// `seed.txt`. Used by the Mode 1 birthday-rewrite flow (AC-24): the
+    /// hands this new mnemonic to the wallet via the
+    /// MINOTARI_WALLET_SEED_WORDS env var alongside `--recovery`. Used by
+    /// the Mode 1 birthday-rewrite flow (AC-24): the
     /// caller decodes the existing mnemonic to a [`tari_common_types::seeds::cipher_seed::CipherSeed`],
     /// calls `change_birthday`, re-encodes, then hands the new mnemonic
     /// back via this method.
     ///
     /// Bails when called post-spawn: a swap there would silently desync
     /// the held mnemonic from the running wallet's loaded seed (the
-    /// wallet keeps using the previously-loaded value while `seed.txt`
-    /// regenerates only on next spawn). Call before [`Self::spawn`] or
-    /// after [`Self::teardown`].
+    /// wallet keeps using the previously-loaded value; the env var is
+    /// read only at spawn). Call before [`Self::spawn`] or after
+    /// [`Self::teardown`].
     pub fn replace_mnemonic(&mut self, mnemonic: String) -> anyhow::Result<()> {
         if self.is_spawned() {
             anyhow::bail!(
@@ -388,7 +398,7 @@ impl ConsoleWalletLifecycle {
         }
         log::debug!(
             target: LOG_TARGET,
-            "replacing held mnemonic (length={}); next spawn rewrites seed.txt",
+            "replacing held mnemonic (length={}); next spawn passes it via env",
             mnemonic.len(),
         );
         self.seed_mnemonic = mnemonic;
@@ -435,12 +445,10 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
             );
         }
 
-        // 1. Write the seed mnemonic to a file inside the harness data dir
-        //    (per `DESIGN.md §Secret handling`, the seed file lives only
-        //    inside the harness tempdir and is gone on drop).
-        let seed_path = self.data_dir.path().join("seed.txt");
-        std::fs::write(&seed_path, &self.seed_mnemonic)
-            .with_context(|| format!("writing seed.txt to {}", seed_path.display()))?;
+        // 1. The seed mnemonic rides in the MINOTARI_WALLET_SEED_WORDS env
+        //    var (declared on the wallet's `--seed-words` clap arg), which
+        //    keeps it off argv. Nothing is written to disk by the harness;
+        //    the wallet ingests the words through `--recovery`.
 
         // 2. Allocate a dynamic port for gRPC.
         let port = Self::allocate_port()?;
@@ -464,6 +472,7 @@ impl WalletLifecycle for ConsoleWalletLifecycle {
         let child = Command::new(&self.binary)
             .args(&argv)
             .args(["--password", &self.wallet_password])
+            .env("MINOTARI_WALLET_SEED_WORDS", &self.seed_mnemonic)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -750,18 +759,22 @@ mod tests {
     fn spawn_argv_matches_design() {
         let argv =
             ConsoleWalletLifecycle::spawn_argv("esmeralda", Path::new("/tmp/old_wallet"), 39201);
-        // Order matters per DESIGN.md §Mode 1 step 1: --network first, then
-        // --base-path, --seed-words-file, --non-interactive-mode, then
-        // --grpc-address. (`--password` is appended in spawn().)
+        // Order: --network first, then --base-path, --recovery,
+        // --non-interactive-mode, then --grpc-address. (`--password` is
+        // appended in spawn(); the seed words ride in the
+        // MINOTARI_WALLET_SEED_WORDS env var, never argv.)
         assert_eq!(argv[0], "--network");
         assert_eq!(argv[1], "esmeralda");
         assert_eq!(argv[2], "--base-path");
         assert_eq!(argv[3], "/tmp/old_wallet");
-        assert_eq!(argv[4], "--seed-words-file");
-        assert_eq!(argv[5], "/tmp/old_wallet/seed.txt");
-        assert_eq!(argv[6], "--non-interactive-mode");
-        assert_eq!(argv[7], "--grpc-address");
-        assert_eq!(argv[8], "/ip4/127.0.0.1/tcp/39201");
+        assert_eq!(argv[4], "--recovery");
+        assert_eq!(argv[5], "--non-interactive-mode");
+        assert_eq!(argv[6], "--grpc-address");
+        assert_eq!(argv[7], "/ip4/127.0.0.1/tcp/39201");
+        assert!(
+            !argv.iter().any(|a| a.contains("seed")),
+            "no seed material or seed-file flags may appear on argv: {argv:?}",
+        );
     }
 
     #[test]
@@ -774,8 +787,8 @@ mod tests {
     }
 
     /// Replacing the held mnemonic after `spawn` is a footgun: the
-    /// running wallet keeps using the previously-loaded seed while
-    /// `seed.txt` regenerates only on next spawn. The guard added
+    /// running wallet keeps using the previously-loaded seed while the
+    /// env var is read only on next spawn. The guard added
     /// alongside step 3k commit 3 refuses the swap. Verify it bails
     /// with the documented diagnostic.
     #[tokio::test]
