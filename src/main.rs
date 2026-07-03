@@ -174,9 +174,45 @@ async fn run_harness_async(
         // boots both lifecycles and waits for their HTTP readiness probes
         // per analysis/specs/MODE_3_REWORK_SPEC.md §2 step 4.
         if let ModeHandle::Mode3(pp) = &mut mode_handle {
-            pp.start_external_services()
+            if let Err(e) = pp
+                .start_external_services()
                 .await
-                .context("Mode 3 start_external_services")?;
+                .context("Mode 3 start_external_services")
+            {
+                // A mode whose external services cannot start must not
+                // destroy the other modes' results: record every cell of
+                // this mode as an error carrying the startup failure and
+                // move on to the summary + writer. Observed live: a PP
+                // daemon that exits during its readiness probe used to
+                // abort the whole run here, discarding the completed
+                // old_wallet and new_wallet matrices.
+                log::error!(
+                    target: LOG_TARGET,
+                    "mode {mode_role:?} external services failed to start; recording all \
+                     cells for this mode as errors and continuing: {e:#}",
+                );
+                for scenario_id in ScenarioId::all() {
+                    println!(
+                        "[{}] mode={} scenario={}  done   tx_count=0 elapsed=0.0s status=err",
+                        chrono::Local::now().format("%H:%M:%S"),
+                        mode_name(mode_role),
+                        scenario_id,
+                    );
+                    matrix.record(
+                        mode_role,
+                        scenario_id,
+                        CellResult::Error(anyhow::anyhow!(
+                            "mode external services failed to start: {e:#}"
+                        )),
+                        0,
+                        None,
+                        None,
+                        Some("mode skipped: external services failed to start".to_string()),
+                        0,
+                    );
+                }
+                continue;
+            }
         }
         let mut scenario_input = ScenarioInput {
             s5_seed_role_for_mode: Some(mode_role),
