@@ -271,9 +271,15 @@ impl std::fmt::Debug for RedactionDenylist {
     }
 }
 
-/// Push the whole-mnemonic value AND each word as separate substring rules
-/// under the same rule ID. Schema §6 R2 names both whole-string and per-word
-/// matching explicitly.
+/// Push the whole-mnemonic value AND each consecutive word pair as
+/// separate substring rules under the same rule ID. Schema §6 R2 names
+/// both whole-string and per-word matching; per-word is realised as
+/// word-PAIR matching because mnemonic words are ordinary English words
+/// by construction. Single-word substring rules tripped the writer on
+/// legitimate profile content (a 15 hour run's profile was refused
+/// because one seed word also occurred in unrelated serialized text),
+/// while any real leak of mnemonic material contains consecutive words
+/// from the phrase, which never occur as pairs in system strings.
 fn push_seed_substrings(rules: &mut Vec<RedactionRule>, id: &'static str, env_name: &str) {
     let raw = std::env::var(env_name).unwrap_or_default();
     if raw.is_empty() {
@@ -284,15 +290,13 @@ fn push_seed_substrings(rules: &mut Vec<RedactionRule>, id: &'static str, env_na
         value: raw.clone(),
         reason: "Captured seed phrase (whole-string match).",
     });
-    for word in raw.split_whitespace() {
-        if word.len() >= 3 {
-            // Skip 1-2 letter tokens — they would over-match the JSON.
-            rules.push(RedactionRule::Substring {
-                id,
-                value: word.to_string(),
-                reason: "Captured seed phrase (per-word match).",
-            });
-        }
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    for pair in words.windows(2) {
+        rules.push(RedactionRule::Substring {
+            id,
+            value: format!("{} {}", pair[0], pair[1]),
+            reason: "Captured seed phrase (per-word match).",
+        });
     }
 }
 
@@ -407,6 +411,63 @@ mod tests {
             !msg.contains(&mnemonic),
             "error must NEVER echo the matched secret: {msg}",
         );
+    }
+
+    #[test]
+    fn denylist_ignores_single_seed_word_in_unrelated_text() {
+        // Mnemonic words are ordinary English words; one of them occurring
+        // alone in legitimate profile text (env capture, notes, version
+        // strings) must not trip the writer. Observed live: a completed
+        // run's profile was refused because a single seed word appeared in
+        // unrelated serialized content.
+        let seeds = unique_seeds("SEED_SINGLE_WORD");
+        let mnemonic = gen_seed().expect("gen_seed");
+        let first_word = mnemonic
+            .split_whitespace()
+            .next()
+            .expect("mnemonic has words")
+            .to_string();
+        set_env(&seeds.old, &mnemonic);
+        set_env(&seeds.new, "");
+        set_env(&seeds.payment_processor, "");
+        set_env(&seeds.wallet_password, "");
+        let denylist = RedactionDenylist::init_from_env(&seeds);
+        let profile = FakeProfile {
+            scenario: "S0".to_string(),
+            notes: format!("unrelated text mentioning {first_word} exactly once"),
+        };
+        let result = denylist.check(&profile);
+        unset_env(&seeds.old);
+        unset_env(&seeds.new);
+        unset_env(&seeds.payment_processor);
+        unset_env(&seeds.wallet_password);
+        result.expect("a lone seed word in unrelated text must not trip the denylist");
+    }
+
+    #[test]
+    fn denylist_catches_consecutive_seed_word_pair() {
+        let seeds = unique_seeds("SEED_WORD_PAIR");
+        let mnemonic = gen_seed().expect("gen_seed");
+        let words: Vec<&str> = mnemonic.split_whitespace().collect();
+        let pair = format!("{} {}", words[5], words[6]);
+        set_env(&seeds.old, &mnemonic);
+        set_env(&seeds.new, "");
+        set_env(&seeds.payment_processor, "");
+        set_env(&seeds.wallet_password, "");
+        let denylist = RedactionDenylist::init_from_env(&seeds);
+        let profile = FakeProfile {
+            scenario: "S0".to_string(),
+            notes: format!("partial leak: {pair}"),
+        };
+        let err = denylist
+            .check(&profile)
+            .expect_err("two consecutive seed words must trip the denylist");
+        unset_env(&seeds.old);
+        unset_env(&seeds.new);
+        unset_env(&seeds.payment_processor);
+        unset_env(&seeds.wallet_password);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("R2"), "R2 should fire on a word pair: {msg}");
     }
 
     #[test]
