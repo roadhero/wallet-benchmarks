@@ -125,6 +125,22 @@ pub trait Mode: Send + Sync {
         fee_rate: u64,
     ) -> anyhow::Result<TxRecord>;
 
+    /// Block until the wallet can spend the change from the transaction it
+    /// just sent, then return. Called by S1's serial self-send loop between
+    /// consecutive sends.
+    ///
+    /// Default: no-op. Mode 1's console wallet tracks its own mempool and
+    /// spends unmined change directly (evidenced by its 574 chained S1
+    /// sends at ~90s each, faster than the block cadence), so it needs no
+    /// gate. Mode 2/3 route through the `minotari` CLI, whose input
+    /// selector treats any output with `confirmed_height IS NULL` as
+    /// unavailable (it refuses unmined change with "Funds are pending"),
+    /// so those modes must wait for the change to be mined and rescanned
+    /// before the next send can lock it. See `src/modes/minotari_wallet_ops.rs`.
+    async fn settle_after_send(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Scan the chain from the given birthday height. Called by B0
     /// (birthday=0, expects 0 outputs), S2 (birthday=0, expects 512),
     /// S3 (birthday=H_birth from S0), S6 (S2-shape after S5), S7
@@ -496,6 +512,12 @@ pub(crate) mod test_support {
         async fn wipe_and_reimport(&mut self, _birthday: u16) -> anyhow::Result<()> {
             self.record("wipe_and_reimport");
             self.check_fail("wipe_and_reimport")?;
+            Ok(())
+        }
+
+        async fn settle_after_send(&mut self) -> anyhow::Result<()> {
+            self.record("settle_after_send");
+            self.check_fail("settle_after_send")?;
             Ok(())
         }
 

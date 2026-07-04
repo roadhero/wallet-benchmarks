@@ -355,6 +355,12 @@ async fn classify_single_send_result(
                 let confirmed = wait_for_state_change(config, mode).await?;
                 if confirmed {
                     *success_count += 1;
+                    // Serial self-send gate: block until the change this send
+                    // produced is spendable by the next send. No-op for Mode 1
+                    // (console wallet spends unmined change); Mode 2/3 wait for
+                    // the change to be mined + confirmed. See
+                    // `Mode::settle_after_send`.
+                    mode.settle_after_send().await?;
                 } else {
                     *stall_count += 1;
                 }
@@ -511,6 +517,85 @@ mod tests {
             "wire-success contributes no details[]"
         );
         assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
+    }
+
+    #[tokio::test]
+    async fn s1_calls_settle_after_each_confirmed_send() {
+        let mut fake = FakeMode::new();
+        fake.send_single_sequence = vec![SendOutcome::Ok(success_record())];
+        // Two distinct readings so `wait_for_state_change` observes a change
+        // (baseline 10 → 11) and reports the send confirmed, which is the
+        // branch that invokes the settle gate. A single-value canned count
+        // would time out to a stall and never reach settle.
+        fake.canned_utxo_count = vec![10, 11];
+
+        let cfg = Config {
+            // Larger than the 2 s CONFIRMATION_POLL_INTERVAL so the state
+            // change is observed before the per-tx timeout fires.
+            per_tx_confirmation_timeout_ms: 10_000,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+
+        let outcome = run(&ctx, &mut fake, Some(1))
+            .await
+            .expect("S1 single-round runs");
+
+        assert_eq!(outcome.success_count, 1, "state change observed → success");
+        assert_eq!(outcome.stall_count, 0);
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            calls.contains(&"settle_after_send"),
+            "settle_after_send must run after a confirmed send: {calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s1_does_not_settle_after_a_failed_send() {
+        let mut fake = FakeMode::new();
+        // A construct-side Err never reaches the confirmed-success branch, so
+        // the settle gate must not run for it.
+        fake.send_single_sequence = vec![SendOutcome::Err("broadcast rejected".to_string())];
+        fake.canned_utxo_count = vec![10];
+
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 50,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+
+        let outcome = run(&ctx, &mut fake, Some(1))
+            .await
+            .expect("S1 single-round runs");
+
+        assert_eq!(outcome.success_count, 0);
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"settle_after_send"),
+            "settle_after_send must not run after a failed send: {calls:?}",
+        );
     }
 
     #[tokio::test]

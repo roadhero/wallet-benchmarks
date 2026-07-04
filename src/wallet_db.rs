@@ -34,6 +34,16 @@ pub trait WalletDb: Send + Sync {
     /// Spendable UTXO count — Q2 per the spec. Returns `Ok(0)` when
     /// the DB file does not yet exist.
     fn count_spendable_utxos(&self, db_path: &Path) -> Result<u64>;
+
+    /// Count of outputs that are actually spendable *now* by the `minotari`
+    /// input selector: UNSPENT, not locked, and mined (`confirmed_height`
+    /// set). This differs from [`Self::count_spendable_utxos`], which
+    /// counts every UNSPENT output including a locally-created but not-yet-
+    /// mined change output (stored as UNSPENT with `confirmed_height IS
+    /// NULL`). S1's settle-between-sends gate uses this so it does not
+    /// mistake pending change for spendable funds. Returns `Ok(0)` when the
+    /// DB file does not yet exist.
+    fn count_confirmed_spendable_utxos(&self, db_path: &Path) -> Result<u64>;
 }
 
 /// Convenience alias for an injectable [`WalletDb`] handle. `Arc` lets the
@@ -92,6 +102,38 @@ impl WalletDb for LiveWalletDb {
         #[allow(clippy::cast_sign_loss)]
         Ok(n.max(0) as u64)
     }
+
+    fn count_confirmed_spendable_utxos(&self, db_path: &Path) -> Result<u64> {
+        if !db_path.exists() {
+            log::debug!(
+                target: LOG_TARGET,
+                "count_confirmed_spendable_utxos: DB file missing at {}; returning 0",
+                db_path.display(),
+            );
+            return Ok(0);
+        }
+        let conn = open_read_only(db_path)?;
+        // `confirmed_height IS NOT NULL` is the mined predicate the input
+        // selector's "available" bucket uses (a NULL confirmed_height is the
+        // unconfirmed/pending bucket). UNSPENT (not LOCKED, not SPENT) plus
+        // mined equals "lockable by the next send".
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outputs \
+                 WHERE deleted_at IS NULL AND is_burn = 0 AND status = ?1 \
+                 AND confirmed_height IS NOT NULL",
+                rusqlite::params!["UNSPENT"],
+                |row| row.get(0),
+            )
+            .with_context(|| {
+                format!(
+                    "count_confirmed_spendable_utxos query on {}",
+                    db_path.display()
+                )
+            })?;
+        #[allow(clippy::cast_sign_loss)]
+        Ok(n.max(0) as u64)
+    }
 }
 
 fn open_read_only(db_path: &Path) -> Result<Connection> {
@@ -106,6 +148,7 @@ fn open_read_only(db_path: &Path) -> Result<Connection> {
 pub(crate) struct FakeWalletDb {
     pub canned_count_outputs: std::result::Result<u64, String>,
     pub canned_count_spendable: std::result::Result<u64, String>,
+    pub canned_count_confirmed_spendable: std::result::Result<u64, String>,
 }
 
 #[cfg(test)]
@@ -114,6 +157,9 @@ impl FakeWalletDb {
         Self {
             canned_count_outputs: Ok(count_outputs),
             canned_count_spendable: Ok(count_spendable),
+            // Default the confirmed-spendable count to the spendable count;
+            // tests that exercise the settle gate override it explicitly.
+            canned_count_confirmed_spendable: Ok(count_spendable),
         }
     }
 }
@@ -130,6 +176,12 @@ impl WalletDb for FakeWalletDb {
         match &self.canned_count_spendable {
             Ok(n) => Ok(*n),
             Err(msg) => anyhow::bail!("FakeWalletDb::count_spendable_utxos: {msg}"),
+        }
+    }
+    fn count_confirmed_spendable_utxos(&self, _db_path: &Path) -> Result<u64> {
+        match &self.canned_count_confirmed_spendable {
+            Ok(n) => Ok(*n),
+            Err(msg) => anyhow::bail!("FakeWalletDb::count_confirmed_spendable_utxos: {msg}"),
         }
     }
 }
@@ -159,7 +211,8 @@ mod tests {
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             status TEXT NOT NULL DEFAULT 'UNSPENT',
             deleted_at TIMESTAMP,
-            is_burn INTEGER NOT NULL DEFAULT 0
+            is_burn INTEGER NOT NULL DEFAULT 0,
+            confirmed_height INTEGER
         );
     "#;
 
@@ -183,6 +236,18 @@ mod tests {
             rusqlite::params![status, deleted_at, is_burn],
         )
         .expect("insert row");
+    }
+
+    /// Insert one row with an explicit `confirmed_height` (`None` = the
+    /// unconfirmed/pending bucket, a locally-created but not-yet-mined
+    /// output; `Some(h)` = mined at height `h`).
+    fn insert_row_with_height(conn: &Connection, status: &str, confirmed_height: Option<i64>) {
+        conn.execute(
+            "INSERT INTO outputs (status, deleted_at, is_burn, confirmed_height) \
+             VALUES (?1, NULL, 0, ?2)",
+            rusqlite::params![status, confirmed_height],
+        )
+        .expect("insert row with height");
     }
 
     #[test]
@@ -219,6 +284,41 @@ mod tests {
         insert_row(&conn, "SPENT", None, 0);
         let db = LiveWalletDb;
         assert_eq!(db.count_spendable_utxos(&db_path).expect("count"), 1);
+    }
+
+    #[test]
+    fn count_confirmed_spendable_excludes_unmined_and_non_unspent() {
+        let (_dir, db_path) = fresh_db();
+        let conn = Connection::open(&db_path).expect("re-open");
+        // Mined + UNSPENT: spendable now.
+        insert_row_with_height(&conn, "UNSPENT", Some(725_000));
+        // UNSPENT but not yet mined (pending change): NOT spendable, though
+        // count_spendable_utxos (status-only) would wrongly include it.
+        insert_row_with_height(&conn, "UNSPENT", None);
+        // Mined but LOCKED / SPENT: not available to the next send.
+        insert_row_with_height(&conn, "LOCKED", Some(725_000));
+        insert_row_with_height(&conn, "SPENT", Some(725_000));
+        let db = LiveWalletDb;
+        assert_eq!(
+            db.count_spendable_utxos(&db_path).expect("count"),
+            2,
+            "status-only count includes the unmined pending change",
+        );
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            1,
+            "confirmed-spendable count excludes the unmined pending change",
+        );
+    }
+
+    #[test]
+    fn count_confirmed_spendable_empty_table_returns_zero() {
+        let (_dir, db_path) = fresh_db();
+        let db = LiveWalletDb;
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            0,
+        );
     }
 
     #[test]

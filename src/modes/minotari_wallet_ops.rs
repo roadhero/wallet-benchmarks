@@ -560,6 +560,115 @@ pub(super) async fn wait_for_balance_positive(
     }
 }
 
+/// Poll cadence for [`wait_for_confirmed_spendable`]. Matches
+/// [`wait_for_balance_positive`]: 5 s is the rate at which the wallet's scan
+/// commits confirmations to the sqlite file, so a finer cadence only spawns
+/// more scan subprocesses without surfacing the state any earlier.
+const SPENDABLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wall-clock budget for the S1 settle gate. The change from a send becomes
+/// spendable once `minotari`'s confirmation_window (default 3) blocks are
+/// mined above the change's own block; at Esmeralda's observed ~45 s cadence
+/// that is roughly 3 minutes. 10 minutes absorbs block-time variance without
+/// false-failing the common case.
+const DEFAULT_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Re-scan and poll the wallet DB until at least one confirmed, spendable
+/// UTXO exists (the change from the just-sent transaction has been mined and
+/// buried by confirmation_window blocks), or `deadline` elapses.
+///
+/// S1's serial self-send loop calls this between consecutive Mode 2/3 sends.
+/// `minotari create-unsigned-transaction`'s input selector (`fetch_unspent_outputs`
+/// in `minotari-cli` `db/outputs.rs`) only picks outputs whose
+/// `confirmed_height` is set, so without this gate the next send hits
+/// "Funds are pending. Available: 0 µT" while the change is still unconfirmed.
+/// Each poll runs `minotari scan`, which advances the wallet past any new tip
+/// blocks and runs the confirmation pass (`block_processor.rs` `process_confirmations`),
+/// setting `confirmed_height` on now-buried outputs, then reads
+/// [`crate::wallet_db::WalletDb::count_confirmed_spendable_utxos`].
+///
+/// On timeout this logs a warning and returns `Ok(())` rather than bailing:
+/// the next send then surfaces the still-pending state as an honest per-tx
+/// failure in the result profile, which is more faithful than aborting the
+/// whole scenario. Uses the same `tokio::select!` deadline idiom as
+/// [`wait_for_balance_positive`]; the AC-32 carve-out
+/// (`tests/c_no_retry_backoff_throttle.rs`) excises the select body.
+pub(super) async fn wait_for_confirmed_spendable(
+    cfg: &Config,
+    data_dir: &Path,
+    password: &str,
+    wallet_db: &dyn crate::wallet_db::WalletDb,
+    deadline: Option<std::time::Duration>,
+) -> anyhow::Result<()> {
+    let deadline = deadline.unwrap_or(DEFAULT_SETTLE_DEADLINE);
+    let started = std::time::Instant::now();
+    let deadline_instant = tokio::time::Instant::now() + deadline;
+    let db_path = data_dir.join("wallet.sqlite3");
+    let mut polls: u32 = 0;
+    loop {
+        // Advance the wallet past any newly mined blocks (this also runs the
+        // confirmation pass), then check whether the change is spendable.
+        // Scan failures during the wait are transient (mid-write DB, base
+        // node blip); log and keep polling. The deadline below bounds it.
+        match run_scan_subprocess(cfg, data_dir, password, None).await {
+            Ok(_) => match wallet_db.count_confirmed_spendable_utxos(&db_path) {
+                Ok(n) if n > 0 => {
+                    polls = polls.saturating_add(1);
+                    log::info!(
+                        target: LOG_TARGET,
+                        "wait_for_confirmed_spendable: {n} confirmed UTXO(s) spendable after \
+                         {polls} polls ({:?} elapsed)",
+                        started.elapsed(),
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    polls = polls.saturating_add(1);
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "wait_for_confirmed_spendable: change not yet confirmed after {polls} \
+                         polls ({:?} elapsed); polling again in {SPENDABLE_POLL_INTERVAL:?}",
+                        started.elapsed(),
+                    );
+                }
+                Err(e) => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "wait_for_confirmed_spendable: count query transient error: {e:#}; \
+                         polling again in {SPENDABLE_POLL_INTERVAL:?}",
+                    );
+                }
+            },
+            Err(e) => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "wait_for_confirmed_spendable: scan transient error: {e:#}; polling again \
+                     in {SPENDABLE_POLL_INTERVAL:?}",
+                );
+            }
+        }
+        // Deadline-arm idiom: the absolute deadline races the poll-cadence
+        // bound. AC-32 carve-out applies; both arm bodies are excised
+        // before the static grep.
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline_instant) => {
+                log::warn!(
+                    target: LOG_TARGET,
+                    "wait_for_confirmed_spendable: no confirmed spendable UTXO after {:?} \
+                     ({polls} polls). The next send will record the pending state as a \
+                     per-tx failure.",
+                    deadline,
+                );
+                return Ok(());
+            }
+            _ = tokio::time::sleep(SPENDABLE_POLL_INTERVAL) => {
+                // Poll cadence elapsed; loop back and re-scan + re-check.
+            }
+        }
+    }
+}
+
 /// Parse the microTari u64 from `Balance`'s stdout.
 ///
 /// The stdout format is `Balance at height {h}({d}): {total}` where `{total}`

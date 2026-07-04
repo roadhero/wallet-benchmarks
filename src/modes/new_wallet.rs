@@ -43,7 +43,7 @@ use crate::{
         minotari_subprocess::{create_sign_and_submit, MinotariSubprocessDispatcher, SeedRole},
         minotari_wallet_ops::{
             rewrite_birthday, run_balance_subprocess, run_scan_subprocess,
-            wait_for_balance_positive, wipe_and_reimport_via_create,
+            wait_for_balance_positive, wait_for_confirmed_spendable, wipe_and_reimport_via_create,
         },
         Mode, S4Dispatcher, ScanOutcome, TxRecord,
     },
@@ -171,6 +171,27 @@ impl Mode for NewWallet {
         )
         .await
         .context("Mode 2 create_sign_and_submit (batch 1-to-many)")
+    }
+
+    async fn settle_after_send(&mut self) -> anyhow::Result<()> {
+        // Between consecutive S1 self-sends the change from the prior send is
+        // stored UNSPENT but with `confirmed_height IS NULL`, which the
+        // `minotari` input selector rejects ("Funds are pending"). Re-scan
+        // and wait until the change is mined + confirmed before the next
+        // send tries to lock it. See `wait_for_confirmed_spendable`.
+        let password = self
+            .seeds
+            .wallet_password()
+            .context("reading wallet password for Mode 2 settle_after_send")?;
+        wait_for_confirmed_spendable(
+            &self.cfg,
+            self.data_dir.path(),
+            password.reveal(),
+            self.wallet_db.as_ref(),
+            None,
+        )
+        .await
+        .context("Mode 2 settle_after_send")
     }
 
     async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
@@ -470,6 +491,7 @@ mod tests {
         let fake = Arc::new(crate::wallet_db::FakeWalletDb {
             canned_count_outputs: Ok(0),
             canned_count_spendable: Err("simulated DB failure".to_string()),
+            canned_count_confirmed_spendable: Ok(0),
         });
         let mut m = NewWallet::new_with_wallet_db(cfg, seeds, data_dir, fake);
         let err = m
