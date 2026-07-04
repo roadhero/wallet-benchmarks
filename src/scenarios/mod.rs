@@ -433,6 +433,77 @@ pub async fn run_scenario(
     }
 }
 
+/// CipherSeed birthday epoch: 2022-01-01 00:00:00 UTC in Unix seconds.
+/// `change_birthday` encodes `u16` days since this instant (per
+/// `analysis/ANALYSIS.md` Birthday encoding and the live wallet log
+/// `birthday 1643 at epoch time 1782950400`, since
+/// `1782950400 - 1643 * 86400 == 1640995200`).
+const BIRTHDAY_EPOCH_UNIX_SECS: i64 = 1_640_995_200;
+/// Seconds per day for the birthday day-count conversion.
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The CipherSeed birthday (`u16` days-since-2022-01-01) for a wallet whose
+/// funding transaction confirmed at `funding_unix_secs`.
+///
+/// S3/S7's `wipe_and_reimport(h_birth)` + `scan_from_birthday(h_birth)` need
+/// S0's funding height expressed in the `u16` birthday format (`DESIGN.md §6`,
+/// AC-16/AC-23). The birthday is fundamentally a date, not a block height:
+/// S0's tx confirms within minutes of the run loop reaching
+/// [`update_scenario_input`], so the wall-clock time at that point is S0's
+/// funding time to day precision. One day is subtracted as a safety margin so
+/// the encoded birthday is at or before the funding output even if the
+/// funding tx and this computation straddle a UTC midnight; the resulting
+/// birthday-scoped rescan still covers materially fewer blocks than S2's
+/// from-genesis scan (genesis is day 0; a mid-2026 funding is day ~1640).
+///
+/// Clamped to `[0, u16::MAX]`: pre-epoch inputs floor at 0, and the
+/// `u16::MAX` ceiling is ~2101, well beyond any realistic run date.
+pub(crate) fn s0_funding_birthday(funding_unix_secs: i64) -> u16 {
+    let days = (funding_unix_secs - BIRTHDAY_EPOCH_UNIX_SECS).max(0) / SECONDS_PER_DAY;
+    let clamped = days.clamp(0, i64::from(u16::MAX)) as u16;
+    clamped.saturating_sub(1)
+}
+
+/// Thread the just-completed scenario's results into `ScenarioInput` so
+/// downstream scenarios in the same mode's loop pick up derived values
+/// (S0's funding birthday to S3/S7; S1's `success_count` to S2/S3; S5's
+/// `success_count` to S6/S7).
+///
+/// `now_unix_secs` is injected (rather than read from the wall clock inside)
+/// so the S0 birthday derivation is deterministic under test, matching the
+/// clock-injection pattern used by [`crate::wallet_lifecycle`]'s ready loop.
+pub fn update_scenario_input(
+    outcome: &ScenarioOutcome,
+    input: &mut ScenarioInput,
+    now_unix_secs: i64,
+) {
+    match outcome {
+        ScenarioOutcome::S0(_s0) => {
+            // S0's funding tx confirms within minutes of this arm running.
+            // Derive its birthday from the current time and feed both the
+            // S3 (`h_birth_s3`) and S7 (`s7_h_birth`) birthday-rescan slots.
+            // Previously a no-op: the fields stayed `None` and S3/S7 bailed
+            // in the dispatch above with "requires ScenarioInput::h_birth_s3".
+            let birthday = s0_funding_birthday(now_unix_secs);
+            input.h_birth_s3 = Some(birthday);
+            input.s7_h_birth = Some(birthday);
+        }
+        ScenarioOutcome::S1(s1) => {
+            // The chain's final UTXO count after S1's 7 rounds is the
+            // expected scan target for S2 / S3.
+            input.expected_outputs_s2 = Some(s1.success_count);
+        }
+        ScenarioOutcome::S5(s5) => {
+            // After S5's send volume, the wallet's net output set is S1's
+            // net plus S5's successful sends.
+            let s5_successes = s5.success_count;
+            input.s6_expected_outputs = input.expected_outputs_s2.map(|p| p + s5_successes);
+            input.s7_expected_outputs = input.s6_expected_outputs;
+        }
+        _ => {}
+    }
+}
+
 /// Cross-test fixtures for the scenario layer. Lets B0/S2/S3/S6/S7
 /// tests (which don't currently maintain their own ctx fixture
 /// machinery) build a minimal-no-sampler `ScenarioCtx` in two lines.
@@ -502,6 +573,79 @@ mod tests {
     use super::*;
     use crate::config::Seeds;
     use crate::gen_seed;
+    use crate::modes::TxRecord;
+
+    /// Build an `S0Outcome` fixture. `update_scenario_input`'s S0 arm
+    /// ignores the contents (it derives the birthday from the injected
+    /// timestamp), so field values only need to be well-formed.
+    fn sample_s0_outcome() -> S0Outcome {
+        S0Outcome {
+            pre_balance: 2_000_000_000,
+            post_balance: 1_999_999_800,
+            balance_delta: -200,
+            pre_utxo_count: 1,
+            post_utxo_count: 2,
+            utxo_delta: 1,
+            t_construct_ms: Some(50),
+            t_broadcast_ms: 200,
+            t_confirm_ms: Some(30_000),
+            tx_record: TxRecord {
+                txid: "deadbeef".to_string(),
+                t_total_ms: 250,
+                t_broadcast_ms: 200,
+                t_confirm_ms: Some(30_000),
+                status: "success".to_string(),
+                error_string: None,
+                fee_microtari: 200,
+            },
+            peak_rss_bytes: None,
+            peak_cpu_pct: None,
+        }
+    }
+
+    #[test]
+    fn s0_funding_birthday_converts_days_since_2022_with_margin() {
+        // 1782950400 == epoch + 1643 days (the live wallet-log value). With
+        // the 1-day safety margin the encoded birthday is 1642.
+        assert_eq!(s0_funding_birthday(1_782_950_400), 1642);
+        // Exactly 100 days after the epoch -> 100 days, minus margin -> 99.
+        assert_eq!(s0_funding_birthday(1_640_995_200 + 100 * 86_400), 99);
+    }
+
+    #[test]
+    fn s0_funding_birthday_floors_at_zero_for_epoch_and_earlier() {
+        // At the epoch: 0 days, saturating_sub(1) stays 0.
+        assert_eq!(s0_funding_birthday(1_640_995_200), 0);
+        // Before the epoch: clamped to 0, not a huge wraparound.
+        assert_eq!(s0_funding_birthday(1_640_995_200 - 5), 0);
+        assert_eq!(s0_funding_birthday(0), 0);
+    }
+
+    #[test]
+    fn s0_funding_birthday_clamps_near_u16_max() {
+        // Far-future timestamp must saturate near u16::MAX, never overflow
+        // or wrap. The day-count clamps to u16::MAX, then the 1-day margin
+        // leaves u16::MAX - 1.
+        assert_eq!(s0_funding_birthday(i64::MAX), u16::MAX - 1);
+    }
+
+    #[test]
+    fn update_scenario_input_s0_populates_both_birthday_slots() {
+        // Regression for the S3/S7 "requires ScenarioInput::h_birth_s3"
+        // failure: the S0 arm must fill both birthday slots so S3 and S7
+        // dispatch instead of bailing.
+        let mut input = ScenarioInput::default();
+        assert_eq!(input.h_birth_s3, None);
+        assert_eq!(input.s7_h_birth, None);
+
+        let outcome = ScenarioOutcome::S0(sample_s0_outcome());
+        update_scenario_input(&outcome, &mut input, 1_782_950_400);
+
+        assert_eq!(input.h_birth_s3, Some(1642), "S3 birthday slot populated");
+        assert_eq!(input.s7_h_birth, Some(1642), "S7 birthday slot populated");
+        // Both slots carry the same S0 funding birthday (AC-16 / AC-23).
+        assert_eq!(input.h_birth_s3, input.s7_h_birth);
+    }
 
     #[test]
     fn scenario_id_all_is_canonical_order() {

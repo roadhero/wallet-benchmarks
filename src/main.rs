@@ -291,7 +291,11 @@ async fn run_harness_async(
 
             let (cell_result, fees) = match outcome {
                 Ok(o) => {
-                    update_scenario_input(&o, &mut scenario_input);
+                    scenarios::update_scenario_input(
+                        &o,
+                        &mut scenario_input,
+                        chrono::Utc::now().timestamp(),
+                    );
                     let fees = compute_fees_paid(&o, &config);
                     (CellResult::Outcome(Box::new(o)), fees)
                 }
@@ -620,38 +624,5 @@ fn compute_fees_paid(outcome: &ScenarioOutcome, config: &Config) -> u64 {
                 .sum();
             ind + bat
         }
-    }
-}
-
-/// Thread the just-completed scenario's results into `ScenarioInput` so
-/// downstream scenarios in the same mode's loop pick up derived values
-/// (S0's `h_birth` → S3/S7; S1's `outputs_found` → S2; S5's
-/// `outputs_found` → S6/S7).
-fn update_scenario_input(outcome: &ScenarioOutcome, input: &mut ScenarioInput) {
-    match outcome {
-        ScenarioOutcome::S0(_s0) => {
-            // S0 records a tx_record; the harness doesn't yet derive an
-            // h_birth value from S0 because the pinned client doesn't
-            // expose a "block height of last accepted tx" lookup.
-            // h_birth_s3 / s7_h_birth stay at the operator-supplied (or
-            // default-zero) value for now. Tracked in
-            // analysis/PR_BODY_PLAN.md §Phase 4 h_birth derivation.
-        }
-        ScenarioOutcome::S1(s1) => {
-            // The chain's final UTXO count after S1's 7 rounds is the
-            // expected scan target for S2 / S3. Derive from the success
-            // count (the schema reads expected_outputs as "scan should
-            // rediscover this many").
-            input.expected_outputs_s2 = Some(s1.success_count);
-        }
-        ScenarioOutcome::S5(s5) => {
-            // After S5's send-volume, the wallet's net output set is S1's
-            // net + S5's per-arm tx_records (only successful sends mature
-            // into spendable UTXOs).
-            let s5_successes = s5.success_count;
-            input.s6_expected_outputs = input.expected_outputs_s2.map(|p| p + s5_successes);
-            input.s7_expected_outputs = input.s6_expected_outputs;
-        }
-        _ => {}
     }
 }
