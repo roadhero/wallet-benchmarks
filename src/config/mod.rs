@@ -34,12 +34,22 @@ mod defaults {
     pub(super) const NETWORK: &str = "esmeralda";
     pub(super) const PER_TX_CONFIRMATION_TIMEOUT_MS: u64 = 1_800_000;
     pub(super) const SAMPLER_INTERVAL_MS: u64 = 1_000;
+    /// Conservative weight (in grams) of a single-recipient S1 send
+    /// (1 input, 2 outputs incl. change, 1 kernel) with BulletProofPlus
+    /// range proofs. The tx fee is `fee_rate × weight`. Measured live on
+    /// esmeralda v5.4.0-rc.1: a single send at fee_rate=1 was charged
+    /// 700 µT, so the effective weight is ~700 grams (BulletProofPlus
+    /// range proofs dominate; an earlier assumption of ~35 grams was off
+    /// by ~20x). Used by [`Config::validate`] to reject an S1 send amount
+    /// that a Mode 2/3 signer would refuse for `fee > amount`.
+    pub(super) const S1_SINGLE_SEND_WEIGHT_GRAMS: u64 = 700;
     /// Default per-tx amount for S1 volume sends, in microTari. Must
-    /// exceed `fee_rate × kernel_weight` (≈ 175 µT at default fee_rate=5,
-    /// kernel weight 35) so the resulting change UTXOs are net-positive
-    /// and spendable. 1000 µT = 0.001 XTM provides ~825 µT net per
-    /// resulting UTXO at default fee_rate.
-    pub(super) const S1_AMOUNT_PER_TX_MICROTARI: u64 = 1_000;
+    /// exceed the single-send fee `fee_rate × S1_SINGLE_SEND_WEIGHT_GRAMS`
+    /// (≈ 3500 µT at the default fee_rate=5) so each self-send's output
+    /// value exceeds its fee. Mode 2/3's offline signer rejects a tx
+    /// whose fee is greater than the amount sent. 4000 µT clears the
+    /// default-fee_rate floor with margin.
+    pub(super) const S1_AMOUNT_PER_TX_MICROTARI: u64 = 4_000;
 
     pub(super) const SEED_ENV_OLD: &str = "HARNESS_SEED_OLD";
     pub(super) const SEED_ENV_NEW: &str = "HARNESS_SEED_NEW";
@@ -349,6 +359,31 @@ impl Config {
     /// table is passed through so the account-key validation can fall
     /// back to seed derivation when the env-var override is not set.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // S1's self-sends must send more than they pay in fees, or the
+        // Mode 2/3 offline signer rejects every one of them with
+        // "Fee (F µT) is greater than the amount sent (A µT)" and S1
+        // records 0 successes. (Mode 1's console-wallet gRPC Transfer does
+        // not enforce this, which is why the failure was Mode-2-only.)
+        // Fail loud at pre-flight rather than let the whole S1 column go
+        // silently to zero. Observed live: fee_rate=1 amount=200 -> fee
+        // 700 > 200 on every doubling-round send.
+        let single_send_fee = self
+            .fee_rate
+            .saturating_mul(defaults::S1_SINGLE_SEND_WEIGHT_GRAMS);
+        if self.s1_amount_per_tx_microtari <= single_send_fee {
+            anyhow::bail!(
+                "s1_amount_per_tx_microtari ({} µT) does not exceed the estimated \
+                 single-send fee ({} µT = fee_rate {} × ~{} grams). Mode 2/3's offline \
+                 signer rejects a transaction whose fee is greater than the amount sent, \
+                 so S1 would record 0 successful sends. Raise s1_amount_per_tx_microtari \
+                 above {} µT (or lower fee_rate).",
+                self.s1_amount_per_tx_microtari,
+                single_send_fee,
+                self.fee_rate,
+                defaults::S1_SINGLE_SEND_WEIGHT_GRAMS,
+                single_send_fee,
+            );
+        }
         if let Some(m) = self.mode_3.as_ref() {
             m.validate(&self.seeds)
                 .context("validating mode_3 config")?;
@@ -623,7 +658,7 @@ mod tests {
         );
         assert_eq!(cfg.per_tx_confirmation_timeout_ms, 1_800_000);
         assert_eq!(cfg.sampler_interval_ms, 1_000);
-        assert_eq!(cfg.s1_amount_per_tx_microtari, 1_000);
+        assert_eq!(cfg.s1_amount_per_tx_microtari, 4_000);
         assert_eq!(cfg.seeds.old, "HARNESS_SEED_OLD");
         assert_eq!(cfg.seeds.new, "HARNESS_SEED_NEW");
         assert_eq!(cfg.seeds.payment_processor, "HARNESS_SEED_PP");
@@ -637,6 +672,61 @@ mod tests {
     fn deserialize_empty_table_yields_defaults() {
         let cfg: Config = toml::from_str("").expect("empty TOML loads with all defaults");
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn validate_accepts_default_s1_amount() {
+        // The default (fee_rate=5, s1_amount=4000) must clear the fee floor
+        // (5 × 700 = 3500) so a fresh operator running with defaults passes.
+        Config::default()
+            .validate()
+            .expect("default config must satisfy the S1 fee-floor check");
+    }
+
+    #[test]
+    fn validate_rejects_s1_amount_at_or_below_single_send_fee() {
+        // SWvheerden's minimal config reproduced: fee_rate=1, amount=200.
+        // Single-send fee = 1 × 700 = 700 µT > 200 µT amount, so Mode 2/3
+        // would reject every send. Must fail loud at pre-flight.
+        let cfg = Config {
+            fee_rate: 1,
+            s1_amount_per_tx_microtari: 200,
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("amount below the single-send fee must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s1_amount_per_tx_microtari"),
+            "error names the offending field: {msg}",
+        );
+        assert!(
+            msg.contains("700"),
+            "error reports the estimated fee floor: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_boundary_amount_equal_to_fee_is_rejected() {
+        // amount == fee is still not "fee < amount"; must be strictly above.
+        let at_fee = Config {
+            fee_rate: 1,
+            s1_amount_per_tx_microtari: 700,
+            ..Config::default()
+        };
+        assert!(
+            at_fee.validate().is_err(),
+            "amount exactly equal to the fee must be rejected",
+        );
+        let above_fee = Config {
+            fee_rate: 1,
+            s1_amount_per_tx_microtari: 701,
+            ..Config::default()
+        };
+        above_fee
+            .validate()
+            .expect("amount one microTari above the fee floor must pass");
     }
 
     #[test]
