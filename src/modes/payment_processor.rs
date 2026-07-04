@@ -219,14 +219,14 @@ impl PaymentProcessor {
     pub async fn start_external_services(&mut self) -> anyhow::Result<()> {
         log::info!(
             target: LOG_TARGET,
-            "starting Mode 3 external services (PR + migrations + PP)",
+            "starting Mode 3 external services (PR + PP)",
         );
         self.pr_lifecycle
             .spawn()
             .await
             .context("spawning PR daemon")?;
-        crate::pp_migrations::apply_migrations(self.pp_lifecycle.data_dir_path())
-            .context("applying PP migrations")?;
+        crate::pp_db::create_empty_db(self.pp_lifecycle.data_dir_path())
+            .context("creating empty PP database")?;
         self.pp_lifecycle
             .spawn()
             .await
