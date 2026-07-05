@@ -32,8 +32,17 @@
 //!
 //! **No retry, no backoff, no throttle.** Single submit; single confirmation
 //! wait. If the wallet doesn't see the tx within `per_tx_confirmation_timeout_ms`
-//! the outcome's `t_confirm_ms` carries `None` and `status = "timeout"` —
-//! the cell is recorded raw per AC-30/31/32/33.
+//! the outcome's `t_confirm_ms` carries `None` and the cell is recorded raw
+//! per AC-30/31/32/33. Note the CELL envelope status stays `"success"`
+//! (scenario ran to completion and produced its measurement, same as
+//! B0/S2/S3/S6/S7 per `result_profile::outcome_to_envelope_json`); the
+//! confirmation run-out is carried by `t_confirm_ms: null`, NOT by a
+//! `"timeout"` status. An earlier revision of this doc claimed a
+//! `"timeout"` cell status; that string is `s4_status`'s, and this comment
+//! previously misattributed it. S1/S4 differ by design: they aggregate
+//! MANY sends, so their envelopes derive status from per-send
+//! terminal-state counters (`stall_count` etc.) that a single-send warmup
+//! does not have.
 
 use std::time::Duration;
 

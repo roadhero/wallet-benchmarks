@@ -184,9 +184,10 @@ Copy `harness.toml.example` to `harness.toml` and edit per host. Every field is 
 | `s4_t_budget_ms` | `900_000` (15 min) | S4 wall-clock budget. |
 | `s5_m`, `s5_k` | `100`, `10` | S5 batch dimensions. |
 | `fee_rate` | `5` µT per gram | Bounty parameter table. |
-| `per_tx_confirmation_timeout_ms` | `1_800_000` (30 min) | Sets the upper bound on S0 / S3 confirmation polling. |
+| `per_tx_confirmation_timeout_ms` | `1_800_000` (30 min) | Upper bound on the per-send confirmation poll (S0's single wait; S1's per-send wait). No longer bounds console-wallet boot; see `wallet_ready_deadline_ms`. |
+| `wallet_ready_deadline_ms` | `1_800_000` (30 min) | How long Mode 1's `wait_ready` waits for a spawned `minotari_console_wallet` to bind gRPC. A `--recovery` wallet binds only after its recovery scan; birthday-0 recovery walks the whole chain (measured ~490-2,300 blocks/s at height ~731k, i.e. 5-25 min, and growing with the chain). Raise this before raising anything else when B0/S2/S6 report "failed to connect to wallet gRPC". |
 | `sampler_interval_ms` | `1_000` | Resource sampler cadence. |
-| `s1_amount_per_tx_microtari` | `1000` µT | The per-tx amount S1 sends. Must exceed `fee_rate × kernel_weight` (~175 µT) for change UTXOs to be net-positive. |
+| `s1_amount_per_tx_microtari` | `4000` µT | The per-tx amount S1 sends. Must exceed the full single-send fee (`fee_rate × ~700 grams`; config validation rejects amounts at or below it) or Mode 2/3 signing refuses the tx. |
 
 ### §3.2. `[seeds]` table
 
@@ -509,6 +510,14 @@ The `CONSOLE_WALLET_PASSWORD` env passed to PP is the fixture string `harness_pp
 **Cause**: Upstream `minotari-cli` does not expose `--account-name` on these subcommands. The created or served wallet's account name is hardcoded to `"default"` per `minotari-cli@52a7287a/minotari/src/utils/init_wallet.rs:121`.
 
 **Resolution**: The harness's `ACCOUNT_NAME` constants in `pr_lifecycle.rs:57` and `pp_lifecycle.rs:60` are both `"default"`. The operator-facing env-var key `BENCH` (in `ACCOUNTS__BENCH__NAME=default`) is just the config-map identifier; PP's HTTP calls to the PR daemon hit `/accounts/default/...` and resolve correctly.
+
+### §7.10. Cell status `success` with `t_confirm_ms: null` or `stall_count > 0`
+
+**Symptom**: A result-profile cell reports `"status": "success"` while its payload carries `t_confirm_ms: null` (S0) or its errors block carries `stall_count > 0` (S1), typically on Mode 3.
+
+**Cause (by design, not a bug)**: The cell envelope status means "the scenario ran to completion and produced its measurement", the same convention as B0/S2/S3/S6/S7 (`result_profile::outcome_to_envelope_json`). Confirmation truth lives one level down and its shape differs by scenario: S0 is a single-send warmup, so its confirmation run-out is `t_confirm_ms: null` in the payload; S1/S4 aggregate many sends, so theirs is the per-send terminal-state counters (`stall_count`, `timeout_count`) and, for S1, the round count (`halted` = fewer than the canonical 7 rounds ran). Mode 3 reports a constant UTXO count of 0 (no scanning wallet), so every per-send confirmation wait on that mode runs to its bound and records honestly as `t_confirm_ms: null` / a stall.
+
+**Resolution**: Read the payload and errors block, not just the status, when judging Mode 3 cells. End-to-end confirmation coverage for Mode 3 requires a per-payment terminal-state signal from the PP pipeline (`/v1/payments/{id}`), which is follow-up work; the per-cell envelope is behaving as specified.
 
 ------
 
