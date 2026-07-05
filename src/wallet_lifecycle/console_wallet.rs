@@ -239,8 +239,11 @@ pub struct ConsoleWalletLifecycle {
     child: Option<Child>,
     /// Connected gRPC client — `None` before `wait_ready`, `Some` after.
     client: Option<WalletClient<Channel>>,
-    /// Configured per-tx confirmation timeout — used as the wait-ready
-    /// deadline (bounded but generous per `DESIGN.md §Mode 1 step 2`).
+    /// Wait-ready deadline from `Config::wallet_ready_deadline_ms`. A
+    /// `--recovery` wallet binds gRPC only after its recovery scan
+    /// completes, and a birthday-0 recovery walks the whole chain, so this
+    /// must scale with chain length (formerly coupled to the per-tx
+    /// confirmation timeout, which bounds a few-block wait).
     ready_deadline: Duration,
 }
 
@@ -285,7 +288,7 @@ impl ConsoleWalletLifecycle {
             data_dir,
             child: None,
             client: None,
-            ready_deadline: Duration::from_millis(config.per_tx_confirmation_timeout_ms),
+            ready_deadline: Duration::from_millis(config.wallet_ready_deadline_ms),
         })
     }
 

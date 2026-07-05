@@ -33,6 +33,10 @@ mod defaults {
     pub(super) const FEE_RATE: u64 = 5;
     pub(super) const NETWORK: &str = "esmeralda";
     pub(super) const PER_TX_CONFIRMATION_TIMEOUT_MS: u64 = 1_800_000;
+    /// Same value the wallet-ready wait used while it was coupled to
+    /// `PER_TX_CONFIRMATION_TIMEOUT_MS`, so decoupling changes no shipped
+    /// behavior by default.
+    pub(super) const WALLET_READY_DEADLINE_MS: u64 = 1_800_000;
     pub(super) const SAMPLER_INTERVAL_MS: u64 = 1_000;
     /// Conservative weight (in grams) of a single-recipient S1 send
     /// (1 input, 2 outputs incl. change, 1 kernel) with BulletProofPlus
@@ -118,6 +122,21 @@ pub struct Config {
     /// Per-tx confirmation wait, in milliseconds. Schema: `per_tx_confirmation_timeout_ms`.
     #[serde(default = "Config::default_per_tx_confirmation_timeout_ms")]
     pub per_tx_confirmation_timeout_ms: u64,
+
+    /// Console-wallet boot deadline, in milliseconds: how long
+    /// [`crate::wallet_lifecycle::console_wallet`]'s `wait_ready` waits for
+    /// the spawned `minotari_console_wallet` to bind its gRPC listener and
+    /// report ready. Formerly coupled to `per_tx_confirmation_timeout_ms`;
+    /// decoupled because the two bound unrelated waits. A `--recovery`
+    /// wallet only binds gRPC after its recovery scan completes, and a
+    /// birthday-0 recovery walks the whole chain (measured live on
+    /// esmeralda at height ~731k: 488 blocks/s, about 25 minutes; the rate
+    /// varied about 2x across runs). That deadline must scale with chain
+    /// length, while the per-tx confirmation timeout bounds a few-block
+    /// wait. Default keeps the previously shipped value.
+    /// Schema: `wallet_ready_deadline_ms`.
+    #[serde(default = "Config::default_wallet_ready_deadline_ms")]
+    pub wallet_ready_deadline_ms: u64,
 
     /// Resource sampler tick interval, in milliseconds. Drives
     /// [`crate::sampler::ResourceSampler`]'s background loop for the
@@ -344,6 +363,9 @@ impl Config {
     }
     fn default_per_tx_confirmation_timeout_ms() -> u64 {
         defaults::PER_TX_CONFIRMATION_TIMEOUT_MS
+    }
+    fn default_wallet_ready_deadline_ms() -> u64 {
+        defaults::WALLET_READY_DEADLINE_MS
     }
     fn default_sampler_interval_ms() -> u64 {
         defaults::SAMPLER_INTERVAL_MS
@@ -598,6 +620,7 @@ impl Default for Config {
             network: Self::default_network(),
             base_node_url: Self::default_base_node_url(),
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
+            wallet_ready_deadline_ms: Self::default_wallet_ready_deadline_ms(),
             sampler_interval_ms: Self::default_sampler_interval_ms(),
             s1_amount_per_tx_microtari: Self::default_s1_amount_per_tx_microtari(),
             seeds: Seeds::default(),
@@ -657,6 +680,11 @@ mod tests {
             "https://rpc.esmeralda.tari.com/"
         );
         assert_eq!(cfg.per_tx_confirmation_timeout_ms, 1_800_000);
+        assert_eq!(
+            cfg.wallet_ready_deadline_ms, 1_800_000,
+            "must default to the value the wait-ready deadline had while \
+             coupled to per_tx_confirmation_timeout_ms",
+        );
         assert_eq!(cfg.sampler_interval_ms, 1_000);
         assert_eq!(cfg.s1_amount_per_tx_microtari, 4_000);
         assert_eq!(cfg.seeds.old, "HARNESS_SEED_OLD");
@@ -742,6 +770,28 @@ mod tests {
     }
 
     #[test]
+    fn wallet_ready_deadline_overrides_independently_of_per_tx_timeout() {
+        // The two knobs bound unrelated waits (chain-length-scaling wallet
+        // recovery vs a few-block confirmation); lowering one must not
+        // drag the other down. Regression guard for the coupling that made
+        // a 600s per-tx override cap wallet boot at 10 minutes.
+        let toml = r#"
+            per_tx_confirmation_timeout_ms = 600000
+            wallet_ready_deadline_ms = 2700000
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parses");
+        assert_eq!(cfg.per_tx_confirmation_timeout_ms, 600_000);
+        assert_eq!(cfg.wallet_ready_deadline_ms, 2_700_000);
+
+        let toml_only_per_tx = "per_tx_confirmation_timeout_ms = 600000";
+        let cfg: Config = toml::from_str(toml_only_per_tx).expect("parses");
+        assert_eq!(
+            cfg.wallet_ready_deadline_ms, 1_800_000,
+            "per-tx override must leave the wallet-ready deadline at its default",
+        );
+    }
+
+    #[test]
     fn deserialize_full_override_round_trips() {
         let original = Config {
             a_fund: 1,
@@ -757,6 +807,7 @@ mod tests {
             network: "esmeralda".to_string(),
             base_node_url: Url::parse("https://rpc.esmeralda.tari.com").unwrap(),
             per_tx_confirmation_timeout_ms: 10,
+            wallet_ready_deadline_ms: 11,
             sampler_interval_ms: 250,
             s1_amount_per_tx_microtari: 1234,
             seeds: Seeds {
