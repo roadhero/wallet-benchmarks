@@ -36,13 +36,15 @@ pub trait WalletDb: Send + Sync {
     fn count_spendable_utxos(&self, db_path: &Path) -> Result<u64>;
 
     /// Count of outputs that are actually spendable *now* by the `minotari`
-    /// input selector: UNSPENT, not locked, and mined (`confirmed_height`
-    /// set). This differs from [`Self::count_spendable_utxos`], which
-    /// counts every UNSPENT output including a locally-created but not-yet-
-    /// mined change output (stored as UNSPENT with `confirmed_height IS
-    /// NULL`). S1's settle-between-sends gate uses this so it does not
-    /// mistake pending change for spendable funds. Returns `Ok(0)` when the
-    /// DB file does not yet exist.
+    /// input selector: UNSPENT, not locked, and confirmed (`confirmed_height`
+    /// set once the output is buried by the confirmation window). This
+    /// differs from [`Self::count_spendable_utxos`], which counts every
+    /// UNSPENT row including outputs a scan has seen mined but not yet
+    /// buried (`confirmed_height` still NULL). Note the rows themselves are
+    /// created only by scans; a send only locks inputs and writes a
+    /// `pending_transactions` row. S1's settle-between-sends gate uses this
+    /// count so it does not mistake not-yet-confirmed outputs for spendable
+    /// funds. Returns `Ok(0)` when the DB file does not yet exist.
     fn count_confirmed_spendable_utxos(&self, db_path: &Path) -> Result<u64>;
 }
 

@@ -573,33 +573,47 @@ const SPENDABLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// false-failing the common case.
 const DEFAULT_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Re-scan and poll the wallet DB until at least one confirmed, spendable
-/// UTXO exists (the change from the just-sent transaction has been mined and
-/// buried by confirmation_window blocks), or `deadline` elapses.
+/// Re-scan and poll the wallet DB until the confirmed-spendable UTXO count
+/// rises above `baseline` (a new confirmed output has appeared since the
+/// send this gate follows), or `deadline` elapses. Returns `Ok(true)` when
+/// settled, `Ok(false)` on deadline.
 ///
-/// S1's serial self-send loop calls this between consecutive Mode 2/3 sends.
-/// `minotari create-unsigned-transaction`'s input selector (`fetch_unspent_outputs`
-/// in `minotari-cli` `db/outputs.rs`) only picks outputs whose
-/// `confirmed_height` is set, so without this gate the next send hits
-/// "Funds are pending. Available: 0 µT" while the change is still unconfirmed.
-/// Each poll runs `minotari scan`, which advances the wallet past any new tip
-/// blocks and runs the confirmation pass (`block_processor.rs` `process_confirmations`),
-/// setting `confirmed_height` on now-buried outputs, then reads
+/// S1's serial self-send loop calls this (via `Mode::settle_after_send`)
+/// after every wire-successful Mode 2 send. Mechanism, per the run-8
+/// evidence DB: a send only locks its inputs and writes a
+/// `pending_transactions` row; `outputs` rows are created exclusively by
+/// `minotari scan` (mined first, then `confirmed_height` set by the
+/// confirmation pass, `block_processor.rs` `process_confirmations`, once
+/// buried by the confirmation window). The input selector
+/// (`fetch_unspent_outputs` in `minotari-cli` `db/outputs.rs`) only picks
+/// outputs whose `confirmed_height` is set, so without this gate the next
+/// chained send fails with "Funds are pending. Available: 0". Each poll
+/// here runs `minotari scan` and then reads
 /// [`crate::wallet_db::WalletDb::count_confirmed_spendable_utxos`].
 ///
-/// On timeout this logs a warning and returns `Ok(())` rather than bailing:
-/// the next send then surfaces the still-pending state as an honest per-tx
-/// failure in the result profile, which is more faithful than aborting the
-/// whole scenario. Uses the same `tokio::select!` deadline idiom as
-/// [`wait_for_balance_positive`]; the AC-32 carve-out
+/// Predicate caveat: `count > baseline` is satisfied by ANY new confirmed
+/// output, not specifically the change of the send this gate follows (an
+/// older in-flight send confirming also trips it). That is acceptable for
+/// S1's serial self-send loop: the gate's contract is "the next send can
+/// lock a confirmed input", and any newly confirmed output of ours meets
+/// it. Tracking the specific change commitment or tx status was rejected
+/// as new SQL/plumbing surface for no added safety in a serial loop; see
+/// the commit message introducing this predicate for the full rationale.
+///
+/// On deadline this logs a warning and returns `Ok(false)` rather than
+/// bailing: the next send then surfaces the still-pending state as an
+/// honest per-tx failure in the result profile, which is more faithful
+/// than aborting the whole scenario. Uses the same `tokio::select!`
+/// deadline idiom as [`wait_for_balance_positive`]; the AC-32 carve-out
 /// (`tests/c_no_retry_backoff_throttle.rs`) excises the select body.
 pub(super) async fn wait_for_confirmed_spendable(
     cfg: &Config,
     data_dir: &Path,
     password: &str,
     wallet_db: &dyn crate::wallet_db::WalletDb,
+    baseline: u64,
     deadline: Option<std::time::Duration>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let deadline = deadline.unwrap_or(DEFAULT_SETTLE_DEADLINE);
     let started = std::time::Instant::now();
     let deadline_instant = tokio::time::Instant::now() + deadline;
@@ -607,27 +621,29 @@ pub(super) async fn wait_for_confirmed_spendable(
     let mut polls: u32 = 0;
     loop {
         // Advance the wallet past any newly mined blocks (this also runs the
-        // confirmation pass), then check whether the change is spendable.
-        // Scan failures during the wait are transient (mid-write DB, base
-        // node blip); log and keep polling. The deadline below bounds it.
+        // confirmation pass), then check whether a new confirmed output has
+        // appeared. Scan failures during the wait are transient (mid-write
+        // DB, base node blip); log and keep polling. The deadline below
+        // bounds it.
         match run_scan_subprocess(cfg, data_dir, password, None).await {
             Ok(_) => match wallet_db.count_confirmed_spendable_utxos(&db_path) {
-                Ok(n) if n > 0 => {
+                Ok(n) if n > baseline => {
                     polls = polls.saturating_add(1);
                     log::info!(
                         target: LOG_TARGET,
-                        "wait_for_confirmed_spendable: {n} confirmed UTXO(s) spendable after \
-                         {polls} polls ({:?} elapsed)",
+                        "wait_for_confirmed_spendable: {n} confirmed UTXO(s) spendable \
+                         (baseline {baseline}) after {polls} polls ({:?} elapsed)",
                         started.elapsed(),
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
-                Ok(_) => {
+                Ok(n) => {
                     polls = polls.saturating_add(1);
                     log::debug!(
                         target: LOG_TARGET,
-                        "wait_for_confirmed_spendable: change not yet confirmed after {polls} \
-                         polls ({:?} elapsed); polling again in {SPENDABLE_POLL_INTERVAL:?}",
+                        "wait_for_confirmed_spendable: count {n} still at/below baseline \
+                         {baseline} after {polls} polls ({:?} elapsed); polling again in \
+                         {SPENDABLE_POLL_INTERVAL:?}",
                         started.elapsed(),
                     );
                 }
@@ -655,12 +671,12 @@ pub(super) async fn wait_for_confirmed_spendable(
             _ = tokio::time::sleep_until(deadline_instant) => {
                 log::warn!(
                     target: LOG_TARGET,
-                    "wait_for_confirmed_spendable: no confirmed spendable UTXO after {:?} \
-                     ({polls} polls). The next send will record the pending state as a \
-                     per-tx failure.",
+                    "wait_for_confirmed_spendable: count never rose above baseline \
+                     {baseline} within {:?} ({polls} polls). The next send will record \
+                     the pending state as a per-tx failure.",
                     deadline,
                 );
-                return Ok(());
+                return Ok(false);
             }
             _ = tokio::time::sleep(SPENDABLE_POLL_INTERVAL) => {
                 // Poll cadence elapsed; loop back and re-scan + re-check.
@@ -930,5 +946,126 @@ mod tests {
         // 7 fractional digits → reject (below 1 µT resolution).
         let stdout = "Balance at height 100(...): 10.0000001 T\n";
         assert!(parse_balance_microtari(stdout).is_err());
+    }
+
+    /// Fake-binary harness for [`wait_for_confirmed_spendable`]: a stub
+    /// `minotari` script stands in for the real CLI so the test exercises
+    /// the REAL dynamic (scan invocation is the only thing that changes the
+    /// DB) instead of canned counts. Same precedent as
+    /// `tests/mode3_pp_lifecycle_with_fake_binary.rs`. Requires the
+    /// `sqlite3` CLI on PATH (ships with macOS and ubuntu).
+    #[cfg(unix)]
+    mod settle_gate_fake_binary {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+        use crate::config::Config;
+        use crate::wallet_db::{LiveWalletDb, WalletDb};
+
+        const OUTPUTS_SCHEMA: &str = r#"
+            CREATE TABLE outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'UNSPENT',
+                deleted_at TIMESTAMP,
+                is_burn INTEGER NOT NULL DEFAULT 0,
+                confirmed_height INTEGER
+            );
+        "#;
+
+        /// Build a data dir holding a wallet DB seeded with `confirmed`
+        /// pre-existing confirmed UNSPENT rows, plus a stub `minotari`
+        /// whose every invocation runs `insert_sql` against the DB.
+        fn stub_env(confirmed: u64, insert_sql: &str) -> (tempfile::TempDir, Config) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("wallet.sqlite3");
+            let conn = rusqlite::Connection::open(&db_path).expect("open db");
+            conn.execute_batch(OUTPUTS_SCHEMA).expect("schema");
+            for _ in 0..confirmed {
+                conn.execute(
+                    "INSERT INTO outputs (status, deleted_at, is_burn, confirmed_height) \
+                     VALUES ('UNSPENT', NULL, 0, 725000)",
+                    [],
+                )
+                .expect("seed row");
+            }
+            drop(conn);
+            let stub_path = dir.path().join("minotari-stub.sh");
+            let body = format!(
+                "#!/bin/sh\n{}\nexit 0\n",
+                if insert_sql.is_empty() {
+                    String::new()
+                } else {
+                    format!("sqlite3 {} \"{insert_sql}\"", db_path.display())
+                },
+            );
+            std::fs::write(&stub_path, body).expect("write stub");
+            let mut perms = std::fs::metadata(&stub_path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_path, perms).expect("chmod");
+            let cfg = Config {
+                minotari_path: Some(stub_path),
+                ..Config::default()
+            };
+            (dir, cfg)
+        }
+
+        #[tokio::test]
+        async fn settle_returns_true_only_after_scan_adds_new_confirmed_output() {
+            let (dir, cfg) = stub_env(
+                2,
+                "INSERT INTO outputs (status, deleted_at, is_burn, confirmed_height) \
+                 VALUES ('UNSPENT', NULL, 0, 725100);",
+            );
+            let db = LiveWalletDb;
+            let db_path = dir.path().join("wallet.sqlite3");
+            assert_eq!(
+                db.count_confirmed_spendable_utxos(&db_path).expect("pre"),
+                2,
+                "two pre-existing confirmed rows before the gate runs",
+            );
+            let settled = wait_for_confirmed_spendable(
+                &cfg,
+                dir.path(),
+                "pw",
+                &db,
+                2,
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await
+            .expect("gate runs");
+            assert!(
+                settled,
+                "stub scan added a new confirmed row above baseline"
+            );
+            assert_eq!(
+                db.count_confirmed_spendable_utxos(&db_path).expect("post"),
+                3,
+                "the scan invocation is what moved the count",
+            );
+        }
+
+        #[tokio::test]
+        async fn settle_returns_false_when_only_stale_confirmed_outputs_exist() {
+            // Regression guard for the weak `count > 0` predicate: two
+            // confirmed rows exist, but none is NEW relative to the
+            // baseline, so the gate must NOT pass. The stub scan is a no-op.
+            let (dir, cfg) = stub_env(2, "");
+            let db = LiveWalletDb;
+            let settled = wait_for_confirmed_spendable(
+                &cfg,
+                dir.path(),
+                "pw",
+                &db,
+                2,
+                Some(std::time::Duration::from_millis(200)),
+            )
+            .await
+            .expect("gate runs");
+            assert!(
+                !settled,
+                "pre-existing confirmed rows must not satisfy the baseline predicate",
+            );
+        }
     }
 }

@@ -355,15 +355,16 @@ async fn classify_single_send_result(
                 let confirmed = wait_for_state_change(config, mode).await?;
                 if confirmed {
                     *success_count += 1;
-                    // Serial self-send gate: block until the change this send
-                    // produced is spendable by the next send. No-op for Mode 1
-                    // (console wallet spends unmined change); Mode 2/3 wait for
-                    // the change to be mined + confirmed. See
-                    // `Mode::settle_after_send`.
-                    mode.settle_after_send().await?;
                 } else {
                     *stall_count += 1;
                 }
+                // Next-send readiness gate: runs for every wire-successful
+                // send regardless of how THIS send classified, because the
+                // gate's job (the next send can lock a confirmed input) is
+                // independent of this send's confirmed-vs-stall outcome.
+                // No-op for Mode 1 (self-scanning daemon) and Mode 3 (no
+                // scanning wallet). See `Mode::settle_after_send`.
+                mode.settle_after_send().await?;
             } else {
                 *rejection_count += 1;
                 details.push(DetailRecord {
@@ -405,7 +406,10 @@ fn synthesize_failure_record(error_string: &str) -> TxRecord {
 
 /// Wait for `mode.get_utxo_count()` to change from its current value, or
 /// for `config.per_tx_confirmation_timeout_ms` to elapse. Returns `true`
-/// on observed change, `false` on timeout.
+/// on observed change, `false` on timeout. Each poll first calls
+/// `mode.refresh_wallet_view()` so modes whose wallet view is a passive
+/// file (Mode 2) can observe the chain at all; the refresh is a no-op for
+/// Mode 1 (self-scanning daemon) and Mode 3 (constant zero count).
 ///
 /// The same `tokio::select!` pattern as S0: deadline arm
 /// (`sleep_until`) plus poll-cadence arm (`sleep(CONFIRMATION_POLL_INTERVAL)`).
@@ -422,6 +426,11 @@ async fn wait_for_state_change(config: &Config, mode: &mut dyn Mode) -> anyhow::
                 return Ok(false);
             }
             _ = tokio::time::sleep(CONFIRMATION_POLL_INTERVAL) => {
+                // Advance the wallet's view first: Mode 2's sqlite view only
+                // changes when a scan runs (no-op for Modes 1 and 3). Without
+                // this the poll below reads a frozen count forever and every
+                // Mode 2 send times out as a stall.
+                mode.refresh_wallet_view().await?;
                 let observed = mode.get_utxo_count().await?;
                 if observed != baseline {
                     return Ok(true);
@@ -517,6 +526,104 @@ mod tests {
             "wire-success contributes no details[]"
         );
         assert!(outcome.peak_rss_bytes.is_none(), "sampler lands in 3j");
+    }
+
+    #[tokio::test]
+    async fn s1_confirms_via_refresh_driven_state_change() {
+        // Models Mode 2's real dynamic: the UTXO count is frozen until a
+        // refresh (scan) runs. The run-8 defect was exactly this coupling:
+        // without a refresh in the poll arm, the count could never change
+        // and every Mode 2 send timed out as a stall.
+        let mut fake = FakeMode::new();
+        fake.send_single_sequence = vec![SendOutcome::Ok(success_record())];
+        fake.canned_utxo_count = vec![5];
+        // The count moves to 6 only after refresh_wallet_view has run once.
+        fake.count_after_refreshes = Some((1, 6));
+
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 10_000,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+
+        let outcome = run(&ctx, &mut fake, Some(1))
+            .await
+            .expect("S1 single-round runs");
+
+        assert_eq!(
+            outcome.success_count, 1,
+            "refresh-driven count change must classify as success, not stall",
+        );
+        assert_eq!(outcome.stall_count, 0);
+        let calls = fake.calls.lock().unwrap();
+        let send_pos = calls
+            .iter()
+            .position(|c| *c == "send_single")
+            .expect("send_single recorded");
+        let refresh_pos = calls
+            .iter()
+            .position(|c| *c == "refresh_wallet_view")
+            .expect("refresh_wallet_view must run in the confirmation poll");
+        let settle_pos = calls
+            .iter()
+            .position(|c| *c == "settle_after_send")
+            .expect("settle_after_send must run after classification");
+        assert!(
+            send_pos < refresh_pos && refresh_pos < settle_pos,
+            "ordering must be send -> refresh -> settle: {calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s1_settles_even_when_send_stalls() {
+        // The settle gate's job is next-send readiness, independent of how
+        // THIS send classified. Regression guard for the run-8 dead-branch
+        // defect (settle only ran inside `if confirmed`, which for Mode 2
+        // was unreachable).
+        let mut fake = FakeMode::new();
+        fake.send_single_sequence = vec![SendOutcome::Ok(success_record())];
+        // Static count and no refresh coupling: the wait times out (stall).
+        fake.canned_utxo_count = vec![10];
+
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 50,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+
+        let outcome = run(&ctx, &mut fake, Some(1))
+            .await
+            .expect("S1 single-round runs");
+
+        assert_eq!(outcome.success_count, 0);
+        assert_eq!(outcome.stall_count, 1, "no state change within timeout");
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            calls.contains(&"settle_after_send"),
+            "settle must run after a stalled wire-successful send: {calls:?}",
+        );
     }
 
     #[tokio::test]

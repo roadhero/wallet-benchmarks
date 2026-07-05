@@ -125,19 +125,38 @@ pub trait Mode: Send + Sync {
         fee_rate: u64,
     ) -> anyhow::Result<TxRecord>;
 
-    /// Block until the wallet can spend the change from the transaction it
-    /// just sent, then return. Called by S1's serial self-send loop between
-    /// consecutive sends.
+    /// Block until the wallet can lock an input for its NEXT send, then
+    /// return. S1's serial self-send loop calls this once per
+    /// wire-successful send, after the confirmation wait, regardless of
+    /// whether that wait observed the confirmation (next-send readiness is
+    /// independent of this-send classification).
     ///
-    /// Default: no-op. Mode 1's console wallet tracks its own mempool and
-    /// spends unmined change directly (evidenced by its 574 chained S1
-    /// sends at ~90s each, faster than the block cadence), so it needs no
-    /// gate. Mode 2/3 route through the `minotari` CLI, whose input
-    /// selector treats any output with `confirmed_height IS NULL` as
-    /// unavailable (it refuses unmined change with "Funds are pending"),
-    /// so those modes must wait for the change to be mined and rescanned
-    /// before the next send can lock it. See `src/modes/minotari_wallet_ops.rs`.
+    /// Default: no-op. Mode 1's console wallet daemon tracks the chain
+    /// itself (574 chained S1 sends at ~90s each in the first e2e run), so
+    /// it needs no gate. Mode 2 routes through the `minotari` CLI: a send
+    /// only locks its inputs and writes a `pending_transactions` row; the
+    /// `outputs` table gains rows exclusively via `minotari scan`, and the
+    /// input selector only picks outputs whose `confirmed_height` is set
+    /// (mined AND buried by the confirmation window). Until a scan runs and
+    /// the burial depth is reached, the next send fails with "Funds are
+    /// pending", so Mode 2 overrides this to scan-and-wait. See
+    /// [`crate::modes::minotari_wallet_ops`].
     async fn settle_after_send(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Refresh the wallet's view of the chain so a subsequent
+    /// [`Mode::get_utxo_count`] reflects recent blocks. Called by S1's
+    /// per-tx confirmation poll loop before each count read.
+    ///
+    /// Default: no-op. Mode 1's console wallet scans continuously
+    /// in-process, so its gRPC counts already track the chain. Mode 2's
+    /// wallet is a passive sqlite file that only changes when `minotari
+    /// scan` runs; without a refresh the confirmation poll reads a frozen
+    /// count forever and every send times out as a stall. Mode 3 reports a
+    /// constant zero count (no scanning wallet), so a refresh cannot help
+    /// it and it keeps the no-op.
+    async fn refresh_wallet_view(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -380,12 +399,20 @@ pub(crate) mod test_support {
         pub fail_with: Option<String>,
         /// Method-name log in call order.
         pub calls: Mutex<Vec<&'static str>>,
+        /// Models Mode 2's scan-coupled count dynamic: once
+        /// `refresh_wallet_view` has been called at least `.0` times,
+        /// `get_utxo_count` returns `.1` instead of the canned sequence.
+        /// `None` keeps the legacy canned-sequence behavior (Mode-1-style
+        /// counts that change without any refresh).
+        pub count_after_refreshes: Option<(u32, u64)>,
         /// Index into `canned_balance` for the next `get_balance` call.
         balance_idx: Mutex<usize>,
         /// Index into `canned_utxo_count` for the next `get_utxo_count` call.
         utxo_idx: Mutex<usize>,
         /// Index into `send_single_sequence` for the next `send_single` call.
         send_single_idx: Mutex<usize>,
+        /// Number of `refresh_wallet_view` calls so far.
+        refresh_count: Mutex<u32>,
     }
 
     impl FakeMode {
@@ -400,9 +427,11 @@ pub(crate) mod test_support {
                 canned_batch: None,
                 fail_with: None,
                 calls: Mutex::new(Vec::new()),
+                count_after_refreshes: None,
                 balance_idx: Mutex::new(0),
                 utxo_idx: Mutex::new(0),
                 send_single_idx: Mutex::new(0),
+                refresh_count: Mutex::new(0),
             }
         }
 
@@ -497,6 +526,13 @@ pub(crate) mod test_support {
         async fn get_utxo_count(&mut self) -> anyhow::Result<u64> {
             self.record("get_utxo_count");
             self.check_fail("get_utxo_count")?;
+            // Scan-coupled dynamic (Mode 2 model): the count only moves
+            // once enough refresh_wallet_view calls have happened.
+            if let Some((required, new_count)) = self.count_after_refreshes {
+                if *self.refresh_count.lock().unwrap() >= required {
+                    return Ok(new_count);
+                }
+            }
             if self.canned_utxo_count.is_empty() {
                 anyhow::bail!("FakeMode::get_utxo_count: no canned value set");
             }
@@ -518,6 +554,13 @@ pub(crate) mod test_support {
         async fn settle_after_send(&mut self) -> anyhow::Result<()> {
             self.record("settle_after_send");
             self.check_fail("settle_after_send")?;
+            Ok(())
+        }
+
+        async fn refresh_wallet_view(&mut self) -> anyhow::Result<()> {
+            self.record("refresh_wallet_view");
+            self.check_fail("refresh_wallet_view")?;
+            *self.refresh_count.lock().unwrap() += 1;
             Ok(())
         }
 

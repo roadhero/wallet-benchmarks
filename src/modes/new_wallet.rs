@@ -174,24 +174,57 @@ impl Mode for NewWallet {
     }
 
     async fn settle_after_send(&mut self) -> anyhow::Result<()> {
-        // Between consecutive S1 self-sends the change from the prior send is
-        // stored UNSPENT but with `confirmed_height IS NULL`, which the
-        // `minotari` input selector rejects ("Funds are pending"). Re-scan
-        // and wait until the change is mined + confirmed before the next
-        // send tries to lock it. See `wait_for_confirmed_spendable`.
+        // A send only locks its inputs and writes a pending_transactions
+        // row; the outputs table gains rows exclusively via `minotari
+        // scan`, and the input selector only picks outputs whose
+        // confirmed_height is set. Scan-and-wait until the confirmed
+        // spendable count rises above the post-send baseline so the next
+        // chained send can lock an input instead of failing with "Funds
+        // are pending". See `wait_for_confirmed_spendable` for the
+        // predicate caveat (any new confirmed output satisfies the gate).
+        let db_path = self.wallet_db_path();
+        let baseline = self
+            .wallet_db
+            .count_confirmed_spendable_utxos(&db_path)
+            .context("Mode 2 settle_after_send baseline count")?;
         let password = self
             .seeds
             .wallet_password()
             .context("reading wallet password for Mode 2 settle_after_send")?;
-        wait_for_confirmed_spendable(
+        let settled = wait_for_confirmed_spendable(
             &self.cfg,
             self.data_dir.path(),
             password.reveal(),
             self.wallet_db.as_ref(),
+            baseline,
             None,
         )
         .await
-        .context("Mode 2 settle_after_send")
+        .context("Mode 2 settle_after_send")?;
+        if !settled {
+            log::warn!(
+                target: LOG_TARGET,
+                "Mode 2 settle_after_send: no new confirmed output within the settle \
+                 deadline (baseline {baseline}); the next send may record an honest \
+                 Funds-pending failure",
+            );
+        }
+        Ok(())
+    }
+
+    async fn refresh_wallet_view(&mut self) -> anyhow::Result<()> {
+        // One bounded catch-up scan so the sqlite view tracks the chain
+        // during S1's confirmation polling. Without it the DB is frozen
+        // between sends (outputs rows are created only by scans) and
+        // `wait_for_state_change` could never observe the self-send.
+        let password = self
+            .seeds
+            .wallet_password()
+            .context("reading wallet password for Mode 2 refresh_wallet_view")?;
+        run_scan_subprocess(&self.cfg, self.data_dir.path(), password.reveal(), None)
+            .await
+            .context("Mode 2 refresh_wallet_view scan")?;
+        Ok(())
     }
 
     async fn scan_from_birthday(&mut self, birthday: u16) -> anyhow::Result<ScanOutcome> {
