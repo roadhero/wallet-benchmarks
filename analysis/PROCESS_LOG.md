@@ -69,3 +69,15 @@ checkpointed run_complete profile all confirmed) before the reply draft
 was released for posting.
 
 Signed off: Dennis Vorobyov
+
+## 2026-07-09 (operational): funded validation wallet seed mnemonics lost to tmp cleanup
+
+Funded validation wallet seed mnemonics stored in macOS tmp were
+deleted by system cleanup. Wallets on chain unrecoverable from this
+machine without the seed material. Going forward: seed material for any
+funded validation wallets stored outside auto-cleaned tmp paths (e.g.,
+~/.wallet-benchmarks-seeds/ with restrictive permissions, or a password
+manager). Applies to any future local funded validation, not just
+wallet-benchmarks.
+
+Signed off: Dennis Vorobyov
