@@ -19,3 +19,22 @@ commit body; the pre-amend chain is preserved on the local ref
 backup-pre-amend until this PR merges.
 
 Signed off: Dennis Vorobyov
+
+## 2026-07-09: Rule 13 misapplication by the operator, corrected on review pushback
+
+The operator misapplied Rule 13 to within-mechanism engineering value
+calls (the D-1 settle timeout, 600 s vs a 300 s figure that had only
+ever been a labeled design-discussion assumption) and to a commit
+boundary decision that the original proposal itself authorized (two
+defects batched per its "batch only if they can't be split" caveat).
+The implementation review pushed back with cited evidence from the
+authorization turns, including a nonexistent commit reference in the
+original finding. Retraction applied, and the two artifacts produced
+under the misapplied correction (a timeout config knob and a
+"recurrence" log entry) were dropped from the branch tip, preserved on
+the local ref backup-retracted-items until this PR merges. Rule
+discipline runs both ways: Rule 13 is meant to prevent scope expansion
+during absence, not to gate value discussions within authorized
+mechanisms.
+
+Signed off: Dennis Vorobyov
