@@ -38,3 +38,15 @@ during absence, not to gate value discussions within authorized
 mechanisms.
 
 Signed off: Dennis Vorobyov
+
+## 2026-07-09: standing rule, posting authority
+
+Rule declaration, not a correction of a prior action. The operator
+posts all replies to PR reviewers manually: PR comments, PR review
+comments, issue comments, and any GitHub interaction beyond pushing
+code to the branch are the operator's to send. Draft text is produced
+as committed or local files (analysis/PR_REPLY_DRAFT_*.md) or plaintext
+blocks for the operator to copy and post. Posting authority for the
+branch is code pushes only.
+
+Signed off: Dennis Vorobyov
