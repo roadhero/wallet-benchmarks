@@ -126,7 +126,24 @@ pub fn mode_key(role: SeedRole) -> &'static str {
     }
 }
 
-/// Build the full profile JSON, apply redaction, write to `output_path`.
+/// Build the full profile JSON, apply redaction, write to `output_path`
+/// atomically.
+///
+/// `run_complete` marks whether this profile represents a finished run
+/// (`true`, the final write) or a mid-run partial (`false`, written after
+/// the pre-flight and after each completed mode so an interrupted or
+/// mid-run-failed harness leaves its completed cells on disk instead of
+/// nothing; observed live: a ~7 hour operator run lost everything to a
+/// fatal error between the last scenario and the single end-of-run write).
+///
+/// Atomicity: the JSON is written to a sibling `<output>.tmp` on the SAME
+/// filesystem, fsynced, then renamed over `output_path` (POSIX rename is
+/// atomic within a filesystem). A crash mid-write therefore leaves the
+/// previous good profile intact plus an inert `.tmp`; the next write
+/// truncates the `.tmp`. The containing directory is fsynced best-effort
+/// (advisory on macOS), which covers process death fully and host power
+/// loss approximately; the latter is an accepted residual for a benchmark
+/// artifact.
 pub fn write(
     matrix: &Matrix,
     config: &Config,
@@ -134,8 +151,9 @@ pub fn write(
     versions: &Versions,
     redaction: &RedactionDenylist,
     output_path: &Path,
+    run_complete: bool,
 ) -> anyhow::Result<()> {
-    let profile = assemble_profile(matrix, config, env, versions, redaction);
+    let profile = assemble_profile(matrix, config, env, versions, redaction, run_complete);
     redaction
         .check(&profile)
         .context("redaction denylist matched the assembled profile — programming error in result_profile writer; mnemonic/password material leaked into a serialized value")?;
@@ -147,11 +165,42 @@ pub fn write(
     }
     let bytes = serde_json::to_vec_pretty(&profile)
         .context("serializing assembled profile to pretty JSON")?;
-    std::fs::write(output_path, &bytes)
-        .with_context(|| format!("writing result profile to {}", output_path.display()))?;
+
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path {} has no file name", output_path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp_path = output_path.with_file_name(format!("{file_name}.tmp"));
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("creating temp profile at {}", tmp_path.display()))?;
+        f.write_all(&bytes)
+            .with_context(|| format!("writing temp profile to {}", tmp_path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsyncing temp profile at {}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, output_path).with_context(|| {
+        format!(
+            "renaming {} over {}",
+            tmp_path.display(),
+            output_path.display(),
+        )
+    })?;
+    // Best-effort directory fsync so the rename itself is durable; advisory
+    // on macOS, load-bearing on Linux. Failure here is not fatal: the file
+    // content is already synced and the rename already visible.
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
+    }
     log::info!(
         target: LOG_TARGET,
-        "wrote result profile ({} bytes) to {}",
+        "wrote result profile ({} bytes, run_complete={run_complete}) to {}",
         bytes.len(),
         output_path.display(),
     );
@@ -164,9 +213,15 @@ fn assemble_profile(
     env: &Environment,
     versions: &Versions,
     redaction: &RedactionDenylist,
+    run_complete: bool,
 ) -> Value {
     json!({
         "schema_version": 1,
+        // Additive field, no schema_version bump: existing readers ignore
+        // unknown fields and the version is reserved for breaking shape
+        // changes. `false` = mid-run partial; `true` = the run reached its
+        // final write.
+        "run_complete": run_complete,
         "started_at": chrono::Utc::now().to_rfc3339(),
         "config": config_block(config),
         "environment": env_block(env),
@@ -913,7 +968,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
 
-        write(&matrix, &config, &env, &versions, &redaction, &path).expect("write");
+        write(&matrix, &config, &env, &versions, &redaction, &path, true).expect("write");
 
         let raw = std::fs::read_to_string(&path).expect("read back");
         let parsed: Value = serde_json::from_str(&raw).expect("parse JSON");
@@ -1029,6 +1084,101 @@ mod tests {
                 .unwrap()
                 .contains("simulated scan failure"),
             "error_string surfaces underlying anyhow message",
+        );
+    }
+
+    #[test]
+    fn write_replaces_output_atomically_leaving_no_stale_tmp() {
+        let matrix = Matrix::new();
+        let config = Config::default();
+        let env = fake_env();
+        let versions = fake_versions();
+        let redaction = redaction_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.json");
+
+        write(&matrix, &config, &env, &versions, &redaction, &path, false).expect("first write");
+        let first = std::fs::read_to_string(&path).expect("first read");
+        write(&matrix, &config, &env, &versions, &redaction, &path, true).expect("second write");
+        let second = std::fs::read_to_string(&path).expect("second read");
+        assert_ne!(first, second, "second write replaced the profile");
+        assert!(
+            !dir.path().join("profile.json.tmp").exists(),
+            "temp file must be renamed away, not left behind",
+        );
+        // Both reads parsed implicitly below: the replacement is a complete
+        // document, never a torn write.
+        let parsed: Value = serde_json::from_str(&second).expect("valid JSON after replace");
+        assert!(parsed.get("modes").is_some());
+    }
+
+    #[test]
+    fn partial_write_marks_run_complete_false() {
+        let matrix = Matrix::new();
+        let config = Config::default();
+        let env = fake_env();
+        let versions = fake_versions();
+        let redaction = redaction_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        write(&matrix, &config, &env, &versions, &redaction, &path, false).expect("write");
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            parsed.get("run_complete").and_then(Value::as_bool),
+            Some(false),
+            "mid-run partials must be marked run_complete=false",
+        );
+    }
+
+    #[test]
+    fn final_write_marks_run_complete_true() {
+        let matrix = Matrix::new();
+        let config = Config::default();
+        let env = fake_env();
+        let versions = fake_versions();
+        let redaction = redaction_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        write(&matrix, &config, &env, &versions, &redaction, &path, true).expect("write");
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            parsed.get("run_complete").and_then(Value::as_bool),
+            Some(true),
+            "the final write of a finished run must be marked run_complete=true",
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_tmp_write_leaves_previous_output_intact() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let matrix = Matrix::new();
+        let config = Config::default();
+        let env = fake_env();
+        let versions = fake_versions();
+        let redaction = redaction_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.json");
+        write(&matrix, &config, &env, &versions, &redaction, &path, false).expect("good write");
+        let before = std::fs::read_to_string(&path).expect("read");
+
+        // Make the directory read-only so creating the sibling .tmp fails.
+        let mut perms = std::fs::metadata(dir.path()).expect("stat").permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod ro");
+        let res = write(&matrix, &config, &env, &versions, &redaction, &path, true);
+        let mut restore = std::fs::metadata(dir.path()).expect("stat").permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), restore).expect("chmod rw");
+
+        assert!(res.is_err(), "tmp creation in a read-only dir must error");
+        let after = std::fs::read_to_string(&path).expect("read after failure");
+        assert_eq!(
+            before, after,
+            "a failed write must leave the previous good profile untouched",
         );
     }
 }

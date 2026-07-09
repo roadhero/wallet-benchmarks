@@ -162,6 +162,21 @@ async fn run_harness_async(
 
     // 5. Per-mode × per-scenario loop.
     let mut matrix = Matrix::new();
+    // Write #0: an all-null skeleton with run_complete=false, so from this
+    // point on the operator always has a valid profile on disk no matter
+    // where the run dies. Best-effort like the per-mode checkpoints; a
+    // failure here (e.g. unwritable output dir) is worth failing fast on,
+    // since the final write would fail the same way hours later.
+    result_profile::write(
+        &matrix,
+        &config,
+        &env,
+        &versions,
+        &redaction,
+        &output_path,
+        false,
+    )
+    .context("initial result-profile skeleton write (is the output path writable?)")?;
     for mode_role in [SeedRole::Old, SeedRole::New, SeedRole::Pp] {
         log::info!(target: LOG_TARGET, "running scenarios for mode {mode_role:?}");
         // Mode 3 is optional: an absent [mode_3] block disables the mode.
@@ -181,8 +196,16 @@ async fn run_harness_async(
         // Build the mode. Mode 3 returns a concretely-typed PaymentProcessor
         // (carried inside a generic ModeHandle) so the run loop can call
         // start_external_services + shutdown without downcasting through
-        // the Mode trait object.
-        let mut mode_handle = construct_mode(mode_role, &config, &seeds)?;
+        // the Mode trait object. Construction failure must not abort the
+        // run (that used to skip the writer and discard completed modes):
+        // record this mode's cells as errors and continue.
+        let mut mode_handle = match construct_mode(mode_role, &config, &seeds) {
+            Ok(h) => h,
+            Err(e) => {
+                record_mode_error(&mut matrix, mode_role, "mode construction failed", &e);
+                continue;
+            }
+        };
         // Mode 3 needs the PR + PP child processes spawned before the
         // scenario loop runs. PaymentProcessor::start_external_services
         // boots both lifecycles and waits for their HTTP readiness probes
@@ -200,31 +223,12 @@ async fn run_harness_async(
                 // daemon that exits during its readiness probe used to
                 // abort the whole run here, discarding the completed
                 // old_wallet and new_wallet matrices.
-                log::error!(
-                    target: LOG_TARGET,
-                    "mode {mode_role:?} external services failed to start; recording all \
-                     cells for this mode as errors and continuing: {e:#}",
+                record_mode_error(
+                    &mut matrix,
+                    mode_role,
+                    "mode external services failed to start",
+                    &e,
                 );
-                for scenario_id in ScenarioId::all() {
-                    println!(
-                        "[{}] mode={} scenario={}  done   tx_count=0 elapsed=0.0s status=err",
-                        chrono::Local::now().format("%H:%M:%S"),
-                        mode_name(mode_role),
-                        scenario_id,
-                    );
-                    matrix.record(
-                        mode_role,
-                        scenario_id,
-                        CellResult::Error(anyhow::anyhow!(
-                            "mode external services failed to start: {e:#}"
-                        )),
-                        0,
-                        None,
-                        None,
-                        Some("mode skipped: external services failed to start".to_string()),
-                        0,
-                    );
-                }
                 continue;
             }
         }
@@ -371,6 +375,25 @@ async fn run_harness_async(
                 );
             }
         }
+        // Partial checkpoint: persist everything recorded so far so a
+        // failure or kill in a later mode cannot discard this mode's
+        // results. Best-effort: a failed partial write must not abort the
+        // run (the final write below is the authoritative one and does
+        // propagate its error).
+        if let Err(e) = result_profile::write(
+            &matrix,
+            &config,
+            &env,
+            &versions,
+            &redaction,
+            &output_path,
+            false,
+        ) {
+            log::warn!(
+                target: LOG_TARGET,
+                "partial result-profile write after mode {mode_role:?} failed: {e:#} (continuing)",
+            );
+        }
     }
 
     // 5b. Print the operator-facing summary table to stdout before
@@ -384,8 +407,16 @@ async fn run_harness_async(
     //    WalletClient transaction-info query method that's a follow-up
     //    after the canonical baseline run validates the matrix shape. See
     //    analysis/PR_BODY_PLAN.md §Phase 4 confirmation-backfill gap.
-    result_profile::write(&matrix, &config, &env, &versions, &redaction, &output_path)
-        .context("writing result profile")?;
+    result_profile::write(
+        &matrix,
+        &config,
+        &env,
+        &versions,
+        &redaction,
+        &output_path,
+        true,
+    )
+    .context("writing result profile")?;
 
     println!("wrote {}", output_path.display());
     Ok(())
@@ -450,6 +481,37 @@ fn mode_name(role: SeedRole) -> &'static str {
 /// for scan-only scenarios 0 (no txs sent). Best-effort summary, not a
 /// load-bearing value — the canonical numbers live in the result
 /// profile.
+/// Record every cell of `mode_role` as an error carrying `why` + the source
+/// error, print the per-scenario `status=err` progress lines, and log once.
+/// Shared by the two mode-level failure classes (construction failure,
+/// external-services startup failure) so neither aborts the run: aborting
+/// used to skip the writer and discard the other modes' completed results.
+fn record_mode_error(matrix: &mut Matrix, mode_role: SeedRole, why: &str, e: &anyhow::Error) {
+    log::error!(
+        target: LOG_TARGET,
+        "mode {mode_role:?}: {why}; recording all cells for this mode as errors and \
+         continuing: {e:#}",
+    );
+    for scenario_id in ScenarioId::all() {
+        println!(
+            "[{}] mode={} scenario={}  done   tx_count=0 elapsed=0.0s status=err",
+            chrono::Local::now().format("%H:%M:%S"),
+            mode_name(mode_role),
+            scenario_id,
+        );
+        matrix.record(
+            mode_role,
+            scenario_id,
+            CellResult::Error(anyhow::anyhow!("{why}: {e:#}")),
+            0,
+            None,
+            None,
+            Some(format!("mode skipped: {why}")),
+            0,
+        );
+    }
+}
+
 /// Record all nine Mode 3 cells as `NotRun` (the profile's skipped/null
 /// semantics) when the operator runs without a `[mode_3]` block. Prints the
 /// same per-scenario progress lines the run loop emits so the operator sees
