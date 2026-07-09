@@ -36,12 +36,50 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
-/// The known top-level key set, derived from `Config::default()` itself so it
-/// can never drift from the struct (pinned by
-/// `known_keys_match_config_schema`).
+/// A `Config` with EVERY `Option` field populated, used solely to derive the
+/// known top-level key set.
+///
+/// Why not `Config::default()`: TOML has no null, so the toml serializer
+/// silently DROPS `None`-valued keys. Deriving the key set from the default
+/// therefore excluded every Option field (`minotari_console_wallet_path`,
+/// `minotari_path`, `mode_3`) and the loader rejected valid operator
+/// configs at startup; observed live on a maintainer run 2026-07-09.
+///
+/// Maintenance contract: any NEW `Option` field added to `Config` MUST be
+/// populated here or it will be rejected as unknown. Enforced by the
+/// exhaustive destructuring in `config_accepts_every_valid_top_level_field`,
+/// which fails to compile when `Config` gains a field, forcing the reader
+/// to this site.
+fn fully_populated_probe() -> Config {
+    use crate::config::{Mode3Account, Mode3Accounts, Mode3Config, WorkerSleepOverrides};
+    Config {
+        minotari_console_wallet_path: Some(std::path::PathBuf::from("/probe")),
+        minotari_path: Some(std::path::PathBuf::from("/probe")),
+        mode_3: Some(Mode3Config {
+            pp_binary_path: std::path::PathBuf::from("/probe"),
+            minotari_binary_path: std::path::PathBuf::from("/probe"),
+            api_port: 1,
+            pr_port: 2,
+            pr_base_url: "http://probe".to_string(),
+            terminal_state_poll_timeout_secs: 1,
+            worker_sleep_overrides: WorkerSleepOverrides::default(),
+            accounts: Mode3Accounts {
+                bench: Mode3Account {
+                    view_key_env: "PROBE_VIEW".to_string(),
+                    public_spend_key_env: "PROBE_SPEND".to_string(),
+                },
+            },
+        }),
+        ..Config::default()
+    }
+}
+
+/// The known top-level key set, derived from a fully-populated `Config` so
+/// Option fields are present (pinned by `known_keys_match_config_schema`
+/// and `config_accepts_every_valid_top_level_field`).
 fn known_top_level_keys() -> Vec<String> {
-    let value = toml::Value::try_from(Config::default())
-        .expect("Config::default serializes to TOML (programmer error otherwise)");
+    let value = toml::Value::try_from(fully_populated_probe())
+        .expect("probe Config serializes to TOML (programmer error otherwise)");
     match value {
         toml::Value::Table(t) => t.keys().cloned().collect(),
         _ => Vec::new(),
@@ -197,16 +235,154 @@ mod tests {
 
     #[test]
     fn known_keys_match_config_schema() {
-        // The suggestion machinery derives the key set from Config::default()
-        // at runtime; this pin guarantees the derivation works and includes
-        // the keys the tests below rely on.
+        // The suggestion machinery derives the key set from a fully
+        // populated probe at runtime; this pin guarantees the derivation
+        // includes BOTH plain fields and every Option field. The Option
+        // entries here are the regression pin for the 2026-07-09 defect
+        // (deriving from Config::default() dropped None-valued keys and
+        // the loader rejected valid operator configs).
         let known = known_top_level_keys();
-        for expected in ["network", "a_fund", "seeds", "fee_rate"] {
+        for expected in [
+            "network",
+            "a_fund",
+            "seeds",
+            "fee_rate",
+            "minotari_console_wallet_path",
+            "minotari_path",
+            "mode_3",
+        ] {
             assert!(
                 known.iter().any(|k| k == expected),
                 "derived key set must contain `{expected}`: {known:?}",
             );
         }
+    }
+
+    /// Every valid top-level field, as a (key, minimal-valid-TOML) pair.
+    ///
+    /// COMPILE-TIME COMPLETENESS GUARD: the exhaustive destructuring below
+    /// (no `..`) fails to compile the moment `Config` gains a field, forcing
+    /// whoever adds one to extend this list, the probe in
+    /// `fully_populated_probe` (for Option fields), and the acceptance test.
+    fn every_top_level_field() -> Vec<(&'static str, &'static str)> {
+        let Config {
+            a_fund: _,
+            c_min: _,
+            volume_target: _,
+            doubling_rounds: _,
+            fanout_outputs_per_tx: _,
+            concurrent_batches: _,
+            s4_t_budget_ms: _,
+            s5_m: _,
+            s5_k: _,
+            fee_rate: _,
+            network: _,
+            base_node_url: _,
+            per_tx_confirmation_timeout_ms: _,
+            wallet_ready_deadline_ms: _,
+            sampler_interval_ms: _,
+            s1_amount_per_tx_microtari: _,
+            seeds: _,
+            minotari_console_wallet_path: _,
+            minotari_path: _,
+            mode_3: _,
+        } = Config::default();
+        vec![
+            ("a_fund", "a_fund = 1"),
+            ("c_min", "c_min = 1"),
+            ("volume_target", "volume_target = 1"),
+            ("doubling_rounds", "doubling_rounds = 1"),
+            ("fanout_outputs_per_tx", "fanout_outputs_per_tx = 1"),
+            ("concurrent_batches", "concurrent_batches = [1]"),
+            ("s4_t_budget_ms", "s4_t_budget_ms = 1"),
+            ("s5_m", "s5_m = 1"),
+            ("s5_k", "s5_k = 1"),
+            ("fee_rate", "fee_rate = 1"),
+            ("network", "network = \"esmeralda\""),
+            (
+                "base_node_url",
+                "base_node_url = \"https://rpc.esmeralda.tari.com\"",
+            ),
+            (
+                "per_tx_confirmation_timeout_ms",
+                "per_tx_confirmation_timeout_ms = 1",
+            ),
+            ("wallet_ready_deadline_ms", "wallet_ready_deadline_ms = 1"),
+            ("sampler_interval_ms", "sampler_interval_ms = 1"),
+            (
+                "s1_amount_per_tx_microtari",
+                "s1_amount_per_tx_microtari = 5000",
+            ),
+            ("seeds", "[seeds]\nold = \"SOME_ENV\""),
+            (
+                "minotari_console_wallet_path",
+                "minotari_console_wallet_path = \"/usr/local/bin/minotari_console_wallet\"",
+            ),
+            (
+                "minotari_path",
+                "minotari_path = \"/usr/local/bin/minotari\"",
+            ),
+            (
+                "mode_3",
+                "[mode_3]\npp_binary_path = \"/x/pp\"\nminotari_binary_path = \"/x/minotari\"",
+            ),
+        ]
+    }
+
+    #[test]
+    fn config_accepts_every_valid_top_level_field() {
+        // Acceptance-path coverage for every field kind, one key at a time:
+        // the 2026-07-09 defect rejected valid Option-typed keys while all
+        // rejection-path tests passed. A minimal config per field must load.
+        for (key, snippet) in every_top_level_field() {
+            let file = write_toml(&format!("{snippet}\n"));
+            load(file.path())
+                .unwrap_or_else(|e| panic!("valid key `{key}` must be accepted, got: {e:#}"));
+        }
+        // And all of them together in one document.
+        let all: String = every_top_level_field()
+            .iter()
+            // Table-valued keys ([seeds], [mode_3]) must come after the
+            // plain keys in a TOML document.
+            .filter(|(_, s)| !s.starts_with('['))
+            .map(|(_, s)| format!("{s}\n"))
+            .chain(
+                every_top_level_field()
+                    .iter()
+                    .filter(|(_, s)| s.starts_with('['))
+                    .map(|(_, s)| format!("{s}\n")),
+            )
+            .collect();
+        let file = write_toml(&all);
+        load(file.path()).expect("a config naming every valid key must load");
+    }
+
+    #[test]
+    fn config_accepts_swvheerden_paste_verbatim() {
+        // Regression fixture from the maintainer's 2026-07-09 report: his
+        // config was rejected on its two binary-path keys. Reconstructed
+        // from his 2026-07-08 paste with one documented adaptation: the four
+        // seed env-var names appear under [seeds] rather than as bare
+        // top-level keys, because the loader rejects the bare form BY DESIGN
+        // (and his 2026-07-09 error listed only the two path keys, so his
+        // current file no longer carries them bare).
+        let file = write_toml(
+            "network = \"esmeralda\"\n\
+             base_node_url = \"https://rpc.esmeralda.tari.com\"\n\
+             minotari_console_wallet_path = \"tools/minotari_console_wallet\"\n\
+             minotari_path = \"tools/minotari\"\n\
+             [seeds]\n\
+             old = \"HARNESS_SEED_OLD\"\n\
+             new = \"HARNESS_SEED_NEW\"\n\
+             payment_processor = \"HARNESS_SEED_PP\"\n\
+             wallet_password = \"HARNESS_WALLET_PW\"\n",
+        );
+        let cfg = load(file.path()).expect("the maintainer's config shape must load without error");
+        assert_eq!(
+            cfg.minotari_path.as_deref(),
+            Some(std::path::Path::new("tools/minotari")),
+        );
+        assert!(cfg.mode_3.is_none());
     }
 
     #[test]
