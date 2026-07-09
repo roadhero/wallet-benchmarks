@@ -173,7 +173,10 @@ impl Mode for NewWallet {
         .context("Mode 2 create_sign_and_submit (batch 1-to-many)")
     }
 
-    async fn settle_after_send(&mut self) -> anyhow::Result<bool> {
+    async fn settle_after_send(
+        &mut self,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<bool> {
         // A send only locks its inputs and writes a pending_transactions
         // row; the outputs table gains rows exclusively via `minotari
         // scan`, and the input selector only picks outputs whose
@@ -197,7 +200,7 @@ impl Mode for NewWallet {
             password.reveal(),
             self.wallet_db.as_ref(),
             baseline,
-            None,
+            deadline,
         )
         .await
         .context("Mode 2 settle_after_send")?;

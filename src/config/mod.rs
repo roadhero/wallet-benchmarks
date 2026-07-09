@@ -37,6 +37,10 @@ mod defaults {
     /// `PER_TX_CONFIRMATION_TIMEOUT_MS`, so decoupling changes no shipped
     /// behavior by default.
     pub(super) const WALLET_READY_DEADLINE_MS: u64 = 1_800_000;
+    /// Matches the settle gate's previously hardcoded deadline
+    /// (minotari_wallet_ops::DEFAULT_SETTLE_DEADLINE) so exposing the knob
+    /// changes no shipped behavior by default.
+    pub(super) const S0_CHANGE_CONFIRM_TIMEOUT_SECS: u64 = 600;
     pub(super) const SAMPLER_INTERVAL_MS: u64 = 1_000;
     /// Conservative weight (in grams) of a single-recipient S1 send
     /// (1 input, 2 outputs incl. change, 1 kernel) with BulletProofPlus
@@ -146,6 +150,16 @@ pub struct Config {
     /// Schema: `wallet_ready_deadline_ms`.
     #[serde(default = "Config::default_wallet_ready_deadline_ms")]
     pub wallet_ready_deadline_ms: u64,
+
+    /// Deadline, in seconds, for S0's post-send settle gate: after its
+    /// warmup send, S0 waits until the change is confirmed and spendable
+    /// before handing the wallet to S1 (Mode 2; the gate is a no-op for
+    /// Modes 1/3). `0` skips the gate entirely, restoring the pre-gate
+    /// behavior as an operator escape hatch; S1's per-send settle keeps its
+    /// own shared default and is not affected by this knob.
+    /// Schema: `s0_change_confirm_timeout_secs`.
+    #[serde(default = "Config::default_s0_change_confirm_timeout_secs")]
+    pub s0_change_confirm_timeout_secs: u64,
 
     /// Resource sampler tick interval, in milliseconds. Drives
     /// [`crate::sampler::ResourceSampler`]'s background loop for the
@@ -375,6 +389,9 @@ impl Config {
     }
     fn default_wallet_ready_deadline_ms() -> u64 {
         defaults::WALLET_READY_DEADLINE_MS
+    }
+    fn default_s0_change_confirm_timeout_secs() -> u64 {
+        defaults::S0_CHANGE_CONFIRM_TIMEOUT_SECS
     }
     fn default_sampler_interval_ms() -> u64 {
         defaults::SAMPLER_INTERVAL_MS
@@ -630,6 +647,7 @@ impl Default for Config {
             base_node_url: Self::default_base_node_url(),
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
             wallet_ready_deadline_ms: Self::default_wallet_ready_deadline_ms(),
+            s0_change_confirm_timeout_secs: Self::default_s0_change_confirm_timeout_secs(),
             sampler_interval_ms: Self::default_sampler_interval_ms(),
             s1_amount_per_tx_microtari: Self::default_s1_amount_per_tx_microtari(),
             seeds: Seeds::default(),
@@ -693,6 +711,10 @@ mod tests {
             cfg.wallet_ready_deadline_ms, 1_800_000,
             "must default to the value the wait-ready deadline had while \
              coupled to per_tx_confirmation_timeout_ms",
+        );
+        assert_eq!(
+            cfg.s0_change_confirm_timeout_secs, 600,
+            "must default to the settle gate's previously hardcoded deadline",
         );
         assert_eq!(cfg.sampler_interval_ms, 1_000);
         assert_eq!(cfg.s1_amount_per_tx_microtari, 4_000);
@@ -843,6 +865,7 @@ mod tests {
             base_node_url: Url::parse("https://rpc.esmeralda.tari.com").unwrap(),
             per_tx_confirmation_timeout_ms: 10,
             wallet_ready_deadline_ms: 11,
+            s0_change_confirm_timeout_secs: 12,
             sampler_interval_ms: 250,
             s1_amount_per_tx_microtari: 1234,
             seeds: Seeds {

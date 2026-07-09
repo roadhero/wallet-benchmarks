@@ -192,16 +192,27 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
     // the true cause. Per the Mode::settle_after_send contract, an
     // unsettled gate here IS an S0 failure; Modes 1/3 report settled
     // unconditionally (no-op default).
-    let settled = mode
-        .settle_after_send()
-        .await
-        .context("S0 settle_after_send")?;
-    if !settled {
-        anyhow::bail!(
-            "S0 send succeeded but its change failed to confirm within the settle \
-             deadline; the wallet cannot fund S1 (see Mode::settle_after_send and \
-             RUNBOOK section 7.10)",
+    // Operator escape hatch: s0_change_confirm_timeout_secs = 0 skips the
+    // gate entirely (pre-gate behavior); any other value bounds the wait.
+    let settle_timeout = config.s0_change_confirm_timeout_secs;
+    if settle_timeout == 0 {
+        log::info!(
+            "S0 settle gate skipped: s0_change_confirm_timeout_secs = 0 \
+             (operator override); S1 may observe unconfirmed change",
         );
+    } else {
+        let settled = mode
+            .settle_after_send(Some(Duration::from_secs(settle_timeout)))
+            .await
+            .context("S0 settle_after_send")?;
+        if !settled {
+            anyhow::bail!(
+                "S0 send succeeded but its change failed to confirm within the settle \
+                 deadline ({settle_timeout}s, config key s0_change_confirm_timeout_secs); \
+                 the wallet cannot fund S1 (see Mode::settle_after_send and RUNBOOK \
+                 section 7.10)",
+            );
+        }
     }
 
     Ok(S0Outcome {
@@ -509,6 +520,100 @@ mod tests {
         assert!(
             msg.contains("change failed to confirm") && msg.contains("cannot fund S1"),
             "error must name the true cause: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_change_confirm_timeout_from_config_used_when_present() {
+        let mut fake = FakeMode::new();
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 10_000,
+            s0_change_confirm_timeout_secs: 123,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        run(&ctx, &mut fake).await.expect("S0 runs");
+        let deadlines = fake.settle_deadlines.lock().unwrap();
+        assert_eq!(
+            deadlines.as_slice(),
+            &[Some(Duration::from_secs(123))],
+            "the configured timeout must flow to the settle gate",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_change_confirm_timeout_default_600s_when_absent() {
+        let mut fake = FakeMode::new();
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        assert_eq!(cfg.s0_change_confirm_timeout_secs, 600, "config default");
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        run(&ctx, &mut fake).await.expect("S0 runs");
+        let deadlines = fake.settle_deadlines.lock().unwrap();
+        assert_eq!(
+            deadlines.as_slice(),
+            &[Some(Duration::from_secs(600))],
+            "absent override must yield the 600s default at the gate",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_change_confirm_timeout_zero_skips_settle() {
+        // Zero = operator escape hatch: the gate is not called at all, so
+        // even a gate that would report unsettled cannot fail S0.
+        let mut fake = FakeMode::new();
+        fake.settle_settled = false;
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 10_000,
+            s0_change_confirm_timeout_secs: 0,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        run(&ctx, &mut fake)
+            .await
+            .expect("S0 must succeed with the gate skipped");
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"settle_after_send"),
+            "zero timeout must skip the gate entirely: {calls:?}",
         );
     }
 }

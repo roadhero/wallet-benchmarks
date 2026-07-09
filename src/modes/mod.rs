@@ -155,7 +155,16 @@ pub trait Mode: Send + Sync {
     /// reached, the next send fails with "Funds are pending", so Mode 2
     /// overrides this to scan-and-wait. See
     /// [`crate::modes::minotari_wallet_ops`].
-    async fn settle_after_send(&mut self) -> anyhow::Result<bool> {
+    /// `deadline`: `Some` overrides the gate's wait bound (S0 passes
+    /// `Config::s0_change_confirm_timeout_secs`); `None` keeps the
+    /// implementation's shared default. Skip-at-zero is the CALLER's
+    /// decision (S0 skips the call entirely when configured 0), so
+    /// implementations never see a zero deadline.
+    async fn settle_after_send(
+        &mut self,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<bool> {
+        let _ = deadline;
         Ok(true)
     }
 
@@ -423,6 +432,9 @@ pub(crate) mod test_support {
         /// `false` = the gate's deadline elapsed without a newly confirmed
         /// output. Hard settle errors are modeled via `fail_with`.
         pub settle_settled: bool,
+        /// Every `deadline` argument `settle_after_send` received, in call
+        /// order, so tests can assert the configured timeout flows through.
+        pub settle_deadlines: Mutex<Vec<Option<std::time::Duration>>>,
         /// Index into `canned_balance` for the next `get_balance` call.
         balance_idx: Mutex<usize>,
         /// Index into `canned_utxo_count` for the next `get_utxo_count` call.
@@ -447,6 +459,7 @@ pub(crate) mod test_support {
                 calls: Mutex::new(Vec::new()),
                 count_after_refreshes: None,
                 settle_settled: true,
+                settle_deadlines: Mutex::new(Vec::new()),
                 balance_idx: Mutex::new(0),
                 utxo_idx: Mutex::new(0),
                 send_single_idx: Mutex::new(0),
@@ -570,9 +583,13 @@ pub(crate) mod test_support {
             Ok(())
         }
 
-        async fn settle_after_send(&mut self) -> anyhow::Result<bool> {
+        async fn settle_after_send(
+            &mut self,
+            deadline: Option<std::time::Duration>,
+        ) -> anyhow::Result<bool> {
             self.record("settle_after_send");
             self.check_fail("settle_after_send")?;
+            self.settle_deadlines.lock().unwrap().push(deadline);
             Ok(self.settle_settled)
         }
 

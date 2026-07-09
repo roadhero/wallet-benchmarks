@@ -280,6 +280,7 @@ mod tests {
             base_node_url: _,
             per_tx_confirmation_timeout_ms: _,
             wallet_ready_deadline_ms: _,
+            s0_change_confirm_timeout_secs: _,
             sampler_interval_ms: _,
             s1_amount_per_tx_microtari: _,
             seeds: _,
@@ -308,6 +309,10 @@ mod tests {
                 "per_tx_confirmation_timeout_ms = 1",
             ),
             ("wallet_ready_deadline_ms", "wallet_ready_deadline_ms = 1"),
+            (
+                "s0_change_confirm_timeout_secs",
+                "s0_change_confirm_timeout_secs = 1",
+            ),
             ("sampler_interval_ms", "sampler_interval_ms = 1"),
             (
                 "s1_amount_per_tx_microtari",

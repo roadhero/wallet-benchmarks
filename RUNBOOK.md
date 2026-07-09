@@ -185,6 +185,7 @@ Copy `harness.toml.example` to `harness.toml` and edit per host. Every field is 
 | `s5_m`, `s5_k` | `100`, `10` | S5 batch dimensions. |
 | `fee_rate` | `5` µT per gram | Bounty parameter table. |
 | `per_tx_confirmation_timeout_ms` | `1_800_000` (30 min) | Upper bound on the per-send confirmation poll (S0's single wait; S1's per-send wait). No longer bounds console-wallet boot; see `wallet_ready_deadline_ms`. |
+| `s0_change_confirm_timeout_secs` | `600` (10 min) | Bounds S0's post-send settle gate (Mode 2 waits for its warmup send's change to confirm before S1 starts). `0` skips the gate entirely; S1's per-send settle keeps its own default. |
 | `wallet_ready_deadline_ms` | `1_800_000` (30 min) | How long Mode 1's `wait_ready` waits for a spawned `minotari_console_wallet` to bind gRPC. A `--recovery` wallet binds only after its recovery scan; birthday-0 recovery walks the whole chain (measured ~490-2,300 blocks/s at height ~731k, i.e. 5-25 min, and growing with the chain). Raise this before raising anything else when B0/S2/S6 report "failed to connect to wallet gRPC". |
 | `sampler_interval_ms` | `1_000` | Resource sampler cadence. |
 | `s1_amount_per_tx_microtari` | `4000` µT | The per-tx amount S1 sends. Must exceed the full single-send fee (`fee_rate × ~700 grams`; config validation rejects amounts at or below it) or Mode 2/3 signing refuses the tx. |

@@ -367,7 +367,10 @@ async fn classify_single_send_result(
                 // contract, S1 does NOT fail on an unsettled gate: its
                 // remaining contract is measuring sends raw (AC-30/33), so
                 // the following sends record the consequence honestly.
-                let settled = mode.settle_after_send().await?;
+                // None keeps the mode's shared settle default; only S0's
+                // boundary gate is operator-tunable via
+                // s0_change_confirm_timeout_secs.
+                let settled = mode.settle_after_send(None).await?;
                 if !settled {
                     log::debug!(
                         "S1 settle gate unsettled after a wire-successful send; \
