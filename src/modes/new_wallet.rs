@@ -173,7 +173,7 @@ impl Mode for NewWallet {
         .context("Mode 2 create_sign_and_submit (batch 1-to-many)")
     }
 
-    async fn settle_after_send(&mut self) -> anyhow::Result<()> {
+    async fn settle_after_send(&mut self) -> anyhow::Result<bool> {
         // A send only locks its inputs and writes a pending_transactions
         // row; the outputs table gains rows exclusively via `minotari
         // scan`, and the input selector only picks outputs whose
@@ -205,11 +205,11 @@ impl Mode for NewWallet {
             log::warn!(
                 target: LOG_TARGET,
                 "Mode 2 settle_after_send: no new confirmed output within the settle \
-                 deadline (baseline {baseline}); the next send may record an honest \
-                 Funds-pending failure",
+                 deadline (baseline {baseline}); the caller decides whether that fails \
+                 its scenario (see Mode::settle_after_send)",
             );
         }
-        Ok(())
+        Ok(settled)
     }
 
     async fn refresh_wallet_view(&mut self) -> anyhow::Result<()> {

@@ -126,23 +126,37 @@ pub trait Mode: Send + Sync {
     ) -> anyhow::Result<TxRecord>;
 
     /// Block until the wallet can lock an input for its NEXT send, then
-    /// return. S1's serial self-send loop calls this once per
-    /// wire-successful send, after the confirmation wait, regardless of
-    /// whether that wait observed the confirmation (next-send readiness is
-    /// independent of this-send classification).
+    /// return `Ok(true)` (settled) or `Ok(false)` (the settle deadline
+    /// elapsed without a newly confirmed output). Call sites after a
+    /// wire-successful send: S0 (once, before handing the wallet to S1)
+    /// and S1's serial self-send loop (once per send, after the
+    /// confirmation wait, regardless of confirmed-vs-stall classification).
     ///
-    /// Default: no-op. Mode 1's console wallet daemon tracks the chain
-    /// itself (574 chained S1 sends at ~90s each in the first e2e run), so
-    /// it needs no gate. Mode 2 routes through the `minotari` CLI: a send
-    /// only locks its inputs and writes a `pending_transactions` row; the
-    /// `outputs` table gains rows exclusively via `minotari scan`, and the
-    /// input selector only picks outputs whose `confirmed_height` is set
-    /// (mined AND buried by the confirmation window). Until a scan runs and
-    /// the burial depth is reached, the next send fails with "Funds are
-    /// pending", so Mode 2 overrides this to scan-and-wait. See
+    /// Uniform handling contract (no per-scenario special-casing): a call
+    /// site fails its scenario iff `Ok(false)` makes the scenario's
+    /// remaining contract impossible; if the remaining contract is itself
+    /// the measurement of sends, the unsettled state is recorded as
+    /// per-send data instead. Concretely: S0's contract is "hand S1 a
+    /// wallet that can fund its sends" (its module doc's failure-halt
+    /// rule), so S0 maps `Ok(false)` to a scenario error naming the true
+    /// cause; S1's contract is measuring sends raw (AC-30/33), so S1 logs
+    /// and continues, and the following sends record honest failures.
+    /// `Err` is reserved for real failures (IO, missing password) and is
+    /// fatal to the scenario at every call site.
+    ///
+    /// Default: no-op reporting settled. Mode 1's console wallet daemon
+    /// tracks the chain itself (574 chained S1 sends at ~90s each in the
+    /// first e2e run), so it needs no gate. Mode 2 routes through the
+    /// `minotari` CLI: a send only locks its inputs and writes a
+    /// `pending_transactions` row; the `outputs` table gains rows
+    /// exclusively via `minotari scan`, and the input selector only picks
+    /// outputs whose `confirmed_height` is set (mined AND buried by the
+    /// confirmation window). Until a scan runs and the burial depth is
+    /// reached, the next send fails with "Funds are pending", so Mode 2
+    /// overrides this to scan-and-wait. See
     /// [`crate::modes::minotari_wallet_ops`].
-    async fn settle_after_send(&mut self) -> anyhow::Result<()> {
-        Ok(())
+    async fn settle_after_send(&mut self) -> anyhow::Result<bool> {
+        Ok(true)
     }
 
     /// Refresh the wallet's view of the chain so a subsequent
@@ -405,6 +419,10 @@ pub(crate) mod test_support {
         /// `None` keeps the legacy canned-sequence behavior (Mode-1-style
         /// counts that change without any refresh).
         pub count_after_refreshes: Option<(u32, u64)>,
+        /// What `settle_after_send` reports: `true` (default) = settled,
+        /// `false` = the gate's deadline elapsed without a newly confirmed
+        /// output. Hard settle errors are modeled via `fail_with`.
+        pub settle_settled: bool,
         /// Index into `canned_balance` for the next `get_balance` call.
         balance_idx: Mutex<usize>,
         /// Index into `canned_utxo_count` for the next `get_utxo_count` call.
@@ -428,6 +446,7 @@ pub(crate) mod test_support {
                 fail_with: None,
                 calls: Mutex::new(Vec::new()),
                 count_after_refreshes: None,
+                settle_settled: true,
                 balance_idx: Mutex::new(0),
                 utxo_idx: Mutex::new(0),
                 send_single_idx: Mutex::new(0),
@@ -551,10 +570,10 @@ pub(crate) mod test_support {
             Ok(())
         }
 
-        async fn settle_after_send(&mut self) -> anyhow::Result<()> {
+        async fn settle_after_send(&mut self) -> anyhow::Result<bool> {
             self.record("settle_after_send");
             self.check_fail("settle_after_send")?;
-            Ok(())
+            Ok(self.settle_settled)
         }
 
         async fn refresh_wallet_view(&mut self) -> anyhow::Result<()> {

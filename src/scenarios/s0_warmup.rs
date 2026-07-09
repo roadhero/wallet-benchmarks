@@ -46,6 +46,8 @@
 
 use std::time::Duration;
 
+use anyhow::Context;
+
 use crate::modes::{Mode, TxRecord};
 use crate::sampler::Pid;
 use crate::scenarios::ScenarioCtx;
@@ -181,6 +183,27 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         None => (None, None),
     };
 
+    // Next-scenario readiness gate, AFTER every S0 measurement is taken so
+    // the outcome above is byte-identical with or without the gate. S0's
+    // contract is handing S1 a wallet that can fund its sends (module doc,
+    // failure-halt rule): on a wallet whose spendable inputs were all
+    // locked by this send (e.g. a single-UTXO wallet), S1's first send
+    // would otherwise fail at construct with "Funds are pending" and hide
+    // the true cause. Per the Mode::settle_after_send contract, an
+    // unsettled gate here IS an S0 failure; Modes 1/3 report settled
+    // unconditionally (no-op default).
+    let settled = mode
+        .settle_after_send()
+        .await
+        .context("S0 settle_after_send")?;
+    if !settled {
+        anyhow::bail!(
+            "S0 send succeeded but its change failed to confirm within the settle \
+             deadline; the wallet cannot fund S1 (see Mode::settle_after_send and \
+             RUNBOOK section 7.10)",
+        );
+    }
+
     Ok(S0Outcome {
         pre_balance,
         post_balance,
@@ -289,14 +312,23 @@ mod tests {
         assert_eq!(calls[0], "get_balance", "pre-state balance first");
         assert_eq!(calls[1], "get_utxo_count", "pre-state utxo count next");
         assert_eq!(calls[2], "send_single", "broadcast the funding tx");
+        // The settle gate (next-scenario readiness) is the last call, AFTER
+        // every measurement; the post-state balance read comes immediately
+        // before it.
         assert_eq!(
             calls.last().copied(),
-            Some("get_balance"),
-            "post-state balance read last",
+            Some("settle_after_send"),
+            "settle gate runs last",
         );
-        // Every call after `send_single` and before the final `get_balance`
-        // must be a `get_utxo_count` (the confirmation poll).
-        for c in &calls[3..calls.len() - 1] {
+        assert_eq!(
+            calls.get(calls.len() - 2).copied(),
+            Some("get_balance"),
+            "post-state balance read is the final measurement",
+        );
+        // Every call after `send_single` and before the post-state
+        // `get_balance` + settle gate must be a `get_utxo_count` (the
+        // confirmation poll).
+        for c in &calls[3..calls.len() - 2] {
             assert_eq!(*c, "get_utxo_count", "confirmation poll body");
         }
     }
@@ -373,6 +405,110 @@ mod tests {
         assert!(
             msg.contains("broadcast rejected"),
             "error must carry the send-side failure: {msg}",
+        );
+    }
+
+    /// Shared ctx-builder boilerplate for the settle-gate tests.
+    fn settle_test_fixture() -> (Config, TariAddress, SeedHandle, RedactionDenylist) {
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 10_000,
+            ..Config::default()
+        };
+        (
+            cfg,
+            fake_recipient(),
+            SeedHandle::for_test(),
+            RedactionDenylist::for_test(),
+        )
+    }
+
+    #[tokio::test]
+    async fn s0_calls_settle_after_post_state_reads() {
+        // Defect D-1: the gate must run AFTER every measurement (post-state
+        // balance read included) so S0's outcome is identical with or
+        // without it.
+        let mut fake = FakeMode::new();
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        run(&ctx, &mut fake).await.expect("S0 runs");
+        let calls = fake.calls.lock().unwrap();
+        let settle_pos = calls
+            .iter()
+            .position(|c| *c == "settle_after_send")
+            .expect("settle_after_send must be called");
+        let last_balance_pos = calls
+            .iter()
+            .rposition(|c| *c == "get_balance")
+            .expect("post-state get_balance recorded");
+        assert!(
+            settle_pos > last_balance_pos,
+            "settle must run after the post-state balance read: {calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_succeeds_when_gate_settles() {
+        let mut fake = FakeMode::new();
+        fake.settle_settled = true;
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        let outcome = run(&ctx, &mut fake)
+            .await
+            .expect("settled gate keeps S0 ok");
+        assert_eq!(outcome.post_utxo_count, 2);
+    }
+
+    #[tokio::test]
+    async fn s0_errs_with_settle_reason_when_gate_unsettled() {
+        // Per the Mode::settle_after_send contract, S0 maps Ok(false) to a
+        // scenario error naming the true cause, because its remaining
+        // contract (hand S1 a fundable wallet) is impossible. The
+        // downstream alternative is S1 failing at construct with a
+        // Funds-pending message that hides why.
+        let mut fake = FakeMode::new();
+        fake.settle_settled = false;
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        let err = run(&ctx, &mut fake)
+            .await
+            .expect_err("unsettled gate must fail S0");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("change failed to confirm") && msg.contains("cannot fund S1"),
+            "error must name the true cause: {msg}",
         );
     }
 }

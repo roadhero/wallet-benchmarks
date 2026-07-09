@@ -363,8 +363,17 @@ async fn classify_single_send_result(
                 // gate's job (the next send can lock a confirmed input) is
                 // independent of this send's confirmed-vs-stall outcome.
                 // No-op for Mode 1 (self-scanning daemon) and Mode 3 (no
-                // scanning wallet). See `Mode::settle_after_send`.
-                mode.settle_after_send().await?;
+                // scanning wallet). Per the Mode::settle_after_send
+                // contract, S1 does NOT fail on an unsettled gate: its
+                // remaining contract is measuring sends raw (AC-30/33), so
+                // the following sends record the consequence honestly.
+                let settled = mode.settle_after_send().await?;
+                if !settled {
+                    log::debug!(
+                        "S1 settle gate unsettled after a wire-successful send; \
+                         subsequent sends may record Funds-pending failures",
+                    );
+                }
             } else {
                 *rejection_count += 1;
                 details.push(DetailRecord {
@@ -703,6 +712,44 @@ mod tests {
             !calls.contains(&"settle_after_send"),
             "settle_after_send must not run after a failed send: {calls:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn s1_continues_when_settle_reports_unsettled() {
+        // Per the Mode::settle_after_send contract, S1 does NOT fail on an
+        // unsettled gate: its remaining contract is measuring sends raw
+        // (AC-30/33), so the scenario proceeds and later sends record the
+        // consequence honestly. Contrast with S0, which fails (its
+        // remaining contract is handing S1 a fundable wallet).
+        let mut fake = FakeMode::new();
+        fake.settle_settled = false;
+        fake.send_single_sequence = vec![SendOutcome::Ok(success_record())];
+        fake.canned_utxo_count = vec![5];
+        fake.count_after_refreshes = Some((1, 6));
+
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 10_000,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+
+        let outcome = run(&ctx, &mut fake, Some(1))
+            .await
+            .expect("unsettled gate must not fail S1");
+        assert_eq!(outcome.success_count, 1, "the send itself still counts");
+        let calls = fake.calls.lock().unwrap();
+        assert!(calls.contains(&"settle_after_send"));
     }
 
     #[tokio::test]
