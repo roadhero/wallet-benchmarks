@@ -164,6 +164,20 @@ async fn run_harness_async(
     let mut matrix = Matrix::new();
     for mode_role in [SeedRole::Old, SeedRole::New, SeedRole::Pp] {
         log::info!(target: LOG_TARGET, "running scenarios for mode {mode_role:?}");
+        // Mode 3 is optional: an absent [mode_3] block disables the mode.
+        // Record its nine cells as skipped (null in the profile) and move
+        // on, instead of failing the whole run at mode construction, which
+        // used to discard the completed Mode 1/2 results (observed live:
+        // a ~7 h operator run lost to exactly this path).
+        if mode_role == SeedRole::Pp && config.mode_3.is_none() {
+            log::info!(
+                target: LOG_TARGET,
+                "Mode 3 (payment_processor) disabled: no [mode_3] block in the config; \
+                 recording all nine cells as skipped",
+            );
+            record_mode3_skipped(&mut matrix);
+            continue;
+        }
         // Build the mode. Mode 3 returns a concretely-typed PaymentProcessor
         // (carried inside a generic ModeHandle) so the run loop can call
         // start_external_services + shutdown without downcasting through
@@ -436,6 +450,32 @@ fn mode_name(role: SeedRole) -> &'static str {
 /// for scan-only scenarios 0 (no txs sent). Best-effort summary, not a
 /// load-bearing value — the canonical numbers live in the result
 /// profile.
+/// Record all nine Mode 3 cells as `NotRun` (the profile's skipped/null
+/// semantics) when the operator runs without a `[mode_3]` block. Prints the
+/// same per-scenario progress lines the run loop emits so the operator sees
+/// the skips inline. Mirrors the per-scenario `UnsupportedOperation` skip
+/// path's recording shape (zero wall clock, no tip queries, zero fees).
+fn record_mode3_skipped(matrix: &mut Matrix) {
+    for scenario_id in ScenarioId::all() {
+        println!(
+            "[{}] mode={} scenario={}  done   tx_count=0 elapsed=0.0s status=skipped",
+            chrono::Local::now().format("%H:%M:%S"),
+            mode_name(SeedRole::Pp),
+            scenario_id,
+        );
+        matrix.record(
+            SeedRole::Pp,
+            scenario_id,
+            CellResult::NotRun,
+            0,
+            None,
+            None,
+            None,
+            0,
+        );
+    }
+}
+
 fn count_txs(outcome: &ScenarioOutcome) -> u64 {
     use wallet_benchmarks::scenarios::ScenarioOutcome as S;
     match outcome {
@@ -623,6 +663,34 @@ fn compute_fees_paid(outcome: &ScenarioOutcome, config: &Config) -> u64 {
                 .map(|t| t.fee_microtari)
                 .sum();
             ind + bat
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_mode3_records_nine_skipped_cells() {
+        // Defect C acceptance: the mode-level skip must cover every
+        // scenario cell with NotRun so the writer emits null (the same
+        // shape the per-scenario skip path produces), never an error and
+        // never a missing cell.
+        let mut matrix = Matrix::new();
+        record_mode3_skipped(&mut matrix);
+        let ids = ScenarioId::all();
+        assert_eq!(ids.len(), 9, "scenario roster is the 9-cell matrix");
+        for sid in ids {
+            let entry = matrix
+                .get(SeedRole::Pp, sid)
+                .unwrap_or_else(|| panic!("cell {sid} must be recorded"));
+            assert!(
+                matches!(entry.result, CellResult::NotRun),
+                "cell {sid} must be NotRun",
+            );
+            assert_eq!(entry.wall_clock_ms, 0);
+            assert_eq!(entry.fees_paid_microtari, 0);
         }
     }
 }

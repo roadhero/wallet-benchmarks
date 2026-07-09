@@ -770,6 +770,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_checks_mode3_keys_at_startup_when_block_present() {
+        // Defect A pin: Config::validate must route into
+        // Mode3Config::validate when the block is present, so an invalid
+        // Mode 3 config fails in the first second of the run (main.rs
+        // calls Config::validate before the mode loop) instead of hours
+        // later when the loop reaches Mode 3.
+        let (view, spend, seed) = unique_envs("STARTUP_PIN");
+        unset_env(&view);
+        unset_env(&spend);
+        unset_env(&seed);
+        let cfg = Config {
+            mode_3: Some(build_validating_mode3(&view, &spend)),
+            seeds: seeds_with_pp(&seed),
+            ..Config::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("present-but-invalid mode_3 must fail Config::validate");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("validating mode_3 config"),
+            "error must carry the mode_3 validation context: {msg}",
+        );
+    }
+
+    #[test]
     fn wallet_ready_deadline_overrides_independently_of_per_tx_timeout() {
         // The two knobs bound unrelated waits (chain-length-scaling wallet
         // recovery vs a few-block confirmation); lowering one must not

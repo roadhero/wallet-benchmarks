@@ -916,4 +916,28 @@ mod tests {
         );
         teardown_envs(&seeds_cfg, &extras);
     }
+
+    #[test]
+    fn new_without_mode3_errs_cleanly_instead_of_panicking() {
+        // Defect C backstop (Addition 2 acceptance): the run loop now skips
+        // Mode 3 construction when [mode_3] is absent, so this path is
+        // unreachable in production; if a future refactor re-reaches it,
+        // the failure mode must stay a clean Err naming the config gap,
+        // never a panic.
+        let cfg = Config::default();
+        assert!(cfg.mode_3.is_none(), "default Config carries no mode_3");
+        let seeds = SeedHandle::new(&unique_seeds("NO_MODE3"));
+        let pp_dir = HarnessDataDir::new("test-mode3-none-pp", MODE_NAME).expect("pp dir");
+        let pr_dir = HarnessDataDir::new("test-mode3-none-pr", MODE_NAME).expect("pr dir");
+        // `expect_err` needs `T: Debug`; PaymentProcessor deliberately does
+        // not derive Debug (it holds secret-bearing handles), so match.
+        let msg = match PaymentProcessor::new(cfg, seeds, pp_dir, pr_dir) {
+            Ok(_) => panic!("absent mode_3 must surface as a clean Err"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("Config::mode_3 is required"),
+            "error must name the missing config block: {msg}",
+        );
+    }
 }
