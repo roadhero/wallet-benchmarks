@@ -1,16 +1,15 @@
 # wallet-benchmarks harness configuration — example.
 #
 # Copy to `harness.toml` and adjust per host. Every field is optional;
-# omitted fields fall back to the documented defaults (see
-# `analysis/RESULT_PROFILE_SCHEMA.md §1` and `src/config/mod.rs`). The
-# `[mode_3]` block is required only when the operator runs Mode 3
-# (`payment_processor`) scenarios end-to-end; the loop validates
-# Config::mode_3 is Some at startup before spawning either child.
+# omitted fields fall back to the documented defaults (see RUNBOOK.md
+# section 3 and `src/config/mod.rs`). Unknown top-level keys are rejected
+# at startup with a suggestion, so typos fail fast instead of being
+# silently ignored.
 #
-# Secrets (seed mnemonics, wallet password, hex view / spend keys) live
-# in environment variables; only the env var *names* live here, per
-# analysis/DESIGN.md §Secret handling and analysis/specs/MODE_3_REWORK_SPEC.md
-# §12. Set the named env vars before invoking `wallet-benchmarks run`.
+# Secrets (seed mnemonics, wallet password, hex view / spend keys) live in
+# environment variables; only the env var *names* live here. Set the named
+# env vars before invoking `wallet-benchmarks run` (RUNBOOK.md sections
+# 2.3-2.7).
 
 network = "esmeralda"
 base_node_url = "https://rpc.esmeralda.tari.com"
@@ -20,31 +19,52 @@ base_node_url = "https://rpc.esmeralda.tari.com"
 # minotari_console_wallet_path = "/usr/local/bin/minotari_console_wallet"
 # minotari_path = "/usr/local/bin/minotari"
 
-# Mode 3 (payment_processor) — required when running Mode 3.
-[mode_3]
-pp_binary_path = "/tmp/tari-pp-build/pp/target/release/minotari_payment_processor"
-minotari_binary_path = "/usr/local/bin/minotari"
-api_port = 9145
-pr_port = 9146
-# Base URL the PR daemon talks to for its blockchain RPC client.
-# Passed via --base-url on `minotari daemon`. Default mirrors
-# `base_node_url` above; override only when running against a
-# co-located base node.
-pr_base_url = "https://rpc.esmeralda.tari.com"
-terminal_state_poll_timeout_secs = 60
+# Funding parameter, in microTari (1 XTM = 1_000_000 uT). Two things key
+# off it: the funding pre-flight requires every wallet's balance to be at
+# least a_fund * 11/10, and S0's single warmup send carries a_fund / 127.
+# The default (10_000_000_000 uT = 10_000 XTM) therefore needs 11_000 XTM
+# per wallet; for a small smoke run fund each wallet accordingly and set
+# a_fund so both constraints fit, e.g. 2 XTM per wallet supports at most:
+# a_fund = 1_800_000
+# a_fund = 10_000_000_000
 
-# Per-worker sleep overrides (seconds). Each `null` lets PP keep its
-# hardcoded default; the bench values below drive PP as fast as it goes.
-[mode_3.worker_sleep_overrides]
-batch_creator = 1
-unsigned_tx_creator = 1
-transaction_signer = 1
-broadcaster = 1
-confirmation_checker = 5
+# Seed configuration: the VALUES are env var NAMES, never the secrets
+# themselves. These are also the defaults, so the whole table can be
+# omitted; shown here because these keys belong in this [seeds] table,
+# not at the top level.
+# [seeds]
+# old = "HARNESS_SEED_OLD"
+# new = "HARNESS_SEED_NEW"
+# payment_processor = "HARNESS_SEED_PP"
+# wallet_password = "HARNESS_WALLET_PW"
 
-# Single PP account. Multi-account is out of scope for v1 per
-# MODE_3_REWORK_SPEC.md §15. The two `*_env` fields name env vars
-# holding the hex view key and the hex public spend key.
-[mode_3.accounts.bench]
-view_key_env = "TARI_BENCH_VIEW_KEY"
-public_spend_key_env = "TARI_BENCH_SPEND_KEY"
+# Mode 3 (payment_processor): OPTIONAL. Leave this block absent (or
+# commented out, as shipped) to run Modes 1 and 2 only: the harness
+# records the nine Mode 3 cells as skipped and continues. Uncomment and
+# adjust everything below to run Mode 3 end-to-end.
+# [mode_3]
+# pp_binary_path = "/tmp/tari-pp-build/pp/target/release/minotari_payment_processor"
+# minotari_binary_path = "/usr/local/bin/minotari"
+# api_port = 9145
+# pr_port = 9146
+# # Base URL the PR daemon talks to for its blockchain RPC client.
+# # Passed via --base-url on `minotari daemon`. Mirror `base_node_url`
+# # above unless running against a co-located base node.
+# pr_base_url = "https://rpc.esmeralda.tari.com"
+# terminal_state_poll_timeout_secs = 60
+#
+# # Per-worker sleep overrides (seconds); the bench values below drive PP
+# # as fast as it goes.
+# [mode_3.worker_sleep_overrides]
+# batch_creator = 1
+# unsigned_tx_creator = 1
+# transaction_signer = 1
+# broadcaster = 1
+# confirmation_checker = 5
+#
+# # Single PP account. The two `*_env` fields name env vars holding the
+# # hex view key and the hex public spend key (auto-derived from
+# # HARNESS_SEED_PP when unset; see RUNBOOK.md section 2.5).
+# [mode_3.accounts.bench]
+# view_key_env = "TARI_BENCH_VIEW_KEY"
+# public_spend_key_env = "TARI_BENCH_SPEND_KEY"

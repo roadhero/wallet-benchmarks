@@ -68,6 +68,15 @@ mod defaults {
 /// environment variables whose *names* are recorded in [`Self::seeds`]; the harness
 /// resolves them at runtime via [`std::env::var`] — they never touch the TOML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Unknown top-level keys are a config error, not noise to ignore: an
+// operator once ran with the seed env-var names as bare top-level keys and
+// the run only worked because the [seeds] defaults carry the same names.
+// The friendly, suggestion-bearing rejection lives in config::load (the
+// production entry point); this attribute is the backstop for direct
+// deserialization paths. Known trade-off: a newer harness.toml with a field
+// this binary predates now fails loudly instead of silently dropping the
+// key, which is the correct direction for an operator tool.
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Initial funding amount per mode, in microTari. Schema: `a_fund`.
     #[serde(default = "Config::default_a_fund")]

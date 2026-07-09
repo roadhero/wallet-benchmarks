@@ -205,7 +205,7 @@ Override any of these only if you have a multi-run setup where you swap seeds be
 
 ### §3.3. `[mode_3]` table
 
-Required when running Mode 3. The loop validates `Config::mode_3 == Some` at startup before spawning the PR or PP children.
+OPTIONAL. Absent block = Mode 3 disabled: the run covers Modes 1 and 2 and records the nine Mode 3 cells as skipped (null in the profile, `status=skipped` progress lines) instead of failing. When the block IS present, `Config::validate` checks it at startup (binary paths, account key env vars) before anything spawns, so a bad Mode 3 config fails in the first second rather than hours in.
 
 ```toml
 [mode_3]
@@ -329,7 +329,7 @@ For Mode 3, the funded wallet is the same one whose view-key was extracted in §
 
 ## §5. Run invocation
 
-With the environment sourced (§2.7), the binary built (§2.1), `harness.toml` written (§3), and the wallets funded (§4), run the baseline:
+With the environment sourced (§2.7), the binary built (§2.1), `harness.toml` written (§3), and the wallets funded (§4), run the baseline. Mode 3 runs only when `harness.toml` carries a `[mode_3]` block (§3.3); without it the run covers Modes 1 and 2 and marks Mode 3 skipped. The profile is checkpointed after the pre-flight and after each mode (`run_complete: false`), so an interrupted run keeps its completed cells; the final write flips `run_complete` to `true`.
 
 ```sh
 . ./.env.harness
