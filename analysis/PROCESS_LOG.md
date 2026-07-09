@@ -50,3 +50,22 @@ blocks for the operator to copy and post. Posting authority for the
 branch is code pushes only.
 
 Signed off: Dennis Vorobyov
+
+## 2026-07-09 (later): pushed hotfix without end-to-end verification
+
+Pushed hotfix (024af08) with unit-test coverage green but without
+end-to-end verification against a realistic config shape. Operator
+flagged that CI-gate-green is not equivalent to end-to-end verified.
+Going forward: for any fix responding to a maintainer-reported defect,
+an end-to-end test invocation of the release binary against a config
+resembling the reported failure MUST run before push, not just the unit
+test suite. Rule 7 (validation standards): "if full validation is
+impossible, state what was validated, what was not, why, remaining
+risk." Applies here: unit tests validated the fix mechanism but not the
+fix in context. End-to-end invocation closes the gap. The verification
+ran post-push (fixture tests/fixtures/swvheerden_shape.toml through the
+release binary: config load, startup validation, Mode 3 skip cells, and
+checkpointed run_complete profile all confirmed) before the reply draft
+was released for posting.
+
+Signed off: Dennis Vorobyov

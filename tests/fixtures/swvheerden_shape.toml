@@ -1,0 +1,22 @@
+# End-to-end fixture reconstructing the maintainer's 2026-07-09 config
+# shape (the one rejected by the unknown-key defect fixed in 024af08):
+# both top-level binary-path keys from his paste, a [seeds] table, no
+# [mode_3] block, funding-scale values matching his ~4 XTM wallets.
+# His June-suggested s1 amount (200 uT) is intentionally NOT used here:
+# config validation rejects amounts at or below the real single-send fee
+# (700 uT at fee_rate 1); that rejection is by-design behavior verified
+# separately.
+
+network = "esmeralda"
+base_node_url = "https://rpc.esmeralda.tari.com"
+minotari_console_wallet_path = "tools/minotari_console_wallet"
+minotari_path = "tools/minotari"
+a_fund = 2_000_000
+fee_rate = 1
+s1_amount_per_tx_microtari = 1000
+
+[seeds]
+old = "HARNESS_SEED_OLD"
+new = "HARNESS_SEED_NEW"
+payment_processor = "HARNESS_SEED_PP"
+wallet_password = "HARNESS_WALLET_PW"
