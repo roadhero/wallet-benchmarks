@@ -123,6 +123,27 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
 
     let recipient = ctx.recipients.resolve_for(ctx.seeds, 0)?;
 
+    // Entry gate: S0's single serial send locks exactly one input, so the
+    // wallet must hold >= 1 confirmed spendable UTXO before the send is
+    // attempted. Freshly funded wallets sit inside the confirmation window
+    // (scanned but not buried) and would otherwise fail at lock-funds with
+    // "Funds are pending" (observed live, 2026-07-13 maintainer run whose
+    // whole balance was pending). Bounded by the same operator knob as the
+    // settle gate; 0 skips both. S0's contract (fund S1) makes a
+    // not-ready wallet a scenario error per the uniform gate principle.
+    let gate_timeout = config.s0_change_confirm_timeout_secs;
+    if gate_timeout > 0 {
+        let ready = mode
+            .wait_spendable_inputs(1, Some(Duration::from_secs(gate_timeout)))
+            .await
+            .context("S0 wait_spendable_inputs")?;
+        if !ready {
+            anyhow::bail!(
+                "S0 entry gate: wallet has no confirmed spendable input after                  {gate_timeout}s (config key s0_change_confirm_timeout_secs); the funding                  output is likely still inside the confirmation window. Wait for it to                  confirm or raise the timeout (see RUNBOOK section 7.11)",
+            );
+        }
+    }
+
     let pre_balance = mode.get_balance().await?;
     let pre_utxo_count = mode.get_utxo_count().await?;
 
@@ -320,9 +341,13 @@ mod tests {
         // count depends on real clock advancement of the
         // `CONFIRMATION_POLL_INTERVAL` sleep, so we assert the start and end
         // explicitly and the substring shape in the middle.
-        assert_eq!(calls[0], "get_balance", "pre-state balance first");
-        assert_eq!(calls[1], "get_utxo_count", "pre-state utxo count next");
-        assert_eq!(calls[2], "send_single", "broadcast the funding tx");
+        assert_eq!(
+            calls[0], "wait_spendable_inputs",
+            "entry gate runs before any measurement",
+        );
+        assert_eq!(calls[1], "get_balance", "pre-state balance first");
+        assert_eq!(calls[2], "get_utxo_count", "pre-state utxo count next");
+        assert_eq!(calls[3], "send_single", "broadcast the funding tx");
         // The settle gate (next-scenario readiness) is the last call, AFTER
         // every measurement; the post-state balance read comes immediately
         // before it.
@@ -339,7 +364,7 @@ mod tests {
         // Every call after `send_single` and before the post-state
         // `get_balance` + settle gate must be a `get_utxo_count` (the
         // confirmation poll).
-        for c in &calls[3..calls.len() - 2] {
+        for c in &calls[4..calls.len() - 2] {
             assert_eq!(*c, "get_utxo_count", "confirmation poll body");
         }
     }
@@ -614,6 +639,77 @@ mod tests {
         assert!(
             !calls.contains(&"settle_after_send"),
             "zero timeout must skip the gate entirely: {calls:?}",
+        );
+        assert!(
+            !calls.contains(&"wait_spendable_inputs"),
+            "zero timeout must skip the entry gate too: {calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_waits_for_spendable_input_before_sending() {
+        let mut fake = FakeMode::new();
+        fake.canned_balance = vec![10_000_000_000, 9_999_999_900];
+        fake.canned_utxo_count = vec![1, 2];
+        fake.canned_send_single = Some(sample_tx_record());
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        run(&ctx, &mut fake).await.expect("S0 runs");
+        let calls = fake.calls.lock().unwrap();
+        let gate = calls
+            .iter()
+            .position(|c| *c == "wait_spendable_inputs")
+            .expect("entry gate must run");
+        let send = calls
+            .iter()
+            .position(|c| *c == "send_single")
+            .expect("send recorded");
+        assert!(gate < send, "gate must precede the send: {calls:?}");
+        let requests = fake.spendable_requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[(1, Some(Duration::from_secs(600)))],
+            "S0's serial single send needs exactly one input, bounded by the knob",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_errs_with_pending_funds_reason_when_gate_times_out() {
+        let mut fake = FakeMode::new();
+        fake.spendable_ready = false;
+        fake.canned_balance = vec![10_000_000_000];
+        fake.canned_utxo_count = vec![1];
+        fake.canned_send_single = Some(sample_tx_record());
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        let err = run(&ctx, &mut fake)
+            .await
+            .expect_err("a not-ready wallet must fail S0 with the true cause");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("confirmation window") && msg.contains("s0_change_confirm_timeout_secs"),
+            "error must explain pending funds and name the knob: {msg}",
+        );
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"send_single"),
+            "no send may be attempted on a not-ready wallet: {calls:?}",
         );
     }
 }

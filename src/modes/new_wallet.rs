@@ -215,6 +215,41 @@ impl Mode for NewWallet {
         Ok(settled)
     }
 
+    async fn wait_spendable_inputs(
+        &mut self,
+        min_count: u64,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<bool> {
+        // Fast path: no subprocess when the wallet is already ready. One
+        // sqlite read; covers the common case of long-buried funding.
+        let db_path = self.wallet_db_path();
+        let have = self
+            .wallet_db
+            .count_confirmed_spendable_utxos(&db_path)
+            .context("Mode 2 wait_spendable_inputs fast-path count")?;
+        if have >= min_count {
+            return Ok(true);
+        }
+        // Wait path: scan-and-poll until the count crosses min_count.
+        // wait_for_confirmed_spendable's predicate is count > baseline,
+        // so baseline = min_count - 1 makes it fire exactly at min_count.
+        let password = self
+            .seeds
+            .wallet_password()
+            .context("reading wallet password for Mode 2 wait_spendable_inputs")?;
+        let ready = wait_for_confirmed_spendable(
+            &self.cfg,
+            self.data_dir.path(),
+            password.reveal(),
+            self.wallet_db.as_ref(),
+            min_count.saturating_sub(1),
+            deadline,
+        )
+        .await
+        .context("Mode 2 wait_spendable_inputs")?;
+        Ok(ready)
+    }
+
     async fn refresh_wallet_view(&mut self) -> anyhow::Result<()> {
         // One bounded catch-up scan so the sqlite view tracks the chain
         // during S1's confirmation polling. Without it the DB is frozen
@@ -564,5 +599,85 @@ mod tests {
             "error context must name Mode 2's wipe step: {msg}",
         );
         teardown_seeds(&seeds);
+    }
+
+    #[tokio::test]
+    async fn mode_2_s1_gate_passes_immediately_when_utxo_count_already_sufficient() {
+        // Fast-path acceptance coverage (design addition): a wallet that
+        // already holds the required confirmed spendable count passes in
+        // one sqlite read with NO scan subprocess. Proven by pointing the
+        // scanner at a nonexistent binary: if the gate tried to scan it
+        // would burn the deadline in transient retries instead of
+        // returning instantly.
+        let seeds_cfg = unique_seeds("GATE_FAST");
+        let m_old = gen_seed().expect("m_old");
+        let m_new = gen_seed().expect("m_new");
+        let m_pp = gen_seed().expect("m_pp");
+        set_env(&seeds_cfg.old, &m_old);
+        set_env(&seeds_cfg.new, &m_new);
+        set_env(&seeds_cfg.payment_processor, &m_pp);
+        set_env(&seeds_cfg.wallet_password, "pw");
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            minotari_path: Some(std::path::PathBuf::from("/nonexistent/minotari-gate-fast")),
+            ..Config::default()
+        };
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let data_dir = HarnessDataDir::new("test-mode2-GATE_FAST", MODE_NAME).expect("data dir");
+        let fake = Arc::new(crate::wallet_db::FakeWalletDb {
+            canned_count_outputs: Ok(1),
+            canned_count_spendable: Ok(1),
+            canned_count_confirmed_spendable: Ok(1),
+        });
+        let mut m = NewWallet::new_with_wallet_db(cfg, seeds, data_dir, fake);
+        let started = std::time::Instant::now();
+        let ready = m
+            .wait_spendable_inputs(1, Some(std::time::Duration::from_secs(30)))
+            .await
+            .expect("gate runs");
+        let elapsed = started.elapsed();
+        teardown_seeds(&seeds_cfg);
+        assert!(ready, "one confirmed spendable input satisfies min_count 1");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "fast path must not scan or wait: took {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn spendable_gate_min_count_maps_to_baseline() {
+        // min_count 2 with only 1 confirmed spendable must take the wait
+        // path (baseline = min_count - 1 = 1, predicate count > 1) and
+        // report not-ready at the deadline.
+        let seeds_cfg = unique_seeds("GATE_BASE");
+        let m_old = gen_seed().expect("m_old");
+        let m_new = gen_seed().expect("m_new");
+        let m_pp = gen_seed().expect("m_pp");
+        set_env(&seeds_cfg.old, &m_old);
+        set_env(&seeds_cfg.new, &m_new);
+        set_env(&seeds_cfg.payment_processor, &m_pp);
+        set_env(&seeds_cfg.wallet_password, "pw");
+        let cfg = Config {
+            seeds: seeds_cfg.clone(),
+            minotari_path: Some(std::path::PathBuf::from("/nonexistent/minotari-gate-base")),
+            ..Config::default()
+        };
+        let seeds = SeedHandle::new(&seeds_cfg);
+        let data_dir = HarnessDataDir::new("test-mode2-GATE_BASE", MODE_NAME).expect("data dir");
+        let fake = Arc::new(crate::wallet_db::FakeWalletDb {
+            canned_count_outputs: Ok(1),
+            canned_count_spendable: Ok(1),
+            canned_count_confirmed_spendable: Ok(1),
+        });
+        let mut m = NewWallet::new_with_wallet_db(cfg, seeds, data_dir, fake);
+        let ready = m
+            .wait_spendable_inputs(2, Some(std::time::Duration::from_millis(200)))
+            .await
+            .expect("gate runs");
+        teardown_seeds(&seeds_cfg);
+        assert!(
+            !ready,
+            "one confirmed spendable input must not satisfy min_count 2",
+        );
     }
 }

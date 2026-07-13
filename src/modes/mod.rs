@@ -183,6 +183,38 @@ pub trait Mode: Send + Sync {
         Ok(())
     }
 
+    /// Block until the wallet holds at least `min_count` confirmed
+    /// spendable inputs, or `deadline` elapses. Returns `Ok(true)` when
+    /// ready, `Ok(false)` on deadline. Send scenarios call this at entry
+    /// so a wallet whose funding is still inside the confirmation window
+    /// (scanned but not buried) waits instead of failing at lock-funds
+    /// with "Funds are pending"; observed live on a maintainer run
+    /// (2026-07-13) whose entire balance was pending at S0.
+    ///
+    /// `min_count` derives from scenario semantics, not config arithmetic:
+    /// S0 and S1 send strictly serially and each send locks exactly one
+    /// input, so both pass 1 (S1's chaining beyond the first send is the
+    /// settle gate's job). The only scenario with a larger derivable need
+    /// is S4 (up to max concurrent_batches inputs), deliberately not wired
+    /// here yet.
+    ///
+    /// Handling follows the settle contract's uniform principle: a call
+    /// site fails its scenario iff `Ok(false)` makes the scenario's
+    /// remaining contract impossible. S0 (fund S1) errs; S1 (measure sends
+    /// raw) logs and proceeds, and the fail-fast policy bounds the
+    /// consequence.
+    ///
+    /// Default: no-op reporting ready. Mode 1's console wallet manages its
+    /// own view; Mode 3 has no scanning wallet.
+    async fn wait_spendable_inputs(
+        &mut self,
+        min_count: u64,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<bool> {
+        let _ = (min_count, deadline);
+        Ok(true)
+    }
+
     /// Scan the chain from the given birthday height. Called by B0
     /// (birthday=0, expects 0 outputs), S2 (birthday=0, expects 512),
     /// S3 (birthday=H_birth from S0), S6 (S2-shape after S5), S7
@@ -435,6 +467,12 @@ pub(crate) mod test_support {
         /// Every `deadline` argument `settle_after_send` received, in call
         /// order, so tests can assert the configured timeout flows through.
         pub settle_deadlines: Mutex<Vec<Option<std::time::Duration>>>,
+        /// What `wait_spendable_inputs` reports: `true` (default) = ready,
+        /// `false` = deadline elapsed below `min_count`.
+        pub spendable_ready: bool,
+        /// Every `(min_count, deadline)` pair `wait_spendable_inputs`
+        /// received, in call order.
+        pub spendable_requests: Mutex<Vec<(u64, Option<std::time::Duration>)>>,
         /// Index into `canned_balance` for the next `get_balance` call.
         balance_idx: Mutex<usize>,
         /// Index into `canned_utxo_count` for the next `get_utxo_count` call.
@@ -460,6 +498,8 @@ pub(crate) mod test_support {
                 count_after_refreshes: None,
                 settle_settled: true,
                 settle_deadlines: Mutex::new(Vec::new()),
+                spendable_ready: true,
+                spendable_requests: Mutex::new(Vec::new()),
                 balance_idx: Mutex::new(0),
                 utxo_idx: Mutex::new(0),
                 send_single_idx: Mutex::new(0),
@@ -598,6 +638,20 @@ pub(crate) mod test_support {
             self.check_fail("refresh_wallet_view")?;
             *self.refresh_count.lock().unwrap() += 1;
             Ok(())
+        }
+
+        async fn wait_spendable_inputs(
+            &mut self,
+            min_count: u64,
+            deadline: Option<std::time::Duration>,
+        ) -> anyhow::Result<bool> {
+            self.record("wait_spendable_inputs");
+            self.check_fail("wait_spendable_inputs")?;
+            self.spendable_requests
+                .lock()
+                .unwrap()
+                .push((min_count, deadline));
+            Ok(self.spendable_ready)
         }
 
         fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {

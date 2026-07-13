@@ -161,6 +161,24 @@ pub(super) async fn run(
     rounds_override: Option<u8>,
 ) -> anyhow::Result<S1Outcome> {
     let config = ctx.config;
+    // Entry gate: S1's serial sends each lock exactly one input; chaining
+    // past the first send is the settle gate's job, so min_count is 1
+    // (a larger figure would demand pre-split UTXOs, contradicting the
+    // AC-30/31 no-pre-partitioning contract). Per the uniform gate
+    // principle S1 does NOT fail when not ready: its contract is measuring
+    // sends raw, so it proceeds and the sends record the consequence
+    // honestly (bounded by the fail-fast policy).
+    let gate_timeout = config.s0_change_confirm_timeout_secs;
+    if gate_timeout > 0 {
+        let ready = mode
+            .wait_spendable_inputs(1, Some(Duration::from_secs(gate_timeout)))
+            .await?;
+        if !ready {
+            log::warn!(
+                "S1 entry gate: no confirmed spendable input after {gate_timeout}s;                  proceeding, sends will record the pending-funds state honestly",
+            );
+        }
+    }
     let sampler = ctx.sampler_factory.map(|f| {
         f.start(
             crate::sampler::Pid(mode.target_pid_for_sampling()),

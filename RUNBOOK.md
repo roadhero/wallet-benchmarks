@@ -185,7 +185,7 @@ Copy `harness.toml.example` to `harness.toml` and edit per host. Every field is 
 | `s5_m`, `s5_k` | `100`, `10` | S5 batch dimensions. |
 | `fee_rate` | `5` µT per gram | Bounty parameter table. |
 | `per_tx_confirmation_timeout_ms` | `1_800_000` (30 min) | Upper bound on the per-send confirmation poll (S0's single wait; S1's per-send wait). No longer bounds console-wallet boot; see `wallet_ready_deadline_ms`. |
-| `s0_change_confirm_timeout_secs` | `600` (10 min) | Bounds S0's post-send settle gate (Mode 2 waits for its warmup send's change to confirm before S1 starts). `0` skips the gate entirely; S1's per-send settle keeps its own default. |
+| `s0_change_confirm_timeout_secs` | `600` (10 min) | Bounds S0's post-send settle gate AND the pre-send entry gates at S0 and S1 (the wallet must hold at least 1 confirmed spendable input before sending; see section 7.11). `0` skips all three gates. S1's per-send settle between chained sends keeps its own shared default. |
 | `wallet_ready_deadline_ms` | `1_800_000` (30 min) | How long Mode 1's `wait_ready` waits for a spawned `minotari_console_wallet` to bind gRPC. A `--recovery` wallet binds only after its recovery scan; birthday-0 recovery walks the whole chain (measured ~490-2,300 blocks/s at height ~731k, i.e. 5-25 min, and growing with the chain). Raise this before raising anything else when B0/S2/S6 report "failed to connect to wallet gRPC". |
 | `sampler_interval_ms` | `1_000` | Resource sampler cadence. |
 | `s1_amount_per_tx_microtari` | `4000` µT | The per-tx amount S1 sends. Must exceed the full single-send fee (`fee_rate × ~700 grams`; config validation rejects amounts at or below it) or Mode 2/3 signing refuses the tx. |
@@ -519,6 +519,14 @@ The `CONSOLE_WALLET_PASSWORD` env passed to PP is the fixture string `harness_pp
 **Cause (by design, not a bug)**: The cell envelope status means "the scenario ran to completion and produced its measurement", the same convention as B0/S2/S3/S6/S7 (`result_profile::outcome_to_envelope_json`). Confirmation truth lives one level down and its shape differs by scenario: S0 is a single-send warmup, so its confirmation run-out is `t_confirm_ms: null` in the payload; S1/S4 aggregate many sends, so theirs is the per-send terminal-state counters (`stall_count`, `timeout_count`) and, for S1, the round count (`halted` = fewer than the canonical 7 rounds ran). Mode 3 reports a constant UTXO count of 0 (no scanning wallet), so every per-send confirmation wait on that mode runs to its bound and records honestly as `t_confirm_ms: null` / a stall.
 
 **Resolution**: Read the payload and errors block, not just the status, when judging Mode 3 cells. End-to-end confirmation coverage for Mode 3 requires a per-payment terminal-state signal from the PP pipeline (`/v1/payments/{id}`), which is follow-up work; the per-cell envelope is behaving as specified.
+
+### §7.11. S0 fails with "wallet has no confirmed spendable input"
+
+**Symptom**: S0 errs at entry with "wallet has no confirmed spendable input after Ns; the funding output is likely still inside the confirmation window".
+
+**Cause**: Mode 2's CLI wallet can only spend outputs that are mined AND buried by the confirmation window. A freshly funded wallet shows its balance as pending (the funding transaction is mined but not yet buried), so a send would fail at lock-funds with "Funds are pending". The entry gate waits for at least one confirmed spendable input, bounded by `s0_change_confirm_timeout_secs`, and fails S0 with the true cause instead of letting the send produce a misleading error.
+
+**Resolution**: wait a few blocks for the funding output to confirm and re-run, or raise `s0_change_confirm_timeout_secs` so the gate waits longer (each block is roughly 45 seconds on esmeralda; burial takes the confirmation window plus one block). Setting the key to `0` skips the gate entirely and restores the raw failure behavior. S1 runs the same gate at entry but does not fail on it: its sends record the pending-funds state honestly.
 
 ------
 
