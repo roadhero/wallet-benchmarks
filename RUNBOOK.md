@@ -207,7 +207,7 @@ Override any of these only if you have a multi-run setup where you swap seeds be
 
 ### §3.3. `[mode_3]` table
 
-OPTIONAL. Absent block = Mode 3 disabled: the run covers Modes 1 and 2 and records the nine Mode 3 cells as skipped (null in the profile, `status=skipped` progress lines) instead of failing. When the block IS present, `Config::validate` checks it at startup (binary paths, account key env vars) before anything spawns, so a bad Mode 3 config fails in the first second rather than hours in.
+OPTIONAL. Absent block = Mode 3 disabled: the funding pre-flight exempts the payment-processor seed (its balance is never queried; the pre-flight pass line shows `pp=DISABLED`), the run covers Modes 1 and 2, and the nine Mode 3 cells are recorded as skipped (null in the profile, `status=skipped` progress lines) instead of failing. This is distinct from a present-but-unreachable Mode 3 setup: with the block configured, the payment-processor seed must be funded like the others, and if the PR daemon balance probe cannot be reached the pre-flight warns and marks the run's Mode 3 arm skipped (`pp=SKIPPED`). When the block IS present, `Config::validate` checks it at startup (binary paths, account key env vars) before anything spawns, so a bad Mode 3 config fails in the first second rather than hours in.
 
 ```toml
 [mode_3]
@@ -259,7 +259,7 @@ PP and the PR daemon watch the same `"default"` account using whichever keypair 
 
 ## §4. Funding
 
-The three wallets must each hold at least **11_000_000_000 µT (11k tXTM)** before the run starts. The bounty's `a_fund` parameter is 10k XTM per wallet; the extra 10% is `enforce_funding`'s headroom margin to account for fees consumed during the run.
+Each funded wallet must hold at least **11_000_000_000 µT (11k tXTM)** before the run starts. The bounty's `a_fund` parameter is 10k XTM per wallet; the extra 10% is `enforce_funding`'s headroom margin to account for fees consumed during the run. Three wallets need funding when `[mode_3]` is configured; without a `[mode_3]` block only the old and new wallets do, because the pre-flight exempts the payment-processor seed entirely (section 3.3).
 
 ### §4.1. Fund the wallets (faucet or solo mining)
 
@@ -294,9 +294,15 @@ There is no one-shot `get-balance` subcommand on `minotari_console_wallet`; the 
 [HH:MM:SS] preflight  old=11000000000uT new=11000000000uT pp=11000000000uT  PASS
 ```
 
+Without a `[mode_3]` block the pp column reports the exemption instead of a balance:
+
+```
+[HH:MM:SS] preflight  old=11000000000uT new=11000000000uT pp=DISABLED  PASS
+```
+
 If any wallet is short, `enforce_funding` bails with a per-seed shortage report naming exactly which seed and by how much. This is the same scan-and-balance code path the canonical run uses, so a green pre-flight here means a green pre-flight on the canonical run that follows.
 
-Per-wallet timing on a healthy network: ~30s of subprocess startup plus the wallet's own scan time (5-15 min on a cold import to a recent block height). The harness sequences the three checks serially under one `per_tx_confirmation_timeout_ms` deadline (30 min by default), so a fully cold three-seed pre-flight wraps inside an hour.
+Per-wallet timing on a healthy network: ~30s of subprocess startup plus the wallet's own scan time (5-15 min on a cold import to a recent block height). The harness runs the per-seed checks in parallel (since commit `1beaf43`), each under its own `wallet_ready_deadline_ms` deadline (30 min by default), so a fully cold pre-flight wraps in roughly the slowest single wallet's scan time.
 
 **Manual verify path (optional).** If you want to verify outside the harness (e.g. before configuring `harness.toml`), the working pattern mirrors what the harness does for Mode 1's console wallet:
 
@@ -325,7 +331,7 @@ In practice, sticking to the primary path (let `enforce_funding` do it) is simpl
 
 ### §4.3. Mode 3: view-key wallet check
 
-For Mode 3, the funded wallet is the same one whose view-key was extracted in §2.5. The PR daemon (spawned by the harness at run time) exposes `GET /accounts/default/balance` as the canonical balance probe. You don't need to pre-warm this; the harness's `enforce_funding` logs a warning and skips the Mode 3 arm if the PR daemon isn't yet up (the warn-and-skip behaviour from `src/guards.rs` plus `src/wallet_lifecycle/pr_balance_query.rs`).
+This section applies only when `[mode_3]` is configured; without the block the pre-flight never queries the payment-processor seed at all (section 3.3). For Mode 3, the funded wallet is the same one whose view-key was extracted in §2.5. The PR daemon (spawned by the harness at run time) exposes `GET /accounts/default/balance` as the canonical balance probe. You don't need to pre-warm this; the harness's `enforce_funding` logs a warning and skips the Mode 3 arm if the PR daemon isn't yet up (the warn-and-skip behaviour from `src/guards.rs` plus `src/wallet_lifecycle/pr_balance_query.rs`, reported as `pp=SKIPPED` on the pass line).
 
 ------
 

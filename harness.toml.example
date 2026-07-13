@@ -28,6 +28,27 @@ base_node_url = "https://rpc.esmeralda.tari.com"
 # a_fund = 1_800_000
 # a_fund = 10_000_000_000
 
+# Scenario shape. Defaults reproduce the bounty's canonical matrix; a
+# smoke run typically lowers volume_target / doubling_rounds / s5_m.
+# c_min = 3                        # confirmation depth for every confirmation wait
+# volume_target = 512              # S1 target final UTXO count
+# doubling_rounds = 6              # S1 serial rounds (1,2,4,8,16,32 sends)
+# fanout_outputs_per_tx = 8        # outputs per tx in the S1 fan-out round
+# concurrent_batches = [2, 4, 8]   # S4 concurrent-batch N values
+# s4_t_budget_ms = 900_000         # S4 hard wall-clock budget per N (15 min)
+# s5_m = 100                       # S5 individual-arm tx count / recipient list length
+# s5_k = 10                        # recipients per batch tx in the S5 batch arm
+# fee_rate = 5                     # microTari per gram
+# s1_amount_per_tx_microtari = 4_000  # S1 per-send amount (0.004 XTM)
+
+# Timeouts and policies (all optional).
+# per_tx_confirmation_timeout_ms = 1_800_000  # per-tx confirmation wait (30 min)
+# wallet_ready_deadline_ms = 1_800_000        # console-wallet startup scan deadline (30 min)
+# s0_change_confirm_timeout_secs = 600        # S0 settle gate + S0/S1 entry gates; 0 skips all three
+# fail_fast_identical_failure_threshold = 10  # abort a send loop after N contiguous
+#                                             # byte-identical failures; 0 disables
+# sampler_interval_ms = 1_000                 # RSS/CPU sampler cadence (1 Hz)
+
 # Seed configuration: the VALUES are env var NAMES, never the secrets
 # themselves. These are also the defaults, so the whole table can be
 # omitted; shown here because these keys belong in this [seeds] table,

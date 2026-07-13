@@ -81,3 +81,33 @@ manager). Applies to any future local funded validation, not just
 wallet-benchmarks.
 
 Signed off: Dennis Vorobyov
+
+## 2026-07-13: four maintainer-driven fixes shipped from the July 13 run report
+
+The maintainer's July 13 run surfaced four items, implemented in commit
+order with a full CI gate per commit (fmt, clippy -D warnings, nextest,
+release build, subprocess-module sentinel byte-identical):
+
+- 44febd0 (F1): funding pre-flight exempts the payment-processor seed
+  when no [mode_3] block is configured; pass line reports pp=DISABLED.
+- e374f04 (F2): s0_change_confirm_timeout_secs reinstated as a config
+  knob. Supersedes the 2026-07-09 retraction of the same knob commit
+  (396fd07): the retraction dropped it as unrequested scope; the
+  maintainer's run subsequently demonstrated the operator need, so the
+  knob returns as a maintainer-driven change with the same shape.
+- cdee226 (F3): Mode::wait_spendable_inputs pre-send gate at S0/S1 so a
+  freshly funded wallet whose whole balance is inside the confirmation
+  window waits instead of failing with "Funds are pending".
+- 7614445 (F4): fail_fast_identical_failure_threshold (default 10)
+  aborts S1/S4/S5 send loops after N contiguous byte-identical
+  failures, recording the reason in the profile details.
+
+End-to-end verification against tests/fixtures/swvheerden_shape.toml
+(release binary, all four paths) gates the push per the 2026-07-09
+rule; reply draft analysis/PR_REPLY_DRAFT_RUN12.md gates on that.
+
+Amendment to the 2026-07-09 seed-storage entry: the agreed storage
+location is the XDG path ~/.config/wallet-benchmarks/seeds/ with
+restrictive permissions (not ~/.wallet-benchmarks-seeds/).
+
+Signed off: Dennis Vorobyov
