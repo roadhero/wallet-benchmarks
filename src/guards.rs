@@ -161,7 +161,8 @@ pub async fn enforce_funding(
         if config.mode_3.is_none() {
             log::info!(
                 target: LOG_TARGET,
-                "Mode 3 disabled (no [mode_3] block): PP seed exempt from the funding                  pre-flight",
+                "Mode 3 disabled (no [mode_3] block): PP seed exempt from the funding \
+                 pre-flight",
             );
             return Ok::<PpPreflight, anyhow::Error>(PpPreflight::Disabled);
         }

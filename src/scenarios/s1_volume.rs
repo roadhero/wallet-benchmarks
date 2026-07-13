@@ -175,7 +175,8 @@ pub(super) async fn run(
             .await?;
         if !ready {
             log::warn!(
-                "S1 entry gate: no confirmed spendable input after {gate_timeout}s;                  proceeding, sends will record the pending-funds state honestly",
+                "S1 entry gate: no confirmed spendable input after {gate_timeout}s; \
+                 proceeding, sends will record the pending-funds state honestly",
             );
         }
     }

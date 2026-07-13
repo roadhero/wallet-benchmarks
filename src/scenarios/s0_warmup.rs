@@ -139,7 +139,11 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
             .context("S0 wait_spendable_inputs")?;
         if !ready {
             anyhow::bail!(
-                "S0 entry gate: wallet has no confirmed spendable input after                  {gate_timeout}s (config key s0_change_confirm_timeout_secs); the funding                  output is likely still inside the confirmation window. Wait for it to                  confirm or raise the timeout (see RUNBOOK section 7.11)",
+                "S0 entry gate: wallet has no confirmed spendable input after \
+                 {gate_timeout}s (config key s0_change_confirm_timeout_secs); \
+                 the funding output is likely still inside the confirmation \
+                 window. Wait for it to confirm or raise the timeout (see \
+                 RUNBOOK section 7.11)",
             );
         }
     }
