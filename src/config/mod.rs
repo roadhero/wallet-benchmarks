@@ -41,6 +41,13 @@ mod defaults {
     /// (minotari_wallet_ops::DEFAULT_SETTLE_DEADLINE) so exposing the knob
     /// changes no shipped behavior by default.
     pub(super) const S0_CHANGE_CONFIRM_TIMEOUT_SECS: u64 = 600;
+    /// Contiguous byte-identical failures a send loop tolerates before
+    /// aborting the scenario early. 10 over 5: an abort is irreversible
+    /// data loss for the cell while extra failure samples cost ~100 ms
+    /// each; ten identical strings are beyond plausible transient
+    /// variance (node blips vary their messages), and the observed
+    /// live case (127 identical rejections) is still cut by 92%.
+    pub(super) const FAIL_FAST_IDENTICAL_FAILURE_THRESHOLD: usize = 10;
     pub(super) const SAMPLER_INTERVAL_MS: u64 = 1_000;
     /// Conservative weight (in grams) of a single-recipient S1 send
     /// (1 input, 2 outputs incl. change, 1 kernel) with BulletProofPlus
@@ -160,6 +167,17 @@ pub struct Config {
     /// Schema: `s0_change_confirm_timeout_secs`.
     #[serde(default = "Config::default_s0_change_confirm_timeout_secs")]
     pub s0_change_confirm_timeout_secs: u64,
+
+    /// Fail-fast policy for send loops (S1, S4, S5): abort the scenario
+    /// after this many CONTIGUOUS failures with byte-identical error
+    /// strings, recording an explicit abort reason in the cell's details.
+    /// A success or a different error string resets the streak; `0`
+    /// disables the policy entirely. Bounds the wasted wall clock when a
+    /// wallet is systematically unable to send (observed live: 127
+    /// identical "Funds are pending" rejections at ~100 ms each).
+    /// Schema: `fail_fast_identical_failure_threshold`.
+    #[serde(default = "Config::default_fail_fast_identical_failure_threshold")]
+    pub fail_fast_identical_failure_threshold: usize,
 
     /// Resource sampler tick interval, in milliseconds. Drives
     /// [`crate::sampler::ResourceSampler`]'s background loop for the
@@ -392,6 +410,9 @@ impl Config {
     }
     fn default_s0_change_confirm_timeout_secs() -> u64 {
         defaults::S0_CHANGE_CONFIRM_TIMEOUT_SECS
+    }
+    fn default_fail_fast_identical_failure_threshold() -> usize {
+        defaults::FAIL_FAST_IDENTICAL_FAILURE_THRESHOLD
     }
     fn default_sampler_interval_ms() -> u64 {
         defaults::SAMPLER_INTERVAL_MS
@@ -648,6 +669,8 @@ impl Default for Config {
             per_tx_confirmation_timeout_ms: Self::default_per_tx_confirmation_timeout_ms(),
             wallet_ready_deadline_ms: Self::default_wallet_ready_deadline_ms(),
             s0_change_confirm_timeout_secs: Self::default_s0_change_confirm_timeout_secs(),
+            fail_fast_identical_failure_threshold:
+                Self::default_fail_fast_identical_failure_threshold(),
             sampler_interval_ms: Self::default_sampler_interval_ms(),
             s1_amount_per_tx_microtari: Self::default_s1_amount_per_tx_microtari(),
             seeds: Seeds::default(),
@@ -711,6 +734,10 @@ mod tests {
             cfg.wallet_ready_deadline_ms, 1_800_000,
             "must default to the value the wait-ready deadline had while \
              coupled to per_tx_confirmation_timeout_ms",
+        );
+        assert_eq!(
+            cfg.fail_fast_identical_failure_threshold, 10,
+            "fail-fast default balances abort risk against wasted samples",
         );
         assert_eq!(
             cfg.s0_change_confirm_timeout_secs, 600,
@@ -866,6 +893,7 @@ mod tests {
             per_tx_confirmation_timeout_ms: 10,
             wallet_ready_deadline_ms: 11,
             s0_change_confirm_timeout_secs: 12,
+            fail_fast_identical_failure_threshold: 13,
             sampler_interval_ms: 250,
             s1_amount_per_tx_microtari: 1234,
             seeds: Seeds {

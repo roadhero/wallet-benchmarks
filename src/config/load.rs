@@ -281,6 +281,7 @@ mod tests {
             per_tx_confirmation_timeout_ms: _,
             wallet_ready_deadline_ms: _,
             s0_change_confirm_timeout_secs: _,
+            fail_fast_identical_failure_threshold: _,
             sampler_interval_ms: _,
             s1_amount_per_tx_microtari: _,
             seeds: _,
@@ -312,6 +313,10 @@ mod tests {
             (
                 "s0_change_confirm_timeout_secs",
                 "s0_change_confirm_timeout_secs = 1",
+            ),
+            (
+                "fail_fast_identical_failure_threshold",
+                "fail_fast_identical_failure_threshold = 1",
             ),
             ("sampler_interval_ms", "sampler_interval_ms = 1"),
             (

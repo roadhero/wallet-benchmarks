@@ -65,6 +65,69 @@ pub struct DetailRecord {
     pub phase: DetailPhase,
 }
 
+/// Fail-fast policy for send loops (S1, S4, S5): counts CONTIGUOUS
+/// failures whose error strings are byte-identical and signals abort when
+/// the configured threshold is reached. A success or a failure with a
+/// DIFFERENT string resets the streak; stalls (no error string) also
+/// reset, since they are a distinct terminal class. Threshold 0 disables
+/// the policy. One mechanism for every send loop per the uniform-policy
+/// requirement; scan scenarios have no send loop, so it does not apply to
+/// them by structure.
+///
+/// Identity is exact string match by design: transient node-side errors
+/// vary their messages (heights, tx ids), while a systematically stuck
+/// wallet repeats the same message verbatim (observed live: 127 identical
+/// "Funds are pending" rejections).
+pub(crate) struct FailureStreakTracker {
+    threshold: usize,
+    streak: Option<(String, usize)>,
+}
+
+impl FailureStreakTracker {
+    pub(crate) fn new(threshold: usize) -> Self {
+        Self {
+            threshold,
+            streak: None,
+        }
+    }
+
+    /// Record a failure; returns `true` when the scenario should abort.
+    pub(crate) fn observe_failure(&mut self, error_string: &str) -> bool {
+        if self.threshold == 0 {
+            return false;
+        }
+        match &mut self.streak {
+            Some((s, n)) if s == error_string => {
+                *n += 1;
+            }
+            _ => {
+                self.streak = Some((error_string.to_string(), 1));
+            }
+        }
+        self.streak
+            .as_ref()
+            .is_some_and(|(_, n)| *n >= self.threshold)
+    }
+
+    /// A success (or any non-failure terminal state) resets the streak.
+    pub(crate) fn observe_success(&mut self) {
+        self.streak = None;
+    }
+
+    /// The abort reason recorded into the cell's details when
+    /// [`Self::observe_failure`] returned `true`.
+    pub(crate) fn abort_reason(&self) -> String {
+        match &self.streak {
+            Some((s, n)) => format!(
+                "aborted after {n} contiguous identical failures \
+                 (fail_fast_identical_failure_threshold = {}): {s}",
+                self.threshold,
+            ),
+            None => "aborted by fail-fast policy".to_string(),
+        }
+    }
+}
+
 /// Per `RESULT_PROFILE_SCHEMA.md §errors sub-object` line 116:
 /// `phase ∈ {"construct", "sign", "broadcast", "confirm", "scan"}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,5 +816,51 @@ mod tests {
             oracle.to_base58(),
             "SelfAddress(Pp) must agree with SeedHandle::address_for(Pp)",
         );
+    }
+
+    #[test]
+    fn failure_streak_aborts_at_threshold() {
+        let mut t = FailureStreakTracker::new(3);
+        assert!(!t.observe_failure("Funds are pending"));
+        assert!(!t.observe_failure("Funds are pending"));
+        assert!(
+            t.observe_failure("Funds are pending"),
+            "third identical failure aborts"
+        );
+        let reason = t.abort_reason();
+        assert!(
+            reason.contains("3 contiguous identical failures")
+                && reason.contains("Funds are pending")
+                && reason.contains("fail_fast_identical_failure_threshold"),
+            "reason must be self-describing: {reason}",
+        );
+    }
+
+    #[test]
+    fn failure_streak_resets_on_success() {
+        let mut t = FailureStreakTracker::new(2);
+        assert!(!t.observe_failure("x"));
+        t.observe_success();
+        assert!(!t.observe_failure("x"), "success resets the streak");
+        assert!(t.observe_failure("x"));
+    }
+
+    #[test]
+    fn failure_streak_resets_on_different_error() {
+        let mut t = FailureStreakTracker::new(2);
+        assert!(!t.observe_failure("error A at height 100"));
+        assert!(
+            !t.observe_failure("error A at height 101"),
+            "identity is exact string match; a varying message is a new streak",
+        );
+        assert!(t.observe_failure("error A at height 101"));
+    }
+
+    #[test]
+    fn failure_streak_disabled_at_zero() {
+        let mut t = FailureStreakTracker::new(0);
+        for _ in 0..1000 {
+            assert!(!t.observe_failure("same"), "0 disables the policy");
+        }
     }
 }

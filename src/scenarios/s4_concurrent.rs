@@ -222,7 +222,18 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
     let mut timeout_count: u64 = 0;
     let mut details: Vec<DetailRecord> = Vec::new();
 
+    // Fail-fast policy (uniform across S1/S4/S5 send loops). S4 tasks
+    // complete concurrently, so the streak is observed in recorded task
+    // order per sub-block; contiguity is therefore approximate for S4 and
+    // documented as such, while a fully failing wallet (every task, same
+    // string) still trips it deterministically.
+    let mut streak =
+        crate::scenarios::FailureStreakTracker::new(config.fail_fast_identical_failure_threshold);
+    let mut aborted = false;
     for &n in &sub_block_sizes {
+        if aborted {
+            break;
+        }
         let outcome = run_one_sub_block(
             ctx,
             mode,
@@ -247,6 +258,24 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         // Per `RESULT_PROFILE_SCHEMA.md` line 114, stall_count is reserved
         // for confirmation-phase timeouts; broadcast errors are NOT stalls.
         for task in &outcome.tx_records {
+            if matches!(
+                task.broadcast_outcome,
+                BroadcastOutcome::Error | BroadcastOutcome::Rejected
+            ) {
+                let failed = task.error_string.clone().unwrap_or_default();
+                if streak.observe_failure(&failed) && !aborted {
+                    let reason = streak.abort_reason();
+                    log::warn!("S4 fail-fast: {reason}");
+                    details.push(DetailRecord {
+                        txid: None,
+                        error_string: reason,
+                        phase: DetailPhase::Broadcast,
+                    });
+                    aborted = true;
+                }
+            } else {
+                streak.observe_success();
+            }
             if matches!(task.broadcast_outcome, BroadcastOutcome::Error) {
                 details.push(DetailRecord {
                     txid: if task.txid.is_empty() {
@@ -645,6 +674,51 @@ mod tests {
             recipients: RecipientStrategy::SelfAddress(SeedRole::New),
             sampler_factory: None,
         }
+    }
+
+    /// F4: S4 shares `fail_fast_identical_failure_threshold` with S1/S5.
+    /// Three sub-blocks are planned; with the threshold at 2 and every
+    /// task failing byte-identically, the streak trips inside sub-block 1
+    /// and sub-blocks 2 and 3 never dispatch.
+    #[tokio::test]
+    async fn s4_aborts_after_contiguous_identical_task_errors() {
+        let (mut fake, seeds_cfg, mut cfg, seeds, redaction, clock) = build_ctx(
+            "FAILFAST_S4",
+            vec![2, 2, 2],
+            60_000,
+            (0..6)
+                .map(|_| SendOutcome::Err("identical broadcast failure".to_string()))
+                .collect(),
+        );
+        cfg.fail_fast_identical_failure_threshold = 2;
+        let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+        let outcome = run(&ctx, &mut fake).await.expect("run ok");
+        assert_eq!(
+            outcome.sub_blocks.len(),
+            1,
+            "abort inside sub-block 1 skips sub-blocks 2 and 3",
+        );
+        // S4 dispatches through the clone-able dispatcher snapshot (not
+        // FakeMode::send_single), so dispatch volume is asserted via the
+        // recorded task outcomes: sub-block 1's two tasks and nothing else.
+        assert_eq!(
+            outcome.sub_blocks[0].tx_records.len(),
+            2,
+            "only sub-block 1's tasks dispatched",
+        );
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|d| d.error_string.contains("2 contiguous identical failures")),
+            "abort reason recorded in details[]: {:?}",
+            outcome
+                .details
+                .iter()
+                .map(|d| d.error_string.as_str())
+                .collect::<Vec<_>>(),
+        );
+        unset_env(&seeds_cfg.new);
     }
 
     /// N=2, both succeed → success_rate == 1.0, double_selection_rejections == 0,

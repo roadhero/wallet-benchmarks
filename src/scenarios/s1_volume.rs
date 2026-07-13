@@ -200,10 +200,18 @@ pub(super) async fn run(
     // round-robins correctly across the whole scenario AND fan-out slots
     // get distinct per-output recipient indices.
     let mut tx_idx: u32 = 0;
+    // Fail-fast policy (uniform across S1/S4/S5 send loops): abort after
+    // N contiguous byte-identical failures, recording the reason raw.
+    let mut streak =
+        crate::scenarios::FailureStreakTracker::new(config.fail_fast_identical_failure_threshold);
+    let mut aborted = false;
 
     // Doubling phase: rounds 1..=doubling_rounds. Each round k dispatches
     // 2^(k-1) serial single-recipient sends.
     for round_idx in 1..=doubling_rounds {
+        if aborted {
+            break;
+        }
         let tx_count: u32 = 1u32 << (round_idx - 1);
         let round_start = ctx.clock.now();
         let mut tx_records = Vec::with_capacity(tx_count as usize);
@@ -213,7 +221,7 @@ pub(super) async fn run(
             let recipient = ctx.recipients.resolve_for(ctx.seeds, tx_idx)?;
             tx_idx = tx_idx.saturating_add(1);
             let send_result = mode.send_single(&recipient, amount, config.fee_rate).await;
-            classify_single_send_result(
+            let abort = classify_single_send_result(
                 send_result,
                 config,
                 mode,
@@ -222,8 +230,14 @@ pub(super) async fn run(
                 &mut rejection_count,
                 &mut stall_count,
                 &mut details,
+                &mut streak,
             )
             .await?;
+            if abort {
+                record_fail_fast_abort(&streak, &mut details);
+                aborted = true;
+                break;
+            }
         }
 
         push_round(
@@ -239,7 +253,7 @@ pub(super) async fn run(
     // Fan-out phase: round `doubling_rounds + 1`. 2^doubling_rounds slots,
     // each slot a 1-input / fanout_k-output tx. Skipped when rounds_override
     // caps the loop at doubling_rounds (or below).
-    if total_rounds >= fanout_round_idx {
+    if total_rounds >= fanout_round_idx && !aborted {
         let fanout_tx_count: u32 = 1u32 << (fanout_round_idx - 1);
         let round_start = ctx.clock.now();
         let mut tx_records: Vec<TxRecord> = Vec::with_capacity(fanout_tx_count as usize);
@@ -265,7 +279,7 @@ pub(super) async fn run(
             if mode.name() == "old_wallet" {
                 for (recipient, amount) in &recipients {
                     let send_result = mode.send_single(recipient, *amount, config.fee_rate).await;
-                    classify_single_send_result(
+                    let abort = classify_single_send_result(
                         send_result,
                         config,
                         mode,
@@ -274,14 +288,20 @@ pub(super) async fn run(
                         &mut rejection_count,
                         &mut stall_count,
                         &mut details,
+                        &mut streak,
                     )
                     .await?;
+                    if abort {
+                        record_fail_fast_abort(&streak, &mut details);
+                        aborted = true;
+                        break;
+                    }
                 }
             } else {
                 let send_result = mode
                     .send_batch_one_to_many(&recipients, config.fee_rate)
                     .await;
-                classify_single_send_result(
+                let abort = classify_single_send_result(
                     send_result,
                     config,
                     mode,
@@ -290,8 +310,16 @@ pub(super) async fn run(
                     &mut rejection_count,
                     &mut stall_count,
                     &mut details,
+                    &mut streak,
                 )
                 .await?;
+                if abort {
+                    record_fail_fast_abort(&streak, &mut details);
+                    aborted = true;
+                }
+            }
+            if aborted {
+                break;
             }
         }
 
@@ -361,7 +389,9 @@ async fn classify_single_send_result(
     rejection_count: &mut u64,
     stall_count: &mut u64,
     details: &mut Vec<DetailRecord>,
-) -> anyhow::Result<()> {
+    streak: &mut crate::scenarios::FailureStreakTracker,
+) -> anyhow::Result<bool> {
+    let mut abort = false;
     match send_result {
         Ok(tx_record) => {
             let txid_opt = if tx_record.txid.is_empty() {
@@ -376,6 +406,10 @@ async fn classify_single_send_result(
                 } else {
                     *stall_count += 1;
                 }
+                // Success and stall are both non-failure terminal classes
+                // for the fail-fast policy: they reset the identical-
+                // failure streak.
+                streak.observe_success();
                 // Next-send readiness gate: runs for every wire-successful
                 // send regardless of how THIS send classified, because the
                 // gate's job (the next send can lock a confirmed input) is
@@ -397,9 +431,11 @@ async fn classify_single_send_result(
                 }
             } else {
                 *rejection_count += 1;
+                let error_string = tx_record.error_string.clone().unwrap_or_default();
+                abort = streak.observe_failure(&error_string);
                 details.push(DetailRecord {
                     txid: txid_opt,
-                    error_string: tx_record.error_string.clone().unwrap_or_default(),
+                    error_string,
                     phase: DetailPhase::Broadcast,
                 });
             }
@@ -407,6 +443,7 @@ async fn classify_single_send_result(
         }
         Err(send_err) => {
             let error_string = format!("{send_err:#}");
+            abort = streak.observe_failure(&error_string);
             details.push(DetailRecord {
                 txid: None,
                 error_string: error_string.clone(),
@@ -415,7 +452,23 @@ async fn classify_single_send_result(
             tx_records.push(synthesize_failure_record(&error_string));
         }
     }
-    Ok(())
+    Ok(abort)
+}
+
+/// Fold the fail-fast abort reason into the cell's details, once, and log
+/// it. The scenario then stops dispatching; already-recorded rounds and
+/// counters stay raw.
+fn record_fail_fast_abort(
+    streak: &crate::scenarios::FailureStreakTracker,
+    details: &mut Vec<DetailRecord>,
+) {
+    let reason = streak.abort_reason();
+    log::warn!("S1 fail-fast: {reason}");
+    details.push(DetailRecord {
+        txid: None,
+        error_string: reason,
+        phase: DetailPhase::Construct,
+    });
 }
 
 /// Construct a synthetic `TxRecord` for a send-side error. Used when
@@ -771,6 +824,93 @@ mod tests {
         assert_eq!(outcome.success_count, 1, "the send itself still counts");
         let calls = fake.calls.lock().unwrap();
         assert!(calls.contains(&"settle_after_send"));
+    }
+
+    #[tokio::test]
+    async fn s1_aborts_after_contiguous_identical_rejections_with_reason() {
+        // F4: rounds_override=4 would dispatch 1+2+4+8 = 15 sends; with the
+        // threshold at 4 and every send failing identically, the scenario
+        // must stop after the 4th attempt (mid round 3), record the abort
+        // reason, and never dispatch round 4.
+        let mut fake = FakeMode::new();
+        fake.send_single_sequence = (0..15)
+            .map(|_| SendOutcome::Err("Funds are pending".to_string()))
+            .collect();
+        fake.canned_utxo_count = vec![5];
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 50,
+            fail_fast_identical_failure_threshold: 4,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        let outcome = run(&ctx, &mut fake, Some(4))
+            .await
+            .expect("fail-fast abort is a recorded outcome, not an error");
+        let send_calls = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == "send_single")
+            .count();
+        assert_eq!(send_calls, 4, "dispatch stops at the threshold");
+        assert_eq!(
+            outcome.rounds.len(),
+            3,
+            "the aborted round records its partial outcome; round 4 never runs",
+        );
+        let last = outcome.details.last().expect("abort reason recorded");
+        assert!(
+            last.error_string
+                .contains("4 contiguous identical failures"),
+            "reason must state the streak: {}",
+            last.error_string,
+        );
+    }
+
+    #[tokio::test]
+    async fn s1_fail_fast_disabled_at_zero_threshold() {
+        let mut fake = FakeMode::new();
+        fake.send_single_sequence = (0..7)
+            .map(|_| SendOutcome::Err("Funds are pending".to_string()))
+            .collect();
+        fake.canned_utxo_count = vec![5];
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 50,
+            fail_fast_identical_failure_threshold: 0,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        let outcome = run(&ctx, &mut fake, Some(3))
+            .await
+            .expect("S1 runs to completion");
+        assert_eq!(
+            outcome.details.len(),
+            7,
+            "0 disables fail-fast: all sends attempted and recorded",
+        );
     }
 
     #[tokio::test]

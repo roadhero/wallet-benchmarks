@@ -182,6 +182,7 @@ pub(super) async fn run(
         m,
         amount_per_recipient,
         fee_rate,
+        config.fail_fast_identical_failure_threshold,
     )
     .await?;
 
@@ -197,6 +198,7 @@ pub(super) async fn run(
         k,
         amount_per_recipient,
         fee_rate,
+        config.fail_fast_identical_failure_threshold,
     )
     .await?;
 
@@ -236,6 +238,7 @@ pub(super) async fn run(
 /// Recipient resolution goes through
 /// [`RecipientStrategy::Pool::resolve_for`] so the per-slot lookup pattern
 /// matches S1 / S4. AC-32-exempt: no sleeps, no throttle.
+#[allow(clippy::too_many_arguments)]
 async fn run_individual_arm(
     mode: &mut dyn Mode,
     seeds: &SeedHandle,
@@ -243,8 +246,10 @@ async fn run_individual_arm(
     m: u32,
     amount_per_recipient: u64,
     fee_rate: u64,
+    fail_fast_threshold: usize,
 ) -> anyhow::Result<ArmOutcome> {
     let mut tx_records: Vec<TxRecord> = Vec::with_capacity(m as usize);
+    let mut streak = crate::scenarios::FailureStreakTracker::new(fail_fast_threshold);
     let arm_start = Instant::now();
     for tx_idx in 0..m {
         let recipient = strategy.resolve_for(seeds, tx_idx)?;
@@ -252,10 +257,29 @@ async fn run_individual_arm(
             .send_single(&recipient, amount_per_recipient, fee_rate)
             .await;
         match send_result {
-            Ok(rec) => tx_records.push(rec),
+            Ok(rec) if rec.status == "success" => {
+                streak.observe_success();
+                tx_records.push(rec);
+            }
+            Ok(rec) => {
+                let failed = rec.error_string.clone().unwrap_or_default();
+                tx_records.push(rec);
+                if streak.observe_failure(&failed) {
+                    let reason = streak.abort_reason();
+                    log::warn!("S5 individual arm fail-fast: {reason}");
+                    tx_records.push(synthesize_failure_record(&reason, "construct"));
+                    break;
+                }
+            }
             Err(send_err) => {
                 let error_string = format!("{send_err:#}");
                 tx_records.push(synthesize_failure_record(&error_string, "construct"));
+                if streak.observe_failure(&error_string) {
+                    let reason = streak.abort_reason();
+                    log::warn!("S5 individual arm fail-fast: {reason}");
+                    tx_records.push(synthesize_failure_record(&reason, "construct"));
+                    break;
+                }
             }
         }
     }
@@ -276,6 +300,7 @@ async fn run_individual_arm(
 /// [`RecipientStrategy::Pool::resolve_for`] surface, cycling through the
 /// pool with a monotonically increasing index so the total served-set
 /// covers each pool slot once.
+#[allow(clippy::too_many_arguments)]
 async fn run_batch_arm(
     mode: &mut dyn Mode,
     seeds: &SeedHandle,
@@ -284,8 +309,10 @@ async fn run_batch_arm(
     k: u32,
     amount_per_recipient: u64,
     fee_rate: u64,
+    fail_fast_threshold: usize,
 ) -> anyhow::Result<ArmOutcome> {
     let tx_count = m / k;
+    let mut streak = crate::scenarios::FailureStreakTracker::new(fail_fast_threshold);
     let mut tx_records: Vec<TxRecord> = Vec::with_capacity(tx_count as usize);
     let arm_start = Instant::now();
     let mut recipient_idx: u32 = 0;
@@ -298,10 +325,29 @@ async fn run_batch_arm(
         }
         let send_result = mode.send_batch_one_to_many(&recipients, fee_rate).await;
         match send_result {
-            Ok(rec) => tx_records.push(rec),
+            Ok(rec) if rec.status == "success" => {
+                streak.observe_success();
+                tx_records.push(rec);
+            }
+            Ok(rec) => {
+                let failed = rec.error_string.clone().unwrap_or_default();
+                tx_records.push(rec);
+                if streak.observe_failure(&failed) {
+                    let reason = streak.abort_reason();
+                    log::warn!("S5 batch arm fail-fast: {reason}");
+                    tx_records.push(synthesize_failure_record(&reason, "construct"));
+                    break;
+                }
+            }
             Err(send_err) => {
                 let error_string = format!("{send_err:#}");
                 tx_records.push(synthesize_failure_record(&error_string, "construct"));
+                if streak.observe_failure(&error_string) {
+                    let reason = streak.abort_reason();
+                    log::warn!("S5 batch arm fail-fast: {reason}");
+                    tx_records.push(synthesize_failure_record(&reason, "construct"));
+                    break;
+                }
             }
         }
     }
@@ -545,6 +591,81 @@ mod tests {
             recipients: RecipientStrategy::SelfAddress(SeedRole::New),
             sampler_factory: None,
         }
+    }
+
+    /// F4: both S5 arms share `fail_fast_identical_failure_threshold`.
+    /// With the threshold at 2 and every send failing byte-identically,
+    /// each arm stops after its 2nd attempt and appends a synthesized
+    /// record carrying the abort reason.
+    #[tokio::test]
+    async fn s4_and_s5_share_the_streak_threshold_s5_arms_abort() {
+        let (mut fake, seeds_cfg, mut cfg, seeds, redaction, clock) = build_ctx(
+            "FAILFAST_S5",
+            6,
+            2,
+            (0..6)
+                .map(|_| SendOutcome::Err("identical construct failure".to_string()))
+                .collect(),
+            Some(TxRecord {
+                txid: String::new(),
+                t_total_ms: 1,
+                t_broadcast_ms: 1,
+                t_confirm_ms: None,
+                status: "failure".to_string(),
+                error_string: Some("identical batch failure".to_string()),
+                fee_microtari: 0,
+            }),
+        );
+        cfg.fail_fast_identical_failure_threshold = 2;
+        let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+        let outcome = run(&ctx, &mut fake, SeedRole::Old)
+            .await
+            .expect("fail-fast abort is a recorded outcome, not an error");
+
+        // Individual arm: 6 planned, aborts after the 2nd identical
+        // failure; records = 2 failures + 1 synthesized abort reason.
+        let send_calls = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == "send_single")
+            .count();
+        assert_eq!(send_calls, 2, "individual arm stops at the threshold");
+        assert_eq!(outcome.arms.individual.tx_records.len(), 3);
+        let last = outcome.arms.individual.tx_records.last().unwrap();
+        assert!(
+            last.error_string
+                .as_deref()
+                .unwrap_or_default()
+                .contains("2 contiguous identical failures"),
+            "individual arm records the abort reason: {:?}",
+            last.error_string,
+        );
+
+        // Batch arm: 3 planned (m/k), aborts after the 2nd identical
+        // failure; records = 2 failures + 1 synthesized abort reason.
+        let batch_calls = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == "send_batch_one_to_many")
+            .count();
+        assert_eq!(batch_calls, 2, "batch arm stops at the threshold");
+        assert_eq!(outcome.arms.batch.tx_records.len(), 3);
+        let last = outcome.arms.batch.tx_records.last().unwrap();
+        assert!(
+            last.error_string
+                .as_deref()
+                .unwrap_or_default()
+                .contains("2 contiguous identical failures"),
+            "batch arm records the abort reason: {:?}",
+            last.error_string,
+        );
+        unset_env(&seeds_cfg.old);
+        unset_env(&seeds_cfg.new);
+        unset_env(&seeds_cfg.payment_processor);
     }
 
     /// Individual arm with 4 successful sends → applies=true, tx_count=4,
