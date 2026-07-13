@@ -100,6 +100,16 @@ pub trait BalanceQuery: Send + Sync {
 /// skipped rather than failing the whole pre-flight. Operators who want
 /// strict pre-flight Mode 3 coverage must pre-warm the PR daemon
 /// out-of-band before running the harness; the warn log explains this.
+/// Outcome of the pre-flight's payment-processor arm. `Disabled` = no
+/// `[mode_3]` block, seed exempt by design; `DaemonUnreachable` = Mode 3
+/// configured but its PR daemon not up yet (soft skip, warn logged);
+/// `Balance` = checked like the other seeds.
+enum PpPreflight {
+    Disabled,
+    DaemonUnreachable,
+    Balance(u64),
+}
+
 pub async fn enforce_funding(
     config: &Config,
     seeds: &SeedHandle,
@@ -142,6 +152,19 @@ pub async fn enforce_funding(
     // doesn't fail the whole pre-flight — same semantics as before
     // parallelization.
     let pp_fut = async {
+        // Mode 3 disabled (no [mode_3] block) exempts the PP seed entirely:
+        // the mode's nine cells are recorded as skipped by the run loop, so
+        // demanding funding for a wallet that will never spend is a config
+        // trap, not a guardrail. Observed live: a maintainer run with
+        // Mode 3 disabled failed pre-flight on an unfunded PP seed
+        // (2026-07-13 report).
+        if config.mode_3.is_none() {
+            log::info!(
+                target: LOG_TARGET,
+                "Mode 3 disabled (no [mode_3] block): PP seed exempt from the funding                  pre-flight",
+            );
+            return Ok::<PpPreflight, anyhow::Error>(PpPreflight::Disabled);
+        }
         if let Some(pr_bq) = pr_balance_query {
             match pr_bq.get_balance().await {
                 Ok(b) => {
@@ -150,7 +173,7 @@ pub async fn enforce_funding(
                         "Mode 3 PR-daemon balance pre-flight: {b} uT (querying {})",
                         pr_bq.balance_url(),
                     );
-                    Ok::<Option<u64>, anyhow::Error>(Some(b))
+                    Ok(PpPreflight::Balance(b))
                 }
                 Err(e) => {
                     log::warn!(
@@ -161,7 +184,7 @@ pub async fn enforce_funding(
                          it before scenarios run.",
                         pr_bq.balance_url(),
                     );
-                    Ok(None)
+                    Ok(PpPreflight::DaemonUnreachable)
                 }
             }
         } else {
@@ -169,10 +192,14 @@ pub async fn enforce_funding(
                 .get_balance(SeedRole::Pp)
                 .await
                 .map_err(|e| e.context("querying balance for the payment-processor seed"))?;
-            Ok(Some(b))
+            Ok(PpPreflight::Balance(b))
         }
     };
-    let (bal_old, bal_new, bal_pp_opt) = tokio::try_join!(old_fut, new_fut, pp_fut)?;
+    let (bal_old, bal_new, pp_arm) = tokio::try_join!(old_fut, new_fut, pp_fut)?;
+    let bal_pp_opt = match pp_arm {
+        PpPreflight::Balance(b) => Some(b),
+        PpPreflight::Disabled | PpPreflight::DaemonUnreachable => None,
+    };
 
     let any_short =
         bal_old < required || bal_new < required || bal_pp_opt.is_some_and(|b| b < required);
@@ -192,13 +219,17 @@ pub async fn enforce_funding(
                 );
             }
             None => {
+                let pp_marker = match pp_arm {
+                    PpPreflight::Disabled => "DISABLED",
+                    _ => "SKIPPED",
+                };
                 log::info!(
                     target: LOG_TARGET,
-                    "funding pre-flight passed (pp arm skipped): required={required} uT, \
+                    "funding pre-flight passed (pp arm {pp_marker}): required={required} uT, \
                      old={bal_old} uT, new={bal_new} uT",
                 );
                 println!(
-                    "[{}] preflight  old={bal_old}uT new={bal_new}uT pp=SKIPPED  PASS",
+                    "[{}] preflight  old={bal_old}uT new={bal_new}uT pp={pp_marker}  PASS",
                     chrono::Local::now().format("%H:%M:%S"),
                 );
             }
@@ -221,10 +252,14 @@ pub async fn enforce_funding(
             report.push_str(&format!("  {label}: {balance} uT OK\n"));
         }
     }
-    if bal_pp_opt.is_none() {
-        report.push_str(
+    match pp_arm {
+        PpPreflight::DaemonUnreachable => report.push_str(
             "  payment_processor: SKIPPED (PR daemon not reachable at pre-flight; see warn log)\n",
-        );
+        ),
+        PpPreflight::Disabled => {
+            report.push_str("  payment_processor: DISABLED (no [mode_3] block; seed exempt)\n")
+        }
+        PpPreflight::Balance(_) => {}
     }
     report.push_str("See RUNBOOK §Funding for how to mine to each address using minotari_miner.");
     bail!("{report}");
@@ -389,12 +424,33 @@ mod tests {
         SeedHandle::new(seeds_cfg)
     }
 
+    /// Minimal `[mode_3]` block for tests that need the PP arm ACTIVE:
+    /// with the block absent the pre-flight exempts the PP seed by design.
+    fn mode3_fixture() -> crate::config::Mode3Config {
+        crate::config::Mode3Config {
+            pp_binary_path: std::path::PathBuf::from("/bin/sh"),
+            minotari_binary_path: std::path::PathBuf::from("/bin/cat"),
+            api_port: 9145,
+            pr_port: 9146,
+            pr_base_url: "https://rpc.esmeralda.tari.com".to_string(),
+            terminal_state_poll_timeout_secs: 60,
+            worker_sleep_overrides: crate::config::WorkerSleepOverrides::default(),
+            accounts: crate::config::Mode3Accounts {
+                bench: crate::config::Mode3Account {
+                    view_key_env: "GUARDS_TEST_VIEW".to_string(),
+                    public_spend_key_env: "GUARDS_TEST_SPEND".to_string(),
+                },
+            },
+        }
+    }
+
     #[tokio::test]
     async fn enforce_funding_passes_when_all_balances_meet_required() {
         let seeds_cfg = unique_seeds("ALL_OK");
         let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
+            mode_3: Some(mode3_fixture()),
             ..Config::default()
         };
         let required = cfg.a_fund * 11 / 10; // 11_000_000_000
@@ -415,6 +471,7 @@ mod tests {
         let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
+            mode_3: Some(mode3_fixture()),
             ..Config::default()
         };
         let required = cfg.a_fund * 11 / 10;
@@ -464,6 +521,7 @@ mod tests {
         let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
+            mode_3: Some(mode3_fixture()),
             ..Config::default()
         };
         let bq = FakeBalanceQuery::new(true);
@@ -498,6 +556,7 @@ mod tests {
         let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
+            mode_3: Some(mode3_fixture()),
             ..Config::default()
         };
         let required = cfg.a_fund * 11 / 10;
@@ -552,6 +611,7 @@ mod tests {
         let handle = install_three_seeds(&seeds_cfg);
         let cfg = Config {
             a_fund: 10_000_000_000,
+            mode_3: Some(mode3_fixture()),
             ..Config::default()
         };
         let required = cfg.a_fund * 11 / 10;
@@ -568,6 +628,62 @@ mod tests {
         unset_env(&seeds_cfg.payment_processor);
         result.expect(
             "pre-flight must pass with the Pp arm skipped when the PR daemon is unreachable",
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_funding_exempts_pp_seed_when_mode3_disabled() {
+        // 2026-07-13 maintainer report: Mode 3 disabled, pre-flight still
+        // demanded PP funding. An unfunded PP seed must pass when the
+        // [mode_3] block is absent, and the PP query must not even run.
+        let seeds_cfg = unique_seeds("PP_EXEMPT");
+        let handle = install_three_seeds(&seeds_cfg);
+        let cfg = Config {
+            a_fund: 10_000_000_000,
+            ..Config::default()
+        };
+        assert!(cfg.mode_3.is_none());
+        let required = cfg.a_fund * 11 / 10;
+        let mut bq = FakeBalanceQuery::new(false);
+        bq.set(SeedRole::Old, required);
+        bq.set(SeedRole::New, required);
+        bq.set(SeedRole::Pp, 0); // unfunded, like the maintainer's run
+        let r = enforce_funding(&cfg, &handle, &bq, None).await;
+        let calls = bq.calls.lock().unwrap().clone();
+        unset_env(&seeds_cfg.old);
+        unset_env(&seeds_cfg.new);
+        unset_env(&seeds_cfg.payment_processor);
+        r.expect("unfunded PP seed must pass when Mode 3 is disabled");
+        assert!(
+            !calls.contains(&SeedRole::Pp),
+            "the PP balance query must not run at all: {calls:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_funding_still_requires_pp_seed_when_mode3_configured() {
+        let seeds_cfg = unique_seeds("PP_REQUIRED");
+        let handle = install_three_seeds(&seeds_cfg);
+        let cfg = Config {
+            a_fund: 10_000_000_000,
+            mode_3: Some(mode3_fixture()),
+            ..Config::default()
+        };
+        let required = cfg.a_fund * 11 / 10;
+        let mut bq = FakeBalanceQuery::new(false);
+        bq.set(SeedRole::Old, required);
+        bq.set(SeedRole::New, required);
+        bq.set(SeedRole::Pp, 0);
+        let err = enforce_funding(&cfg, &handle, &bq, None)
+            .await
+            .expect_err("unfunded PP seed must fail when Mode 3 IS configured");
+        unset_env(&seeds_cfg.old);
+        unset_env(&seeds_cfg.new);
+        unset_env(&seeds_cfg.payment_processor);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payment_processor") && msg.contains("short by"),
+            "report must show the PP deficit: {msg}",
         );
     }
 }
