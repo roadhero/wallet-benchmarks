@@ -969,7 +969,14 @@ mod tests {
                 status TEXT NOT NULL DEFAULT 'UNSPENT',
                 deleted_at TIMESTAMP,
                 is_burn INTEGER NOT NULL DEFAULT 0,
-                confirmed_height INTEGER
+                confirmed_height INTEGER,
+                maturity INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE scanned_tip_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL DEFAULT 1,
+                height INTEGER NOT NULL DEFAULT 725001,
+                hash BLOB NOT NULL DEFAULT x''
             );
         "#;
 

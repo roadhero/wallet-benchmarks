@@ -44,7 +44,18 @@ pub trait WalletDb: Send + Sync {
     /// created only by scans; a send only locks inputs and writes a
     /// `pending_transactions` row. S1's settle-between-sends gate uses this
     /// count so it does not mistake not-yet-confirmed outputs for spendable
-    /// funds. Returns `Ok(0)` when the DB file does not yet exist.
+    /// funds.
+    ///
+    /// Maturity: the count also requires `maturity <= scanned tip`, mirroring
+    /// the upstream input selector's clause (`minotari-cli@52a7287a
+    /// minotari/src/db/outputs.rs::fetch_unspent_outputs`, `maturity >= 0 AND
+    /// maturity <= :tip_height`). A coinbase output carries
+    /// `maturity = mined_height + lock` (observed +6 on Esmeralda) and is
+    /// confirmed several blocks before it becomes selectable; without this
+    /// clause the gate reports ready while `create-unsigned-transaction`
+    /// still fails "Funds are pending". The tip is the wallet's own view,
+    /// `MAX(height)` over `scanned_tip_blocks` (0 when never scanned).
+    /// Returns `Ok(0)` when the DB file does not yet exist.
     fn count_confirmed_spendable_utxos(&self, db_path: &Path) -> Result<u64>;
 }
 
@@ -118,13 +129,25 @@ impl WalletDb for LiveWalletDb {
         // `confirmed_height IS NOT NULL` is the mined predicate the input
         // selector's "available" bucket uses (a NULL confirmed_height is the
         // unconfirmed/pending bucket). UNSPENT (not LOCKED, not SPENT) plus
-        // mined equals "lockable by the next send".
+        // mined plus mature equals "lockable by the next send". The maturity
+        // clause and its `>= 0` wrap-guard mirror the selector verbatim
+        // (upstream outputs.rs::fetch_unspent_outputs); the tip is the
+        // wallet's own scanned view so the whole predicate stays a single
+        // self-contained sqlite read.
+        let scanned_tip: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(height), 0) FROM scanned_tip_blocks",
+                [],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("scanned_tip_blocks query on {}", db_path.display()))?;
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM outputs \
                  WHERE deleted_at IS NULL AND is_burn = 0 AND status = ?1 \
-                 AND confirmed_height IS NOT NULL",
-                rusqlite::params!["UNSPENT"],
+                 AND confirmed_height IS NOT NULL \
+                 AND maturity >= 0 AND maturity <= ?2",
+                rusqlite::params!["UNSPENT", scanned_tip],
                 |row| row.get(0),
             )
             .with_context(|| {
@@ -202,6 +225,10 @@ mod tests {
     ///   - `00009-add_utxo_locking_to_outputs/up.sql` — status TEXT NOT NULL
     ///   - `00013-add_soft_delete_to_inputs_outputs/up.sql` — deleted_at TIMESTAMP
     ///   - `00029-add_is_burn_to_outputs/up.sql` — is_burn INTEGER NOT NULL
+    ///   - `00031-add_maturity_to_outputs/up.sql` — maturity INTEGER NOT NULL
+    ///     DEFAULT 0
+    ///   - `00001-init/up.sql` — scanned_tip_blocks (height column read as
+    ///     the wallet's tip view by the maturity clause)
     const SCHEMA: &str = r#"
         CREATE TABLE outputs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,7 +241,14 @@ mod tests {
             status TEXT NOT NULL DEFAULT 'UNSPENT',
             deleted_at TIMESTAMP,
             is_burn INTEGER NOT NULL DEFAULT 0,
-            confirmed_height INTEGER
+            confirmed_height INTEGER,
+            maturity INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE scanned_tip_blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL DEFAULT 1,
+            height INTEGER NOT NULL DEFAULT 0,
+            hash BLOB NOT NULL DEFAULT x''
         );
     "#;
 
@@ -316,6 +350,86 @@ mod tests {
     #[test]
     fn count_confirmed_spendable_empty_table_returns_zero() {
         let (_dir, db_path) = fresh_db();
+        let db = LiveWalletDb;
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            0,
+        );
+    }
+
+    /// Insert one row with explicit `confirmed_height` and `maturity`, and
+    /// record the wallet's scanned tip — the coinbase-shaped fixture.
+    fn insert_row_with_maturity(
+        conn: &Connection,
+        status: &str,
+        confirmed_height: Option<i64>,
+        maturity: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO outputs (status, deleted_at, is_burn, confirmed_height, maturity) \
+             VALUES (?1, NULL, 0, ?2, ?3)",
+            rusqlite::params![status, confirmed_height, maturity],
+        )
+        .expect("insert row with maturity");
+    }
+
+    fn set_scanned_tip(conn: &Connection, height: i64) {
+        conn.execute(
+            "INSERT INTO scanned_tip_blocks (height) VALUES (?1)",
+            rusqlite::params![height],
+        )
+        .expect("insert scanned tip");
+    }
+
+    /// The live-observed coinbase shape (Esmeralda block 755167: confirmed
+    /// at +3, maturity mined+6): confirmed_height set while maturity is
+    /// still above the scanned tip. The selector refuses it, so the count
+    /// must too.
+    #[test]
+    fn count_confirmed_spendable_excludes_immature_coinbase() {
+        let (_dir, db_path) = fresh_db();
+        let conn = Connection::open(&db_path).expect("re-open");
+        insert_row_with_maturity(&conn, "UNSPENT", Some(755_170), 755_173);
+        set_scanned_tip(&conn, 755_171);
+        let db = LiveWalletDb;
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            0,
+            "confirmed-but-immature coinbase is not selectable",
+        );
+        // Tip advances past maturity: now selectable.
+        set_scanned_tip(&conn, 755_173);
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            1,
+            "mature coinbase counts once the scanned tip reaches maturity",
+        );
+    }
+
+    /// Standard outputs carry maturity = 0 (migration 00031 comment) and
+    /// must count even when the wallet has never recorded a scanned tip
+    /// (COALESCE(MAX(height), 0) = 0 >= 0).
+    #[test]
+    fn count_confirmed_spendable_zero_maturity_counts_without_scanned_tip() {
+        let (_dir, db_path) = fresh_db();
+        let conn = Connection::open(&db_path).expect("re-open");
+        insert_row_with_maturity(&conn, "UNSPENT", Some(100), 0);
+        let db = LiveWalletDb;
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            1,
+        );
+    }
+
+    /// Negative maturity models the upstream wrap-guard (`maturity >= 0`):
+    /// a u64 that wrapped to negative i64 must be excluded, matching
+    /// fetch_unspent_outputs' comment about inverted comparisons.
+    #[test]
+    fn count_confirmed_spendable_excludes_wrapped_negative_maturity() {
+        let (_dir, db_path) = fresh_db();
+        let conn = Connection::open(&db_path).expect("re-open");
+        insert_row_with_maturity(&conn, "UNSPENT", Some(100), -1);
+        set_scanned_tip(&conn, 1_000_000);
         let db = LiveWalletDb;
         assert_eq!(
             db.count_confirmed_spendable_utxos(&db_path).expect("count"),
