@@ -420,10 +420,20 @@ async fn classify_single_send_result(
                 // contract, S1 does NOT fail on an unsettled gate: its
                 // remaining contract is measuring sends raw (AC-30/33), so
                 // the following sends record the consequence honestly.
-                // None keeps the mode's shared settle default; only S0's
-                // boundary gate is operator-tunable via
-                // s0_change_confirm_timeout_secs.
-                let settled = mode.settle_after_send(None).await?;
+                // The deadline follows s0_change_confirm_timeout_secs: on a
+                // slow network the operator's documented remedy (raise the
+                // knob, RUNBOOK 7.11) must reach the settle that actually
+                // times out, or every later send records Funds-pending and
+                // fail-fast aborts a run that would have completed. At 0
+                // (gates skipped) the settle keeps the mode's shared
+                // default rather than being skipped: settling between
+                // chained sends is what makes S1's serial contract
+                // measurable at all.
+                let deadline = match config.s0_change_confirm_timeout_secs {
+                    0 => None,
+                    secs => Some(std::time::Duration::from_secs(secs)),
+                };
+                let settled = mode.settle_after_send(deadline).await?;
                 if !settled {
                     log::debug!(
                         "S1 settle gate unsettled after a wire-successful send; \
@@ -514,7 +524,18 @@ async fn wait_for_state_change(config: &Config, mode: &mut dyn Mode) -> anyhow::
                 // changes when a scan runs (no-op for Modes 1 and 3). Without
                 // this the poll below reads a frozen count forever and every
                 // Mode 2 send times out as a stall.
-                mode.refresh_wallet_view().await?;
+                //
+                // A refresh failure is transient (one flaky scan subprocess /
+                // node blip out of a ~127-send loop): skip this poll and let
+                // the deadline classify persistent failure as a stall, the
+                // same treatment the settle gate's scan loop applies. A hard
+                // `?` here erred the whole S1 cell on one blip.
+                if let Err(e) = mode.refresh_wallet_view().await {
+                    log::warn!(
+                        "S1 confirmation poll: refresh_wallet_view failed                          (transient, retrying next poll): {e:#}",
+                    );
+                    continue;
+                }
                 let observed = mode.get_utxo_count().await?;
                 if observed != baseline {
                     return Ok(true);
@@ -825,6 +846,41 @@ mod tests {
         assert_eq!(outcome.success_count, 1, "the send itself still counts");
         let calls = fake.calls.lock().unwrap();
         assert!(calls.contains(&"settle_after_send"));
+    }
+
+    #[tokio::test]
+    async fn s1_per_send_settle_uses_the_configured_knob() {
+        // F2 completion: the operator's documented remedy (raise
+        // s0_change_confirm_timeout_secs) must reach the per-send settle.
+        let mut fake = FakeMode::new();
+        fake.send_single_sequence = vec![SendOutcome::Ok(success_record())];
+        fake.canned_utxo_count = vec![5, 6];
+        let cfg = Config {
+            per_tx_confirmation_timeout_ms: 50,
+            s0_change_confirm_timeout_secs: 1234,
+            ..Config::default()
+        };
+        let recipient = fake_recipient();
+        let seeds = SeedHandle::for_test();
+        let redaction = RedactionDenylist::for_test();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        run(&ctx, &mut fake, Some(1)).await.expect("S1 runs");
+        let deadlines = fake.settle_deadlines.lock().unwrap();
+        assert!(
+            deadlines
+                .iter()
+                .all(|d| *d == Some(std::time::Duration::from_secs(1234))),
+            "per-send settle must carry the configured deadline: {deadlines:?}",
+        );
+        assert!(!deadlines.is_empty(), "settle must run after a success");
     }
 
     #[tokio::test]
