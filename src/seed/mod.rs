@@ -142,35 +142,43 @@ impl SeedHandle {
         read_env_redacted(&self.seeds_config.wallet_password)
     }
 
-    /// Assert that the three seed mnemonics are mutually distinct.
+    /// Assert that the active seed mnemonics are mutually distinct.
     ///
-    /// Per `DESIGN.md §Secret handling` (AC-35), the harness uses three
-    /// separate funded wallets. A duplicate mnemonic anywhere across the
-    /// three slots collapses two modes onto one wallet and silently mixes
-    /// their UTXO sets — a measurement bug, not a configuration nicety.
-    pub fn assert_distinct(&self) -> anyhow::Result<()> {
+    /// Per `DESIGN.md §Secret handling` (AC-35), the harness uses separate
+    /// funded wallets per mode. A duplicate mnemonic across active slots
+    /// collapses two modes onto one wallet and silently mixes their UTXO
+    /// sets — a measurement bug, not a configuration nicety.
+    ///
+    /// `mode3_enabled` gates the payment-processor arm: with no `[mode_3]`
+    /// block the PP seed env var is never read here, completing the
+    /// pre-flight exemption (a run that never touches the PP wallet must
+    /// not demand its seed exist at all).
+    pub fn assert_distinct(&self, mode3_enabled: bool) -> anyhow::Result<()> {
         let old = self.mnemonic_old()?;
         let new = self.mnemonic_new()?;
-        let pp = self.mnemonic_payment_processor()?;
-        // Compare under the same scope so all three `RedactedString`s drop
+        // Compare under the same scope so the `RedactedString`s drop
         // (and zero) together when the function returns.
         if old.reveal() == new.reveal() {
             anyhow::bail!(
-                "${} and ${} resolve to the same mnemonic — the three harness seeds must be distinct",
+                "${} and ${} resolve to the same mnemonic — the harness seeds must be distinct",
                 self.seeds_config.old,
                 self.seeds_config.new,
             );
         }
+        if !mode3_enabled {
+            return Ok(());
+        }
+        let pp = self.mnemonic_payment_processor()?;
         if old.reveal() == pp.reveal() {
             anyhow::bail!(
-                "${} and ${} resolve to the same mnemonic — the three harness seeds must be distinct",
+                "${} and ${} resolve to the same mnemonic — the harness seeds must be distinct",
                 self.seeds_config.old,
                 self.seeds_config.payment_processor,
             );
         }
         if new.reveal() == pp.reveal() {
             anyhow::bail!(
-                "${} and ${} resolve to the same mnemonic — the three harness seeds must be distinct",
+                "${} and ${} resolve to the same mnemonic — the harness seeds must be distinct",
                 self.seeds_config.new,
                 self.seeds_config.payment_processor,
             );
@@ -450,11 +458,37 @@ mod tests {
         set_env(&seeds.payment_processor, &m_pp);
         let handle = SeedHandle::new(&seeds);
         handle
-            .assert_distinct()
+            .assert_distinct(true)
             .expect("three unique seeds should pass");
         unset_env(&seeds.old);
         unset_env(&seeds.new);
         unset_env(&seeds.payment_processor);
+    }
+
+    #[test]
+    fn seed_handle_assert_distinct_exempts_pp_seed_when_mode3_disabled() {
+        // Completing the F1 exemption: with no [mode_3] block the PP seed
+        // env var must never be read, so a two-wallet operator setup passes.
+        let seeds = unique_seeds("DISTINCT_NO_PP");
+        let m_old = gen_seed().expect("old");
+        let m_new = gen_seed().expect("new");
+        set_env(&seeds.old, &m_old);
+        set_env(&seeds.new, &m_new);
+        unset_env(&seeds.payment_processor);
+        let handle = SeedHandle::new(&seeds);
+        handle
+            .assert_distinct(false)
+            .expect("missing PP seed must pass with Mode 3 disabled");
+        let err = handle
+            .assert_distinct(true)
+            .expect_err("missing PP seed must still fail with Mode 3 enabled");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&seeds.payment_processor),
+            "error should name the missing env var: {msg}",
+        );
+        unset_env(&seeds.old);
+        unset_env(&seeds.new);
     }
 
     #[test]
@@ -467,7 +501,7 @@ mod tests {
         set_env(&seeds.payment_processor, &other);
         let handle = SeedHandle::new(&seeds);
         let err = handle
-            .assert_distinct()
+            .assert_distinct(true)
             .expect_err("duplicate old/new must be rejected");
         let msg = format!("{err:#}");
         unset_env(&seeds.old);

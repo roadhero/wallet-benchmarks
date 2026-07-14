@@ -521,7 +521,7 @@ const SECONDS_PER_DAY: i64 = 86_400;
 ///
 /// Clamped to `[0, u16::MAX]`: pre-epoch inputs floor at 0, and the
 /// `u16::MAX` ceiling is ~2101, well beyond any realistic run date.
-pub(crate) fn s0_funding_birthday(funding_unix_secs: i64) -> u16 {
+pub fn s0_funding_birthday(funding_unix_secs: i64) -> u16 {
     let days = (funding_unix_secs - BIRTHDAY_EPOCH_UNIX_SECS).max(0) / SECONDS_PER_DAY;
     let clamped = days.clamp(0, i64::from(u16::MAX)) as u16;
     clamped.saturating_sub(1)
@@ -542,14 +542,13 @@ pub fn update_scenario_input(
 ) {
     match outcome {
         ScenarioOutcome::S0(_s0) => {
-            // S0's funding tx confirms within minutes of this arm running.
-            // Derive its birthday from the current time and feed both the
-            // S3 (`h_birth_s3`) and S7 (`s7_h_birth`) birthday-rescan slots.
-            // Previously a no-op: the fields stayed `None` and S3/S7 bailed
-            // in the dispatch above with "requires ScenarioInput::h_birth_s3".
-            let birthday = s0_funding_birthday(now_unix_secs);
-            input.h_birth_s3 = Some(birthday);
-            input.s7_h_birth = Some(birthday);
+            // The S3/S7 rescan birthday is wall-clock-derived and populated
+            // at ScenarioInput construction in main.rs, NOT here: this arm
+            // only runs on Ok outcomes, and coupling the birthday to S0's
+            // success made an S0 error cascade into S3/S7 dispatch bails
+            // (the maintainer's observed s0+s3+s7 err trio). Deliberate
+            // no-op so the single source of truth is the run-start init.
+            let _ = now_unix_secs;
         }
         ScenarioOutcome::S1(s1) => {
             // The chain's final UTXO count after S1's 7 rounds is the
@@ -693,21 +692,28 @@ mod tests {
     }
 
     #[test]
-    fn update_scenario_input_s0_populates_both_birthday_slots() {
-        // Regression for the S3/S7 "requires ScenarioInput::h_birth_s3"
-        // failure: the S0 arm must fill both birthday slots so S3 and S7
-        // dispatch instead of bailing.
-        let mut input = ScenarioInput::default();
-        assert_eq!(input.h_birth_s3, None);
-        assert_eq!(input.s7_h_birth, None);
-
+    fn update_scenario_input_s0_does_not_touch_birthday_slots() {
+        // Regression (inverted from the original): the birthday slots are
+        // populated at ScenarioInput construction in main.rs, from wall
+        // clock alone. The S0 arm must NOT own them — when it did, an S0
+        // error meant update_scenario_input never ran and S3/S7 bailed
+        // with "requires ScenarioInput::h_birth_s3" (the maintainer's
+        // observed s0+s3+s7 err trio). Slots set before S0 stay intact;
+        // slots unset stay unset.
+        let mut input = ScenarioInput {
+            h_birth_s3: Some(1642),
+            s7_h_birth: Some(1642),
+            ..ScenarioInput::default()
+        };
         let outcome = ScenarioOutcome::S0(sample_s0_outcome());
         update_scenario_input(&outcome, &mut input, 1_782_950_400);
+        assert_eq!(input.h_birth_s3, Some(1642), "pre-set S3 slot untouched");
+        assert_eq!(input.s7_h_birth, Some(1642), "pre-set S7 slot untouched");
 
-        assert_eq!(input.h_birth_s3, Some(1642), "S3 birthday slot populated");
-        assert_eq!(input.s7_h_birth, Some(1642), "S7 birthday slot populated");
-        // Both slots carry the same S0 funding birthday (AC-16 / AC-23).
-        assert_eq!(input.h_birth_s3, input.s7_h_birth);
+        let mut empty = ScenarioInput::default();
+        update_scenario_input(&outcome, &mut empty, 1_782_950_400);
+        assert_eq!(empty.h_birth_s3, None, "S0 arm no longer populates");
+        assert_eq!(empty.s7_h_birth, None);
     }
 
     #[test]

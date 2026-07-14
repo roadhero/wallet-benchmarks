@@ -122,8 +122,9 @@ pub async fn enforce_funding(
 
     // Validate seed mnemonics are resolvable before the per-role query loop
     // — surfaces a missing-env-var error from `enforce_funding` rather than
-    // from a half-spawned wallet.
-    seeds.assert_distinct()?;
+    // from a half-spawned wallet. The PP seed is exempt when Mode 3 is
+    // disabled, same as the balance arm below.
+    seeds.assert_distinct(config.mode_3.is_some())?;
 
     // Three balance queries run concurrently. Each transient
     // console_wallet pays its own ~30s startup + ready-deadline cost

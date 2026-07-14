@@ -114,10 +114,12 @@ async fn run_harness_async(
     config_owned.validate().context("Config::validate")?;
     let config = Arc::new(config_owned);
 
-    // 2. Build SeedHandle + assert the three seeds are distinct.
+    // 2. Build SeedHandle + assert the active seeds are distinct. The PP
+    // seed is exempt when Mode 3 is disabled — same rationale as the
+    // funding pre-flight exemption in guards.rs.
     let seeds = Arc::new(SeedHandle::new(&config.seeds));
     seeds
-        .assert_distinct()
+        .assert_distinct(config.mode_3.is_some())
         .context("assert_distinct pre-flight")?;
 
     // 3. Funding pre-flight (unless explicitly skipped).
@@ -232,8 +234,16 @@ async fn run_harness_async(
                 continue;
             }
         }
+        // The S3/S7 rescan birthday is derived from wall-clock alone (the
+        // funding lands the same day the run starts), so it is populated up
+        // front rather than threaded through S0's outcome: an S0 error must
+        // not cascade into S3/S7 "requires ScenarioInput::h_birth_s3" bails
+        // (observed live: the maintainer's s0+s3+s7 err trio, 2026-07-14).
+        let run_birthday = scenarios::s0_funding_birthday(chrono::Utc::now().timestamp());
         let mut scenario_input = ScenarioInput {
             s5_seed_role_for_mode: Some(mode_role),
+            h_birth_s3: Some(run_birthday),
+            s7_h_birth: Some(run_birthday),
             ..ScenarioInput::default()
         };
 
