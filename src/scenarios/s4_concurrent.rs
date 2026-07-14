@@ -212,7 +212,11 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         )
     });
     let fee_rate = config.fee_rate;
-    let amount_per_task: u64 = 1_000;
+    // Same validated knob S1 uses: Config::validate guarantees it exceeds
+    // the estimated single-send fee floor (fee_rate * 700). The previous
+    // hardcoded 1_000 uT sat below the floor at fee_rate >= 2, failing
+    // every S4 task at sign with "fee greater than amount".
+    let amount_per_task: u64 = config.s1_amount_per_tx_microtari;
     let budget = Duration::from_millis(config.s4_t_budget_ms);
     let sub_block_sizes = config.concurrent_batches.clone();
 

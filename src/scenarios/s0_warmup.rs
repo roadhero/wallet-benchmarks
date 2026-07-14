@@ -162,6 +162,21 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
         .send_single(&recipient, amount, config.fee_rate)
         .await?;
 
+    // A construct/sign/broadcast failure rides inside the record (status
+    // "failure:*" or "rejected"), not in the Result. Bail with the real
+    // error now: proceeding would burn the settle deadline and then blame
+    // the change confirmation for a send that never happened.
+    if tx_record.status != "success" {
+        anyhow::bail!(
+            "S0 send failed ({}): {}",
+            tx_record.status,
+            tx_record
+                .error_string
+                .as_deref()
+                .unwrap_or("no error string recorded"),
+        );
+    }
+
     // `tokio::select!` confirmation loop. Every sleep inside the select arms
     // is a **deadline** or a **poll interval bound** — not a throttle or
     // backoff. AC-32 (per `analysis/DESIGN_ADDENDUM.md §S3` and the
@@ -185,6 +200,19 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
                 break (current_utxo, None);
             }
             _ = tokio::time::sleep(CONFIRMATION_POLL_INTERVAL) => {
+                // Advance the wallet's view first, matching S1's poll loop:
+                // Mode 2's sqlite view only changes when a scan runs. Without
+                // the refresh the only observable change is the send locking
+                // its input (UNSPENT -> LOCKED drops the count), so S0 was
+                // recording lock latency as t_confirm_ms. Refresh failures
+                // are transient (same policy as S1's poll): skip this poll,
+                // let the deadline classify persistent failure.
+                if let Err(e) = mode.refresh_wallet_view().await {
+                    log::warn!(
+                        "S0 confirmation poll: refresh_wallet_view failed                          (transient, retrying next poll): {e:#}",
+                    );
+                    continue;
+                }
                 let observed = mode.get_utxo_count().await?;
                 if observed != pre_utxo_count {
                     let elapsed = ctx.clock.now().duration_since(confirm_start);
@@ -366,10 +394,15 @@ mod tests {
             "post-state balance read is the final measurement",
         );
         // Every call after `send_single` and before the post-state
-        // `get_balance` + settle gate must be a `get_utxo_count` (the
-        // confirmation poll).
-        for c in &calls[4..calls.len() - 2] {
-            assert_eq!(*c, "get_utxo_count", "confirmation poll body");
+        // `get_balance` + settle gate must be a refresh followed by a
+        // count (the confirmation poll advances the wallet view before
+        // reading, matching S1's loop).
+        for pair in calls[4..calls.len() - 2].chunks(2) {
+            assert_eq!(
+                pair,
+                ["refresh_wallet_view", "get_utxo_count"],
+                "confirmation poll body",
+            );
         }
     }
 
@@ -682,6 +715,50 @@ mod tests {
             requests.as_slice(),
             &[(1, Some(Duration::from_secs(600)))],
             "S0's serial single send needs exactly one input, bounded by the knob",
+        );
+    }
+
+    #[tokio::test]
+    async fn s0_bails_with_the_real_send_error_when_record_status_not_success() {
+        // A construct/broadcast failure rides inside the TxRecord, not the
+        // Result. S0 must surface it immediately instead of burning the
+        // settle deadline and blaming the change confirmation.
+        let mut fake = FakeMode::new();
+        fake.canned_balance = vec![10_000_000_000];
+        fake.canned_utxo_count = vec![1];
+        fake.canned_send_single = Some(TxRecord {
+            txid: String::new(),
+            t_total_ms: 120,
+            t_broadcast_ms: 0,
+            t_confirm_ms: None,
+            status: "failure:construct".to_string(),
+            error_string: Some(
+                "minotari create-unsigned-transaction exit 1: Funds are pending".to_string(),
+            ),
+            fee_microtari: 0,
+        });
+        let (cfg, recipient, seeds, redaction) = settle_test_fixture();
+        let clock = RealClock;
+        let ctx = ScenarioCtx {
+            config: &cfg,
+            seeds: &seeds,
+            redaction: &redaction,
+            clock: &clock,
+            recipients: RecipientStrategy::Fixed(&recipient),
+            sampler_factory: None,
+        };
+        let err = run(&ctx, &mut fake)
+            .await
+            .expect_err("failed send must err the cell");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("S0 send failed (failure:construct)") && msg.contains("Funds are pending"),
+            "error must carry the real cause: {msg}",
+        );
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls.contains(&"settle_after_send"),
+            "settle gate must not run after a failed send: {calls:?}",
         );
     }
 

@@ -156,7 +156,9 @@ pub(super) async fn run(
         )
     });
     let fee_rate = config.fee_rate;
-    let amount_per_recipient: u64 = 1_000;
+    // Same validated knob S1 uses (see the S4 twin): guaranteed above the
+    // fee floor by Config::validate, unlike the previous hardcoded 1_000.
+    let amount_per_recipient: u64 = config.s1_amount_per_tx_microtari;
     let m = config.s5_m;
     let k = config.s5_k;
     anyhow::ensure!(
