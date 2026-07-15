@@ -221,6 +221,51 @@ impl Mode for OldWallet {
         Ok(resp.amount.len() as u64)
     }
 
+    /// Mode 1's gate: poll `GetUnspentAmounts` until the wallet holds at
+    /// least `min_count` spendable outputs. The console wallet is
+    /// self-scanning, so polling its own view is sufficient — no explicit
+    /// refresh exists to drive. The default trait no-op assumed the daemon
+    /// manages its own availability; observed live (2026-07-15 run 1) it
+    /// does not: S0's send left the whole balance as pending change, and
+    /// every S1 send failed "Funds are still pending" until fail-fast
+    /// aborted the cell. The wallet cannot spend unconfirmed change any
+    /// more than the Mode 2 CLI can, so Mode 1 gets the same gate.
+    async fn wait_spendable_inputs(
+        &mut self,
+        min_count: u64,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<bool> {
+        let deadline = deadline.unwrap_or(std::time::Duration::from_secs(600));
+        let poll = std::time::Duration::from_secs(5);
+        let end = tokio::time::Instant::now() + deadline;
+        loop {
+            let have = self.get_utxo_count().await?;
+            if have >= min_count {
+                return Ok(true);
+            }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(end) => {
+                    return Ok(false);
+                }
+                _ = tokio::time::sleep(poll) => {}
+            }
+        }
+    }
+
+    /// Mode 1's settle: the next send must be able to lock a confirmed
+    /// input, so wait until at least one spendable output exists again.
+    /// Weaker than Mode 2's settle (which waits for a NEW confirmed output
+    /// above a post-send baseline): on a multi-UTXO wallet this returns
+    /// immediately, which satisfies the gate's contract — the chained send
+    /// can proceed — without stalling on the specific change output.
+    async fn settle_after_send(
+        &mut self,
+        deadline: Option<std::time::Duration>,
+    ) -> anyhow::Result<bool> {
+        self.wait_spendable_inputs(1, deadline).await
+    }
+
     fn dispatcher(&self) -> Arc<dyn S4Dispatcher> {
         // Clone the connected gRPC client — tonic's generated `WalletClient<T>`
         // derives `Clone` (see
