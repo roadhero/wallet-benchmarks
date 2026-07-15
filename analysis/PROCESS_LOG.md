@@ -111,3 +111,38 @@ location is the XDG path ~/.config/wallet-benchmarks/seeds/ with
 restrictive permissions (not ~/.wallet-benchmarks-seeds/).
 
 Signed off: Dennis Vorobyov
+
+## 2026-07-15: operator override, autonomous diagnose-and-fix window
+
+Explicit operator authorization (2026-07-15) for an autonomous work
+window responding to the maintainer's 2026-07-14 "new wallet keeps
+failing" report: multi-agent diagnostic panel, then local funded suite
+runs iterating fixes until a clean end-to-end result profile, with no
+per-commit signoff gates, no stopping to request maintainer artifacts,
+and no bounds on iteration count or compute. Scope: that task, that
+session, until success or explicit halt. Operator accepted in the
+authorization: diagnosis proceeds without the maintainer's config, logs,
+or branch confirmation; our environment may not reproduce his failure
+mode; fixes shipped are validated against our environment only and
+against his environment only by his next response.
+
+Execution record: four-track read-only diagnostic panel over tip
+79f6338, claims verified against the pinned minotari-cli@52a7287a
+source; nine defects fixed (a73b3e1, dda4ac3, 8d615aa, b1117f2,
+9686052, 2c21759, 45d708b - see analysis/DIAGNOSTIC_MAP_2026-07-15.md);
+wallets re-funded by SHA3 CPU mining against the operator's still-synced
+local node, seeds stored per the 2026-07-09 rule at
+~/.config/wallet-benchmarks/seeds/; three live Esmeralda runs drove the
+iteration (run 1 exposed the Mode 1 gate gap and the fee_rate=1
+inclusion latency; run 2 exposed the S4->S5 boundary gap and the
+scan-endpoint trap; run 3 on the full fix set).
+
+Validation limitation, explicit: every fix in this window is validated
+against this machine's environment (Esmeralda via rpc.esmeralda.tari.com,
+fee_rate 5, coinbase-funded wallets, reduced scenario scale). The
+maintainer's environment is validated only by his next re-run. The
+fee_rate=1 inclusion-latency finding in particular is a plausible - not
+confirmed - explanation of his report until he confirms his fee setting.
+
+Signed off: Dennis Vorobyov
+
