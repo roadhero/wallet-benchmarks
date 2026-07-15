@@ -239,8 +239,18 @@ impl Mode for OldWallet {
         let poll = std::time::Duration::from_secs(5);
         let end = tokio::time::Instant::now() + deadline;
         loop {
+            // Two conditions, both required. GetUnspentAmounts alone is NOT
+            // spendability: it lists outputs the wallet has seen unspent,
+            // including unconfirmed change Transfer refuses (observed live,
+            // run 3: the count-only gate passed on S4's fresh change and
+            // every S5 send still failed "Funds are still pending").
+            // available_balance is the wallet's own confirmed-available
+            // metric - the same one wait_ready's OnlineAndFunded policy
+            // gates on - so it is the load-bearing condition; the count
+            // keeps min_count's contract honest.
             let have = self.get_utxo_count().await?;
-            if have >= min_count {
+            let available = self.get_balance().await?;
+            if have >= min_count && available > 0 {
                 return Ok(true);
             }
             tokio::select! {
