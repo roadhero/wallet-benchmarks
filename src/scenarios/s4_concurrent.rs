@@ -211,6 +211,25 @@ pub(super) async fn run(ctx: &ScenarioCtx<'_>, mode: &mut dyn Mode) -> anyhow::R
             ctx.config.sampler_interval_ms,
         )
     });
+    // Entry gate, same shape as S1's: the preceding scenario's sends leave
+    // the wallet's confirmed set locked/spent and its change unconfirmed,
+    // so a S4 that starts immediately measures an empty wallet, not
+    // concurrency contention. Observed live (run 2, 2026-07-15): Mode 1's S5 fail-fasted in
+    // 0.1s on ten identical pending-funds errors straight after S4's
+    // concurrent block. min_count stays 1 (no pre-partitioning per
+    // AC-30/31); not-ready proceeds and records raw, mirroring S1.
+    let gate_timeout = config.s0_change_confirm_timeout_secs;
+    if gate_timeout > 0 {
+        let ready = mode
+            .wait_spendable_inputs(1, Some(std::time::Duration::from_secs(gate_timeout)))
+            .await?;
+        if !ready {
+            log::warn!(
+                "S4 entry gate: no confirmed spendable input after {gate_timeout}s; \
+                 proceeding, sends will record the pending-funds state honestly",
+            );
+        }
+    }
     let fee_rate = config.fee_rate;
     // Same validated knob S1 uses: Config::validate guarantees it exceeds
     // the estimated single-send fee floor (fee_rate * 700). The previous
@@ -721,6 +740,32 @@ mod tests {
                 .iter()
                 .map(|d| d.error_string.as_str())
                 .collect::<Vec<_>>(),
+        );
+        unset_env(&seeds_cfg.new);
+    }
+
+    /// Entry gate: S4 waits for a confirmed spendable input before its
+    /// first sub-block, and proceeds (recording raw) when not ready.
+    #[tokio::test]
+    async fn s4_entry_gate_runs_and_proceeds_when_not_ready() {
+        let (mut fake, seeds_cfg, cfg, seeds, redaction, clock) = build_ctx(
+            "GATE_S4",
+            vec![2],
+            60_000,
+            vec![
+                SendOutcome::Ok(ok_record("a")),
+                SendOutcome::Ok(ok_record("b")),
+            ],
+        );
+        fake.spendable_ready = false;
+        let ctx = ctx_for(&cfg, &seeds, &redaction, &clock);
+        let outcome = run(&ctx, &mut fake).await.expect("run ok");
+        assert_eq!(outcome.sub_blocks.len(), 1, "not-ready still dispatches");
+        let requests = fake.spendable_requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[(1, Some(std::time::Duration::from_secs(600)))],
+            "gate asks for one input bounded by the knob",
         );
         unset_env(&seeds_cfg.new);
     }
