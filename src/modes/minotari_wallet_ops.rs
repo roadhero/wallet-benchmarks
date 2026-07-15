@@ -549,7 +549,11 @@ pub(super) async fn wait_for_balance_positive(
                 anyhow::bail!(
                     "wait_for_balance_positive: wallet balance still 0 µT after {:?} \
                      ({polls} polls; last_seen={last_seen} µT). Check that the funding tx \
-                     has been mined on the chain the wallet is scanning.",
+                     has been mined on the chain the wallet is scanning, and that \
+                     base_node_url serves the scanner's block-download API: a scan \
+                     against an endpoint without it exits 0 having discovered nothing \
+                     (observed live against a base node's port-9005 wallet-HTTP server; \
+                     use an RPC gateway like rpc.esmeralda.tari.com).",
                     deadline,
                 );
             }

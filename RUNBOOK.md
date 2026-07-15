@@ -535,6 +535,16 @@ The `CONSOLE_WALLET_PASSWORD` env passed to PP is the fixture string `harness_pp
 
 **Resolution**: wait a few blocks for the funding output to confirm and re-run, or raise `s0_change_confirm_timeout_secs` so the gates wait longer (each block is roughly 45 seconds on esmeralda; burial takes the confirmation window plus one block). The same knob bounds S1's per-send settle, so raising it also gives each chained send more time for its change to confirm on a slow network. Setting the key to `0` skips the entry/settle gates entirely and restores the raw failure behavior (S1's per-send settle then falls back to its 600 s default). S1 runs the same gate at entry but does not fail on it: its sends record the pending-funds state honestly. Note for coinbase-funded wallets: a mined-to-wallet output also carries a maturity lock (6 blocks on esmeralda) beyond the confirmation window; the gate accounts for it.
 
+### §7.12. Mode 2 scans find nothing: check what `base_node_url` serves
+
+**Symptom**: every Mode 2 scan cell errs with "wallet balance still 0 µT after 300s" although the wallet is funded; `RUST_LOG=info` shows the `minotari scan` subprocess logging `Failed to send download error with error: channel closed` and `Scan complete event_count=0`; the wallet DB's `scanned_tip_blocks` height stops advancing.
+
+**Cause**: the `minotari` CLI scanner needs the base node HTTP RPC gateway's block-download surface. A local `minotari_node`'s port-9005 wallet-HTTP server answers `get_tip_info` but not the scanner's download calls, so the scan exits 0 having discovered nothing — which the harness can only see as an empty wallet. (Verified live 2026-07-15: the same seed scanned against `rpc.esmeralda.tari.com` found 103 outputs; against a synced local node's `:9005` it found 0.)
+
+**Resolution**: point `base_node_url` at an RPC gateway that serves scans (the public `https://rpc.esmeralda.tari.com`, or a locally hosted gateway). Mode 1 is unaffected — the console wallet syncs over p2p, not this API.
+
+**Fee-rate note (separate trap, same "pending" smell)**: transactions at `fee_rate = 1` were observed taking ~an hour to be mined on esmeralda (broadcast 04:58, mined ~06:00, block 755659), which no settle window absorbs — every chained send then reports pending funds. The default `fee_rate = 5` confirmed within a couple of blocks in the same environment. If you must measure at fee 1, raise `s0_change_confirm_timeout_secs` to ≥ 3600.
+
 ------
 
 ## §8. After a successful run
