@@ -134,31 +134,78 @@ impl WalletDb for LiveWalletDb {
         // (upstream outputs.rs::fetch_unspent_outputs); the tip is the
         // wallet's own scanned view so the whole predicate stays a single
         // self-contained sqlite read.
-        let scanned_tip: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(height), 0) FROM scanned_tip_blocks",
-                [],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("scanned_tip_blocks query on {}", db_path.display()))?;
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM outputs \
-                 WHERE deleted_at IS NULL AND is_burn = 0 AND status = ?1 \
-                 AND confirmed_height IS NOT NULL \
-                 AND maturity >= 0 AND maturity <= ?2",
-                rusqlite::params!["UNSPENT", scanned_tip],
-                |row| row.get(0),
-            )
-            .with_context(|| {
-                format!(
-                    "count_confirmed_spendable_utxos query on {}",
-                    db_path.display()
+        //
+        // Schema compatibility: the `maturity` column only exists from
+        // minotari-cli migration `00031-add_maturity_to_outputs` (introduced
+        // by the pinned commit itself). A wallet DB created by an older
+        // `minotari` binary has no such column, and the maturity clause
+        // errors instantly - observed live as a maintainer's S0 erring in
+        // 0.2 s straight after a clean 101-minute B0 (2026-07-31 report).
+        // On that schema, fall back to the pre-maturity predicate with a
+        // warning: an older CLI's own selector has no maturity clause
+        // either, so the fallback matches what that binary will actually
+        // spend.
+        if has_maturity_schema(&conn) {
+            let scanned_tip: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(height), 0) FROM scanned_tip_blocks",
+                    [],
+                    |row| row.get(0),
                 )
-            })?;
-        #[allow(clippy::cast_sign_loss)]
-        Ok(n.max(0) as u64)
+                .with_context(|| format!("scanned_tip_blocks query on {}", db_path.display()))?;
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outputs \
+                     WHERE deleted_at IS NULL AND is_burn = 0 AND status = ?1 \
+                     AND confirmed_height IS NOT NULL \
+                     AND maturity >= 0 AND maturity <= ?2",
+                    rusqlite::params!["UNSPENT", scanned_tip],
+                    |row| row.get(0),
+                )
+                .with_context(|| {
+                    format!(
+                        "count_confirmed_spendable_utxos query on {}",
+                        db_path.display()
+                    )
+                })?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(n.max(0) as u64)
+        } else {
+            log::warn!(
+                target: LOG_TARGET,
+                "wallet DB at {} has no `maturity` column (minotari binary \
+                 predates migration 00031): counting confirmed spendable \
+                 outputs without the maturity clause. Coinbase maturity \
+                 cannot be respected on this schema - build the minotari \
+                 CLI at the pinned commit (52a7287a) or later.",
+                db_path.display(),
+            );
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM outputs \
+                     WHERE deleted_at IS NULL AND is_burn = 0 AND status = ?1 \
+                     AND confirmed_height IS NOT NULL",
+                    rusqlite::params!["UNSPENT"],
+                    |row| row.get(0),
+                )
+                .with_context(|| {
+                    format!(
+                        "count_confirmed_spendable_utxos (pre-00031 schema) query on {}",
+                        db_path.display()
+                    )
+                })?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(n.max(0) as u64)
+        }
     }
+}
+
+/// True when the wallet DB carries the `outputs.maturity` column
+/// (minotari-cli migration `00031-add_maturity_to_outputs`). Probed via
+/// PRAGMA so the caller can pick a predicate the schema supports instead
+/// of erroring on older wallets.
+fn has_maturity_schema(conn: &Connection) -> bool {
+    conn.prepare("SELECT maturity FROM outputs LIMIT 0").is_ok()
 }
 
 fn open_read_only(db_path: &Path) -> Result<Connection> {
@@ -434,6 +481,48 @@ mod tests {
         assert_eq!(
             db.count_confirmed_spendable_utxos(&db_path).expect("count"),
             0,
+        );
+    }
+
+    /// The maintainer's 2026-07-31 shape: a wallet DB created by a
+    /// minotari binary older than migration 00031 (no `maturity` column,
+    /// no `scanned_tip_blocks` data guarantees). The count must fall back
+    /// to the pre-maturity predicate instead of erroring instantly.
+    #[test]
+    fn count_confirmed_spendable_falls_back_on_pre_00031_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("wallet.sqlite3");
+        let conn = Connection::open(&db_path).expect("create DB");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL DEFAULT 'UNSPENT',
+                deleted_at TIMESTAMP,
+                is_burn INTEGER NOT NULL DEFAULT 0,
+                confirmed_height INTEGER
+            );
+            "#,
+        )
+        .expect("apply pre-00031 schema");
+        conn.execute(
+            "INSERT INTO outputs (status, deleted_at, is_burn, confirmed_height) \
+             VALUES ('UNSPENT', NULL, 0, 725000)",
+            [],
+        )
+        .expect("seed confirmed row");
+        conn.execute(
+            "INSERT INTO outputs (status, deleted_at, is_burn, confirmed_height) \
+             VALUES ('UNSPENT', NULL, 0, NULL)",
+            [],
+        )
+        .expect("seed unconfirmed row");
+        drop(conn);
+        let db = LiveWalletDb;
+        assert_eq!(
+            db.count_confirmed_spendable_utxos(&db_path).expect("count"),
+            1,
+            "pre-00031 schema counts confirmed UNSPENT without maturity",
         );
     }
 
