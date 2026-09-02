@@ -146,3 +146,24 @@ confirmed - explanation of his report until he confirms his fee setting.
 
 Signed off: Dennis Vorobyov
 
+## 2026-09-02: bounty resolved - four-way split, PR not merged
+
+SWvheerden closed out tari-project/wallet-benchmarks#1 by splitting the
+bounty between the four contributors (JustAResearcher, roadhero,
+sanrishi, tzmWW): "you all did a lot of work on this. In the end, I
+wrote one myself as I could not get one of the 4 working correctly as I
+wanted." PR #6 remains unmerged; the maintainer wrote his own harness.
+The payout-address request on PR #6 (metalaureate, same day) is
+consistent with this resolution; the operator posts the payout address
+from a durable personal wallet, never a harness test seed, and sends
+nothing to "verify".
+
+Final branch state: tip 4504d69, all checks green, no conflicts,
+review state CHANGES_REQUESTED (moot). Validated profiles: run 4b
+(all 18 active cells ok) and run 5 (17/18; one settle timeout during
+degraded gateway latency, cause self-documented). Full record:
+analysis/OVERRIDE_REPORT_2026-07.md and
+analysis/DIAGNOSTIC_MAP_2026-07-15.md.
+
+Signed off: Dennis Vorobyov
+
